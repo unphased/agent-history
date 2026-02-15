@@ -2,15 +2,17 @@
 
 ## GitHub Settings
 
-- [ ] Default branch is `main`
-- [ ] Enable Dependabot (done: `.github/dependabot.yml`)
-- [ ] CI required on PRs (done: `.github/workflows/ci.yml`)
-- [ ] Branch protection / ruleset for `main`
-- [ ] Environments/secrets are not required (this repo should not need any)
+- [x] Default branch is `main`
+- [x] Enable Dependabot (`.github/dependabot.yml`)
+- [x] CI required on PRs (`.github/workflows/ci.yml`)
+- [x] Branch protection for `main` (status checks + no force-push/delete)
+- [x] Environments/secrets are not required (this repo should not need any)
 
 ## Suggested `main` Protection (Minimum)
 
 - Require status checks to pass before merging: `test` (workflow: `CI`)
+- Require branches to be up-to-date before merging (strict)
+- Require conversation resolution
 - Disallow force-pushes
 - Disallow branch deletion
 
