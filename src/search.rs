@@ -1,0 +1,171 @@
+use crate::indexer::MessageRecord;
+
+#[derive(Debug, Clone)]
+pub struct CompiledQuery {
+    tokens: Vec<Token>,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    raw: String,
+    // Some: ASCII case-insensitive（needleにASCII英字が含まれ、かつ大文字を含まない）
+    // None: 通常の contains（大小区別 / 非ASCII）
+    lower_ascii: Option<Vec<u8>>,
+}
+
+impl CompiledQuery {
+    pub fn new(query: &str) -> Self {
+        let query = query.trim();
+        if query.is_empty() {
+            return Self { tokens: vec![] };
+        }
+
+        let mut tokens: Vec<Token> = Vec::new();
+        for t in query.split_whitespace() {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+
+            let bytes = t.as_bytes();
+            let has_upper = bytes.iter().any(|&b| b.is_ascii_uppercase());
+            let has_ascii_alpha = bytes.iter().any(|&b| b.is_ascii_alphabetic());
+
+            let lower_ascii = if !has_upper && has_ascii_alpha {
+                let mut lower: Vec<u8> = Vec::with_capacity(bytes.len());
+                for &b in bytes {
+                    lower.push(b.to_ascii_lowercase());
+                }
+                Some(lower)
+            } else {
+                None
+            };
+
+            tokens.push(Token {
+                raw: t.to_string(),
+                lower_ascii,
+            });
+        }
+
+        Self { tokens }
+    }
+
+    pub fn matches_record(&self, rec: &MessageRecord) -> bool {
+        if self.tokens.is_empty() {
+            return true;
+        }
+        for token in &self.tokens {
+            if !record_matches_token(rec, token) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn record_matches_token(rec: &MessageRecord, token: &Token) -> bool {
+    if contains_token(&rec.text, token) {
+        return true;
+    }
+    if let Some(cwd) = rec.cwd.as_deref()
+        && contains_token(cwd, token)
+    {
+        return true;
+    }
+    if let Some(session_id) = rec.session_id.as_deref()
+        && contains_token(session_id, token)
+    {
+        return true;
+    }
+    let path = rec.file.to_string_lossy();
+    if contains_token(&path, token) {
+        return true;
+    }
+    false
+}
+
+fn contains_token(haystack: &str, token: &Token) -> bool {
+    if token.raw.is_empty() {
+        return true;
+    }
+
+    match token.lower_ascii.as_deref() {
+        Some(lower) => contains_ascii_case_insensitive_bytes(haystack.as_bytes(), lower),
+        None => haystack.contains(&token.raw),
+    }
+}
+
+fn contains_ascii_case_insensitive_bytes(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    let n = needle_lower;
+    if n.is_empty() {
+        return true;
+    }
+    let h = haystack;
+    if n.len() > h.len() {
+        return false;
+    }
+
+    for i in 0..=h.len() - n.len() {
+        if h[i].to_ascii_lowercase() != n[0] {
+            continue;
+        }
+        let mut ok = true;
+        for j in 1..n.len() {
+            if h[i + j].to_ascii_lowercase() != n[j] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::indexer::{Role, SourceKind};
+    use std::path::PathBuf;
+
+    fn rec(text: &str) -> MessageRecord {
+        MessageRecord {
+            timestamp: Some("2026-01-01T00:00:00.000Z".to_string()),
+            role: Role::User,
+            text: text.to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("s1".to_string()),
+            cwd: Some("/home/tizze".to_string()),
+            phase: None,
+            source: SourceKind::CodexSessionJsonl,
+        }
+    }
+
+    #[test]
+    fn smartcase_lower_is_case_insensitive() {
+        let r = rec("Hello World");
+        assert!(CompiledQuery::new("hello").matches_record(&r));
+    }
+
+    #[test]
+    fn smartcase_upper_is_case_sensitive() {
+        let r = rec("Hello World");
+        assert!(!CompiledQuery::new("WORLD").matches_record(&r));
+        assert!(CompiledQuery::new("World").matches_record(&r));
+    }
+
+    #[test]
+    fn tokens_are_and() {
+        let r = rec("abc def ghi");
+        assert!(CompiledQuery::new("abc ghi").matches_record(&r));
+        assert!(!CompiledQuery::new("abc xyz").matches_record(&r));
+    }
+
+    #[test]
+    fn compiled_query_matches_as_expected() {
+        let r = rec("Hello World");
+        assert!(CompiledQuery::new("hello").matches_record(&r));
+    }
+}
