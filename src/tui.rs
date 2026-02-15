@@ -482,11 +482,11 @@ fn handle_key(
                 match resume_target_for_record(app, rec) {
                     Some(target) => {
                         let sid = rec.session_id.as_deref().unwrap_or("");
-                        app.indexing.last_warn =
-                            Some(format!("resuming: {} {}", target.program, sid));
-                        terminal.draw(|f| ui(f, app)).context("描画に失敗")?;
-
                         let status = run_with_tui_suspended(terminal, || {
+                            for line in resume_loading_lines(&target, sid) {
+                                eprintln!("{line}");
+                            }
+
                             let mut cmd = Command::new(&target.program);
                             cmd.args(&target.args);
                             if let Some(cwd) = target.current_dir.as_ref() {
@@ -929,6 +929,21 @@ struct ResumeTarget {
     current_dir: Option<PathBuf>,
 }
 
+fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("resuming: {} {}", target.program, session_id));
+    if let Some(cwd) = target.current_dir.as_ref() {
+        out.push(format!("cwd: {}", cwd.display()));
+    }
+    out.push(format!(
+        "command: {} {}",
+        target.program,
+        target.args.join(" ")
+    ));
+    out.push(String::new());
+    out
+}
+
 fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarget> {
     let sid = rec.session_id.as_deref()?;
     let cwd = existing_dir(
@@ -1119,6 +1134,25 @@ mod tests {
             ]
         );
         assert_eq!(target.current_dir.as_deref(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn resume_loading_lines_includes_command_and_optional_cwd() {
+        let target = ResumeTarget {
+            program: "codex".to_string(),
+            args: vec![
+                "resume".to_string(),
+                "-C".to_string(),
+                "/x".to_string(),
+                "sid".to_string(),
+            ],
+            current_dir: Some(PathBuf::from("/x")),
+        };
+
+        let lines = resume_loading_lines(&target, "sid");
+        assert_eq!(lines[0], "resuming: codex sid");
+        assert_eq!(lines[1], "cwd: /x");
+        assert_eq!(lines[2], "command: codex resume -C /x sid");
     }
 
     fn mr(
