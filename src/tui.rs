@@ -22,11 +22,12 @@ use std::{
     cmp,
     collections::HashMap,
     env, fs,
-    io::{self, Stdout},
+    io::{self, Stdout, Write as _},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
     time::Duration,
+    time::Instant,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -483,16 +484,25 @@ fn handle_key(
                     Some(target) => {
                         let sid = rec.session_id.as_deref().unwrap_or("");
                         let status = run_with_tui_suspended(terminal, || {
-                            for line in resume_loading_lines(&target, sid) {
-                                eprintln!("{line}");
-                            }
-
                             let mut cmd = Command::new(&target.program);
                             cmd.args(&target.args);
                             if let Some(cwd) = target.current_dir.as_ref() {
                                 cmd.current_dir(cwd);
                             }
-                            cmd.status().context("プロセス起動に失敗しました")
+
+                            for line in resume_loading_lines(&target, sid) {
+                                eprintln!("{line}");
+                            }
+
+                            // `status()` でブロックすると何も出せないので、`spawn()`して短時間だけ
+                            // "動いてる" ローディング表示を出す（その間に外部CLIが起動する想定）。
+                            let mut child = cmd.spawn().context("プロセス起動に失敗しました")?;
+                            if let Some(st) =
+                                animate_resume_loader(&target.program, sid, &mut child)?
+                            {
+                                return Ok(st);
+                            }
+                            child.wait().context("プロセス待機に失敗しました")
                         });
 
                         match status {
@@ -942,6 +952,54 @@ fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> 
     ));
     out.push(String::new());
     out
+}
+
+fn animate_resume_loader(
+    program: &str,
+    session_id: &str,
+    child: &mut std::process::Child,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    const FRAME_MS: u64 = 60;
+    const MAX_ANIM_MS: u64 = 1500;
+
+    let frames: [char; 4] = ['|', '/', '-', '\\'];
+    let mut frame_idx: usize = 0;
+    let start = Instant::now();
+    let mut stderr = io::stderr();
+
+    // 画面上で目立つように、1行だけを上書きし続ける（後続の外部CLI表示で自然に消える）
+    while start.elapsed() < Duration::from_millis(MAX_ANIM_MS) {
+        if let Some(st) = child
+            .try_wait()
+            .context("プロセス状態の取得に失敗しました")?
+        {
+            write!(stderr, "\r\x1b[2K")?;
+            stderr.flush().ok();
+            return Ok(Some(st));
+        }
+
+        let ch = frames[frame_idx % frames.len()];
+        frame_idx = frame_idx.wrapping_add(1);
+
+        // 疑似プログレス（循環バー）
+        let bar_w = 24usize;
+        let pos = frame_idx % (bar_w + 1);
+        let mut bar = String::with_capacity(bar_w);
+        for i in 0..bar_w {
+            bar.push(if i == pos { '>' } else { ' ' });
+        }
+
+        write!(
+            stderr,
+            "\r\x1b[2K{ch} launching {program} ({session_id}) [{bar}]"
+        )?;
+        stderr.flush().ok();
+        std::thread::sleep(Duration::from_millis(FRAME_MS));
+    }
+
+    write!(stderr, "\r\x1b[2K")?;
+    stderr.flush().ok();
+    Ok(None)
 }
 
 fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarget> {
