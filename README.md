@@ -12,6 +12,14 @@ Japanese README: `README.ja.md`
 cargo install --path .
 ```
 
+## Requirements
+- Rust toolchain (to build/install from source)
+- Optional: `codex` CLI (for `Enter` resume on OpenAI/Codex sessions)
+- Optional: `claude` CLI (for `Enter` resume on Claude sessions)
+- Optional: `$PAGER` (defaults to `less -R`) for `Ctrl+o`
+
+No external fuzzy finder (e.g. `fzf`) is required.
+
 ## Usage
 ```bash
 agent-history
