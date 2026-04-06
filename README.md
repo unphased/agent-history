@@ -1,8 +1,9 @@
 # agent-history
-Project-wide full-text search TUI for Codex / Claude conversation logs.
+Project-wide full-text search TUI for Codex / Claude / OpenCode conversation logs.
 
 - Codex: `~/.codex/sessions/**.jsonl` and `~/.codex/archived_sessions/**.jsonl`
 - Claude: `~/.claude/projects/**.jsonl`
+- OpenCode: `~/.local/share/opencode/storage/{session,message,part}`
 - Auto-discovery: project-local `**/.codex/{sessions,archived_sessions}` and `**/.codex/history.jsonl` under `$HOME` (skips `.git`, `node_modules`, etc.)
 
 Japanese README: `README.ja.md`
@@ -16,6 +17,7 @@ cargo install --path .
 - Rust toolchain (to build/install from source)
 - Optional: `codex` CLI (for `Enter` resume on OpenAI/Codex sessions)
 - Optional: `claude` CLI (for `Enter` resume on Claude sessions)
+- Optional: `opencode` CLI (for `Enter` resume on OpenCode sessions)
 - Optional: `$PAGER` (defaults to `less -R`) for `Ctrl+o`
 
 No external fuzzy finder (e.g. `fzf`) is required.
@@ -35,10 +37,11 @@ cargo run --release
 ## List Format
 Each result row is:
 
-`timestamp(last activity)  dir  C|O  first message (1st line)`
+`timestamp(last activity)  dir  C|O|OC  first message (1st line)`
 
 - `C`: Claude
 - `O`: OpenAI/Codex
+- `OC`: OpenCode
 
 Notes:
 - Codex logs may start with `AGENTS.md` / `<environment_context>` metadata; those are excluded from the “first message”.
@@ -72,7 +75,7 @@ agent-history --query "GitHub Actions"
 - `Ctrl+u`: clear query
 - `↑/↓`: move selection
 - `PageUp/PageDown`: move by page
-- `Enter`: resume in `codex resume` / `claude --resume` (requires those CLIs)
+- `Enter`: resume in `codex resume` / `claude --resume` / `opencode --session` (requires those CLIs)
 - `Ctrl+o`: open raw JSONL around the selected item in `$PAGER` (defaults to `less -R`)
 - `Esc` / `Ctrl+c`: quit
 

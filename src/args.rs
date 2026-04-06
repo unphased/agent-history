@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "agent-history")]
-#[command(about = "Codex/Claude の会話履歴を検索するTUI", long_about = None)]
+#[command(
+    about = "Codex/Claude/OpenCode の会話履歴を検索するTUI",
+    long_about = None
+)]
 #[command(version)]
 pub struct Args {
     /// 追加の検索ルート（再帰）。複数指定可。

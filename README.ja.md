@@ -1,8 +1,9 @@
 # agent-history
-Codex / Claude の会話履歴を、プロジェクト横断で全文検索できるTUIツール。
+Codex / Claude / OpenCode の会話履歴を、プロジェクト横断で全文検索できるTUIツール。
 
 - Codex: `~/.codex/sessions/**.jsonl` / `~/.codex/archived_sessions/**.jsonl`
 - Claude: `~/.claude/projects/**.jsonl`
+- OpenCode: `~/.local/share/opencode/storage/{session,message,part}`
 - 追加: `$HOME` 配下の `**/.codex/{sessions,archived_sessions}` と `**/.codex/history.jsonl` を自動検出（`.git`, `node_modules` などは除外）
 
 ## インストール
@@ -15,6 +16,7 @@ cargo install --path .
 - Rust toolchain（ソースからビルド/インストールする場合）
 - 任意: `codex` CLI（`Enter`でOpenAI/Codexセッションをresumeする場合）
 - 任意: `claude` CLI（`Enter`でClaudeセッションをresumeする場合）
+- 任意: `opencode` CLI（`Enter`でOpenCodeセッションをresumeする場合）
 - 任意: `$PAGER`（未指定なら`less -R`。`Ctrl+o`で使用）
 
 ※ `fzf` のような外部fuzzy finderは不要です。
@@ -32,10 +34,11 @@ cargo run --release
 ```
 
 ### 表示
-結果一覧は `日時(最終更新) ディレクトリ名 C|O 最初の発言(1行目)`。
+結果一覧は `日時(最終更新) ディレクトリ名 C|O|OC 最初の発言(1行目)`。
 
 - `C`: Claude
 - `O`: OpenAI/Codex
+- `OC`: OpenCode
 
 ※ Codexのログは先頭に `AGENTS.md` や `<environment_context>` が入ることがあるので、一覧の「最初の発言」からは除外します。  
 （それしか無いセッションは一覧に出しません）  
@@ -68,7 +71,7 @@ agent-history --query "GitHub Actions"
 - `Ctrl+u`: クエリ全消し
 - `↑/↓`: 選択移動
 - `PageUp/PageDown`: ページ移動
-- `Enter`: 選択中の会話を `codex resume` / `claude --resume` で開く（CLIが必要）
+- `Enter`: 選択中の会話を `codex resume` / `claude --resume` / `opencode --session` で開く（CLIが必要）
 - `Ctrl+o`: 選択中の該当ファイル周辺を `$PAGER`（未指定なら `less -R`）で開く
 - `Esc` / `Ctrl+c`: 終了
 

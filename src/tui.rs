@@ -188,6 +188,7 @@ fn source_sort_key(source: SourceKind) -> u8 {
         SourceKind::CodexSessionJsonl => 0,
         SourceKind::CodexHistoryJsonl => 1,
         SourceKind::ClaudeProjectJsonl => 2,
+        SourceKind::OpenCodeSession => 3,
     }
 }
 
@@ -195,6 +196,7 @@ fn provider_icon(source: SourceKind) -> &'static str {
     match source {
         SourceKind::ClaudeProjectJsonl => "C",
         SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => "O",
+        SourceKind::OpenCodeSession => "OC",
     }
 }
 
@@ -808,6 +810,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             SourceKind::CodexSessionJsonl => "codex_session",
             SourceKind::CodexHistoryJsonl => "codex_history",
             SourceKind::ClaudeProjectJsonl => "claude_project",
+            SourceKind::OpenCodeSession => "opencode_session",
         };
         let role = match rec.role {
             Role::User => "user",
@@ -1029,6 +1032,11 @@ fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarg
             args: vec!["--resume".to_string(), sid.to_string()],
             current_dir: cwd,
         }),
+        SourceKind::OpenCodeSession => Some(ResumeTarget {
+            program: "opencode".to_string(),
+            args: vec!["--session".to_string(), sid.to_string()],
+            current_dir: cwd,
+        }),
     }
 }
 
@@ -1190,6 +1198,49 @@ mod tests {
                 "--resume".to_string(),
                 "8adefc6b-d73e-4a0b-a330-9be4114a5bdb".to_string(),
             ]
+        );
+        assert_eq!(target.current_dir.as_deref(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn resume_target_for_opencode_uses_session_flag() {
+        let tmp = TempDir::new("agent-history");
+        let cwd = tmp.path.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let rec = MessageRecord {
+            timestamp: None,
+            role: Role::User,
+            text: "x".to_string(),
+            file: PathBuf::from("/tmp/x.json"),
+            line: 1,
+            session_id: Some("ses_demo".to_string()),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            phase: Some("orchestrator".to_string()),
+            source: SourceKind::OpenCodeSession,
+        };
+
+        let app = App {
+            query: String::new(),
+            max_results: 0,
+            all: vec![rec.clone()],
+            sessions: Vec::new(),
+            session_records: Vec::new(),
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        let target = resume_target_for_record(&app, &rec).unwrap();
+        assert_eq!(target.program, "opencode");
+        assert_eq!(
+            target.args,
+            vec!["--session".to_string(), "ses_demo".to_string()]
         );
         assert_eq!(target.current_dir.as_deref(), Some(cwd.as_path()));
     }
@@ -1360,10 +1411,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_icon_distinguishes_claude_and_openai() {
+    fn provider_icon_distinguishes_supported_providers() {
         assert_eq!(provider_icon(SourceKind::ClaudeProjectJsonl), "C");
         assert_eq!(provider_icon(SourceKind::CodexSessionJsonl), "O");
         assert_eq!(provider_icon(SourceKind::CodexHistoryJsonl), "O");
+        assert_eq!(provider_icon(SourceKind::OpenCodeSession), "OC");
     }
 
     #[test]

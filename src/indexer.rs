@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     env,
-    fs::File,
+    fs::{self, File},
     io::{BufRead as _, BufReader},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -39,6 +39,7 @@ pub enum SourceKind {
     CodexSessionJsonl,
     CodexHistoryJsonl,
     ClaudeProjectJsonl,
+    OpenCodeSession,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub struct MessageRecord {
 pub struct IndexerConfig {
     pub roots: Vec<PathBuf>,
     pub extra_files: Vec<PathBuf>,
+    pub opencode_storage_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,7 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
 
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut extra_files: Vec<PathBuf> = Vec::new();
+    let mut opencode_storage_roots: Vec<PathBuf> = Vec::new();
 
     if !args.no_default_roots
         && let Some(home) = home.as_ref()
@@ -137,6 +140,11 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
         let claude_projects = home.join(".claude/projects");
         if claude_projects.is_dir() {
             roots.push(claude_projects);
+        }
+
+        let opencode_storage = home.join(".local/share/opencode/storage");
+        if opencode_storage.is_dir() {
+            opencode_storage_roots.push(opencode_storage);
         }
 
         // プロジェクト配下にある `.codex/sessions` なども自動検出して追加する
@@ -169,7 +177,16 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
             roots.dedup();
             extra_files.sort();
             extra_files.dedup();
-            return run_indexer(IndexerConfig { roots, extra_files }, tx);
+            opencode_storage_roots.sort();
+            opencode_storage_roots.dedup();
+            return run_indexer(
+                IndexerConfig {
+                    roots,
+                    extra_files,
+                    opencode_storage_roots,
+                },
+                tx,
+            );
         };
 
         let history = home.join(".codex/history.jsonl");
@@ -182,30 +199,39 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
     roots.dedup();
     extra_files.sort();
     extra_files.dedup();
+    opencode_storage_roots.sort();
+    opencode_storage_roots.dedup();
 
-    run_indexer(IndexerConfig { roots, extra_files }, tx)
+    run_indexer(
+        IndexerConfig {
+            roots,
+            extra_files,
+            opencode_storage_roots,
+        },
+        tx,
+    )
 }
 
 fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
-    let mut files = collect_jsonl_files(&cfg.roots, &cfg.extra_files);
-    files.sort();
+    let inputs = collect_index_inputs(&cfg.roots, &cfg.extra_files, &cfg.opencode_storage_roots);
 
     tx.send(IndexerEvent::Discovered {
-        total_files: files.len(),
+        total_files: inputs.len(),
     })
     .ok();
 
-    let total_files = files.len();
+    let total_files = inputs.len();
     let mut out: Vec<MessageRecord> = Vec::new();
     let mut sessions: HashSet<(SourceKind, String)> = HashSet::new();
 
-    for (processed_files, file) in files.into_iter().enumerate() {
+    for (processed_files, input) in inputs.into_iter().enumerate() {
         let processed_files = processed_files.saturating_add(1);
-        match index_file(&file, &mut out, &mut sessions) {
+        let current = input.path().to_path_buf();
+        match index_input(input, &mut out, &mut sessions) {
             Ok(()) => {}
             Err(e) => {
                 tx.send(IndexerEvent::Warn {
-                    message: format!("読み取り失敗: {}: {e}", file.display()),
+                    message: format!("読み取り失敗: {}: {e}", current.display()),
                 })
                 .ok();
             }
@@ -216,13 +242,46 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
             total_files,
             records: out.len(),
             sessions: sessions.len(),
-            current: file,
+            current,
         })
         .ok();
     }
 
     tx.send(IndexerEvent::Done { records: out }).ok();
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum IndexInput {
+    Jsonl(PathBuf),
+    OpenCodeSession {
+        storage_root: PathBuf,
+        session_file: PathBuf,
+    },
+}
+
+impl IndexInput {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Jsonl(path) => path,
+            Self::OpenCodeSession { session_file, .. } => session_file,
+        }
+    }
+}
+
+fn collect_index_inputs(
+    roots: &[PathBuf],
+    extra_files: &[PathBuf],
+    opencode_storage_roots: &[PathBuf],
+) -> Vec<IndexInput> {
+    let mut out: Vec<IndexInput> = collect_jsonl_files(roots, extra_files)
+        .into_iter()
+        .map(IndexInput::Jsonl)
+        .collect();
+    out.extend(collect_opencode_session_files(opencode_storage_roots));
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn collect_jsonl_files(roots: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBuf> {
@@ -270,6 +329,53 @@ fn collect_jsonl_files(roots: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBu
     out
 }
 
+fn collect_opencode_session_files(storage_roots: &[PathBuf]) -> Vec<IndexInput> {
+    let mut out: Vec<IndexInput> = Vec::new();
+
+    for storage_root in storage_roots {
+        let session_root = storage_root.join("session");
+        if !session_root.is_dir() {
+            continue;
+        }
+
+        for entry in WalkDir::new(&session_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            out.push(IndexInput::OpenCodeSession {
+                storage_root: storage_root.to_path_buf(),
+                session_file: path.to_path_buf(),
+            });
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn index_input(
+    input: IndexInput,
+    out: &mut Vec<MessageRecord>,
+    sessions: &mut HashSet<(SourceKind, String)>,
+) -> anyhow::Result<()> {
+    match input {
+        IndexInput::Jsonl(file) => index_file(&file, out, sessions),
+        IndexInput::OpenCodeSession {
+            storage_root,
+            session_file,
+        } => index_opencode_session_file(&storage_root, &session_file, out, sessions),
+    }
+}
+
 fn index_file(
     file: &Path,
     out: &mut Vec<MessageRecord>,
@@ -308,6 +414,210 @@ fn index_file(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeSessionTime {
+    created: Option<i64>,
+    updated: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeSession {
+    id: String,
+    directory: Option<String>,
+    title: Option<String>,
+    time: Option<OpenCodeSessionTime>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeMessageTime {
+    created: Option<i64>,
+    completed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeMessagePath {
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeMessage {
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    role: String,
+    time: Option<OpenCodeMessageTime>,
+    path: Option<OpenCodeMessagePath>,
+    mode: Option<String>,
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodePartTime {
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodePart {
+    #[serde(rename = "type")]
+    part_type: String,
+    text: Option<String>,
+    time: Option<OpenCodePartTime>,
+}
+
+fn index_opencode_session_file(
+    storage_root: &Path,
+    session_file: &Path,
+    out: &mut Vec<MessageRecord>,
+    sessions: &mut HashSet<(SourceKind, String)>,
+) -> anyhow::Result<()> {
+    let session: OpenCodeSession = serde_json::from_reader(File::open(session_file)?)?;
+    let message_dir = storage_root.join("message").join(&session.id);
+    if !message_dir.is_dir() {
+        return Ok(());
+    }
+
+    let session_cwd = session.directory.as_deref().map(str::to_string);
+    let fallback_title = session
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let session_ts = session
+        .time
+        .as_ref()
+        .and_then(|t| t.updated.or(t.created))
+        .map(|ts| ts.to_string());
+
+    let mut message_files: Vec<PathBuf> = fs::read_dir(&message_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    message_files.sort();
+
+    let mut records_added = 0usize;
+
+    for message_file in message_files {
+        let message: OpenCodeMessage = serde_json::from_reader(File::open(&message_file)?)?;
+        let part_dir = storage_root.join("part").join(&message.id);
+        let Some((text, text_file, timestamp)) = extract_opencode_message_text(&part_dir)? else {
+            continue;
+        };
+
+        let role = Role::from_str(&message.role);
+        let cwd = message
+            .path
+            .as_ref()
+            .and_then(|p| p.cwd.as_deref())
+            .or(session_cwd.as_deref())
+            .map(|s| s.to_string());
+        let timestamp = timestamp
+            .or_else(|| {
+                message
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.completed.or(t.created))
+                    .map(|ts| ts.to_string())
+            })
+            .or_else(|| session_ts.clone());
+        let phase = message.mode.clone().or(message.agent.clone());
+
+        out.push(MessageRecord {
+            timestamp,
+            role,
+            text,
+            file: text_file,
+            line: 1,
+            session_id: Some(message.session_id.clone()),
+            cwd,
+            phase,
+            source: SourceKind::OpenCodeSession,
+        });
+        records_added = records_added.saturating_add(1);
+    }
+
+    if records_added == 0
+        && let Some(title) = fallback_title
+    {
+        out.push(MessageRecord {
+            timestamp: session_ts,
+            role: Role::User,
+            text: title.to_string(),
+            file: session_file.to_path_buf(),
+            line: 1,
+            session_id: Some(session.id.clone()),
+            cwd: session_cwd,
+            phase: Some("title".to_string()),
+            source: SourceKind::OpenCodeSession,
+        });
+        records_added = 1;
+    }
+
+    if records_added > 0 {
+        sessions.insert((SourceKind::OpenCodeSession, session.id));
+    }
+
+    Ok(())
+}
+
+fn extract_opencode_message_text(
+    part_dir: &Path,
+) -> anyhow::Result<Option<(String, PathBuf, Option<String>)>> {
+    if !part_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut part_files: Vec<PathBuf> = fs::read_dir(part_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    part_files.sort();
+
+    let mut texts: Vec<String> = Vec::new();
+    let mut first_text_file: Option<PathBuf> = None;
+    let mut last_ts: Option<i64> = None;
+
+    for part_file in part_files {
+        let part: OpenCodePart = match serde_json::from_reader(File::open(&part_file)?) {
+            Ok(part) => part,
+            Err(_) => continue,
+        };
+
+        if part.part_type != "text" {
+            continue;
+        }
+
+        let Some(text) = part
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if first_text_file.is_none() {
+            first_text_file = Some(part_file.clone());
+        }
+        texts.push(text.to_string());
+
+        if let Some(ts) = part.time.as_ref().and_then(|t| t.end.or(t.start)) {
+            last_ts = Some(last_ts.map_or(ts, |cur| cur.max(ts)));
+        }
+    }
+
+    if texts.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        texts.join("\n"),
+        first_text_file.unwrap_or_else(|| part_dir.to_path_buf()),
+        last_ts.map(|ts| ts.to_string()),
+    )))
 }
 
 fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
@@ -730,6 +1040,157 @@ mod tests {
         assert!(files.contains(&root.join("nested/d.jsonl")));
         assert!(!files.contains(&root.join("subagents/b.jsonl")));
         assert!(!files.contains(&root.join("nested/subagents/c.jsonl")));
+    }
+
+    #[test]
+    fn collect_index_inputs_includes_opencode_sessions() {
+        let tmp = TempDir::new("agent-history-opencode-inputs");
+        let storage = tmp.path.join("storage");
+        fs::create_dir_all(storage.join("session/global")).unwrap();
+        fs::write(storage.join("session/global/ses_1.json"), "{}").unwrap();
+
+        let inputs = collect_index_inputs(&[], &[], &[storage]);
+        assert_eq!(inputs.len(), 1);
+        match &inputs[0] {
+            IndexInput::OpenCodeSession {
+                storage_root,
+                session_file,
+            } => {
+                assert!(storage_root.ends_with("storage"));
+                assert!(session_file.ends_with("ses_1.json"));
+            }
+            other => panic!("unexpected input: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indexes_opencode_session_text_parts() {
+        let tmp = TempDir::new("agent-history-opencode");
+        let storage = tmp.path.join("storage");
+        let sid = "ses_demo";
+        let mid = "msg_demo";
+
+        fs::create_dir_all(storage.join("session/global")).unwrap();
+        fs::create_dir_all(storage.join(format!("message/{sid}"))).unwrap();
+        fs::create_dir_all(storage.join(format!("part/{mid}"))).unwrap();
+
+        fs::write(
+            storage.join("session/global/ses_demo.json"),
+            r#"{
+  "id": "ses_demo",
+  "directory": "/tmp/project",
+  "title": "demo title",
+  "time": { "created": 100, "updated": 300 }
+}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            storage.join(format!("message/{sid}/{mid}.json")),
+            r#"{
+  "id": "msg_demo",
+  "sessionID": "ses_demo",
+  "role": "assistant",
+  "time": { "created": 120, "completed": 250 },
+  "path": { "cwd": "/tmp/project" },
+  "mode": "orchestrator"
+}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            storage.join(format!("part/{mid}/prt_1.json")),
+            r#"{
+  "type": "reasoning",
+  "text": "ignored"
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            storage.join(format!("part/{mid}/prt_2.json")),
+            r#"{
+  "type": "text",
+  "text": "hello from opencode",
+  "time": { "start": 200, "end": 220 }
+}"#,
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut sessions = HashSet::new();
+        index_opencode_session_file(
+            &storage,
+            &storage.join("session/global/ses_demo.json"),
+            &mut out,
+            &mut sessions,
+        )
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, SourceKind::OpenCodeSession);
+        assert_eq!(out[0].role, Role::Assistant);
+        assert_eq!(out[0].text, "hello from opencode");
+        assert_eq!(out[0].cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(out[0].session_id.as_deref(), Some("ses_demo"));
+        assert_eq!(out[0].timestamp.as_deref(), Some("220"));
+        assert_eq!(out[0].phase.as_deref(), Some("orchestrator"));
+        assert!(sessions.contains(&(SourceKind::OpenCodeSession, "ses_demo".to_string())));
+    }
+
+    #[test]
+    fn indexes_opencode_session_title_when_no_text_parts_exist() {
+        let tmp = TempDir::new("agent-history-opencode-title");
+        let storage = tmp.path.join("storage");
+        let sid = "ses_demo";
+        let mid = "msg_demo";
+
+        fs::create_dir_all(storage.join("session/global")).unwrap();
+        fs::create_dir_all(storage.join(format!("message/{sid}"))).unwrap();
+        fs::create_dir_all(storage.join(format!("part/{mid}"))).unwrap();
+
+        fs::write(
+            storage.join("session/global/ses_demo.json"),
+            r#"{
+  "id": "ses_demo",
+  "directory": "/tmp/project",
+  "title": "fallback title",
+  "time": { "updated": 300 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            storage.join(format!("message/{sid}/{mid}.json")),
+            r#"{
+  "id": "msg_demo",
+  "sessionID": "ses_demo",
+  "role": "assistant",
+  "time": { "completed": 250 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            storage.join(format!("part/{mid}/prt_1.json")),
+            r#"{
+  "type": "patch"
+}"#,
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut sessions = HashSet::new();
+        index_opencode_session_file(
+            &storage,
+            &storage.join("session/global/ses_demo.json"),
+            &mut out,
+            &mut sessions,
+        )
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "fallback title");
+        assert_eq!(out[0].role, Role::User);
+        assert_eq!(out[0].file, storage.join("session/global/ses_demo.json"));
+        assert_eq!(out[0].phase.as_deref(), Some("title"));
     }
 
     #[test]
