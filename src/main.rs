@@ -1,4 +1,5 @@
 mod args;
+mod cache;
 mod indexer;
 mod search;
 mod tui;

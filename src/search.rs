@@ -209,13 +209,13 @@ mod tests {
             timestamp: Some("2026-01-01T00:00:00.000Z".to_string()),
             role: Role::User,
             text: text.to_string(),
-        file: PathBuf::from("/tmp/x.jsonl"),
-        line: 1,
-        session_id: Some("s1".to_string()),
-        account: None,
-        cwd: Some("/home/tizze".to_string()),
-        phase: None,
-        source: SourceKind::CodexSessionJsonl,
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("s1".to_string()),
+            account: None,
+            cwd: Some("/home/tizze".to_string()),
+            phase: None,
+            source: SourceKind::CodexSessionJsonl,
         }
     }
 

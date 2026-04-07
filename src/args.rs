@@ -28,4 +28,12 @@ pub struct Args {
     /// 結果表示の上限（0で無制限）
     #[arg(long, default_value_t = 5000)]
     pub max_results: usize,
+
+    /// 永続キャッシュを使わず毎回フルスキャンする
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// 永続キャッシュを破棄して再構築する
+    #[arg(long)]
+    pub rebuild_index: bool,
 }

@@ -733,6 +733,9 @@ fn run_app(
 
 fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
     match ev {
+        IndexerEvent::Loaded { records } => {
+            apply_records(app, records);
+        }
         IndexerEvent::Discovered { total_files } => {
             app.indexing.total_files = total_files;
         }
@@ -753,14 +756,20 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
             app.indexing.last_warn = Some(message);
         }
         IndexerEvent::Done { records } => {
-            app.all = records;
-            let (sessions, session_records) = build_session_index(&app.all);
-            app.sessions = sessions;
-            app.session_records = session_records;
-            app.ready = true;
-            app.update_results();
+            apply_records(app, records);
         }
     }
+}
+
+fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
+    app.all = records;
+    let (sessions, session_records) = build_session_index(&app.all);
+    app.indexing.records = app.all.len();
+    app.indexing.sessions = sessions.len();
+    app.sessions = sessions;
+    app.session_records = session_records;
+    app.ready = true;
+    app.update_results();
 }
 
 fn handle_key(
@@ -1091,10 +1100,7 @@ impl App {
             };
 
             let mut lines = vec![
-                Line::raw(format!(
-                    "timestamp: {}",
-                    short_ts(rec.timestamp.as_deref())
-                )),
+                Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
                 Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                 Line::raw(format!(
                     "role: {role}   phase: {}",
@@ -1143,7 +1149,10 @@ impl App {
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
-            Line::raw(format!("account: {}", sess.account.as_deref().unwrap_or(""))),
+            Line::raw(format!(
+                "account: {}",
+                sess.account.as_deref().unwrap_or("")
+            )),
             Line::raw(format!("source: {}", source_label(sess.source))),
             Line::raw(format!("session opener: {}", sess.first_line)),
             Line::raw(format!(
@@ -1182,10 +1191,7 @@ impl App {
             let section: Vec<Line<'static>> = {
                 let mut section = vec![
                     Line::raw(format!("-- hit {}/{} --", i + 1, total_matches)),
-                    Line::raw(format!(
-                        "timestamp: {}",
-                        short_ts(rec.timestamp.as_deref())
-                    )),
+                    Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
                     Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                     Line::raw(format!(
                         "role: {role}   phase: {}",
@@ -2056,8 +2062,16 @@ mod tests {
 
         let (sessions, _) = build_session_index(&[a, b]);
         assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().any(|sess| sess.account.as_deref() == Some("a")));
-        assert!(sessions.iter().any(|sess| sess.account.as_deref() == Some("b")));
+        assert!(
+            sessions
+                .iter()
+                .any(|sess| sess.account.as_deref() == Some("a"))
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|sess| sess.account.as_deref() == Some("b"))
+        );
     }
 
     #[test]
@@ -2120,7 +2134,10 @@ mod tests {
         app.update_results();
         assert_eq!(app.filtered.len(), 1);
 
-        let sess = app.sessions.get(app.selected_hit().unwrap().session_idx).unwrap();
+        let sess = app
+            .sessions
+            .get(app.selected_hit().unwrap().session_idx)
+            .unwrap();
         assert_eq!(sess.session_id, "a");
 
         let hit = app.selected_hit().unwrap();
@@ -2487,7 +2504,10 @@ mod tests {
     #[test]
     fn short_ts_formats_epoch_timestamps_for_display() {
         assert_eq!(short_ts(Some("1704067200000")), "2024-01-01T00:00:00");
-        assert_eq!(short_ts(Some("2026-02-10T00:00:00Z")), "2026-02-10T00:00:00");
+        assert_eq!(
+            short_ts(Some("2026-02-10T00:00:00Z")),
+            "2026-02-10T00:00:00"
+        );
     }
 
     #[test]

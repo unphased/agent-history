@@ -1,4 +1,5 @@
-use crate::args::Args;
+use crate::{args::Args, cache};
+use anyhow::Context as _;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -9,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::UNIX_EPOCH,
 };
 use walkdir::WalkDir;
 
@@ -74,6 +76,9 @@ pub struct IndexerConfig {
 
 #[derive(Debug)]
 pub enum IndexerEvent {
+    Loaded {
+        records: Vec<MessageRecord>,
+    },
     Discovered {
         total_files: usize,
     },
@@ -182,7 +187,6 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
                 });
             }
         }
-
     }
 
     for root in &args.roots {
@@ -213,6 +217,8 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
                     opencode_storage_roots,
                 },
                 tx,
+                None,
+                false,
             );
         };
 
@@ -249,11 +255,22 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
             opencode_storage_roots,
         },
         tx,
+        (!args.no_cache).then(cache::default_db_path),
+        args.rebuild_index,
     )
 }
 
-fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+fn run_indexer(
+    cfg: IndexerConfig,
+    tx: &mpsc::Sender<IndexerEvent>,
+    cache_path: Option<PathBuf>,
+    rebuild_index: bool,
+) -> anyhow::Result<()> {
     let inputs = collect_index_inputs(&cfg.roots, &cfg.extra_files, &cfg.opencode_storage_roots);
+    let unit_keys: Vec<String> = inputs
+        .iter()
+        .map(|input| cache::unit_key(input.path()))
+        .collect();
 
     tx.send(IndexerEvent::Discovered {
         total_files: inputs.len(),
@@ -261,10 +278,193 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
     .ok();
 
     let total_files = inputs.len();
+
+    if cache_path.is_none() {
+        let out = run_full_scan(&cfg, tx, total_files)?;
+        tx.send(IndexerEvent::Done { records: out }).ok();
+        return Ok(());
+    }
+
+    let mut records_count = 0usize;
+    let mut sessions_count = 0usize;
+
+    let mut cache_store = match cache_path {
+        Some(path) => match cache::CacheStore::open(&path, rebuild_index) {
+            Ok(mut store) => {
+                let removed = store.prune_missing_units()?;
+                if removed > 0 {
+                    tx.send(IndexerEvent::Warn {
+                        message: format!("removed {removed} stale cached sources"),
+                    })
+                    .ok();
+                }
+
+                let cached_records = store.load_records(&unit_keys)?;
+                if !cached_records.is_empty() {
+                    records_count = cached_records.len();
+                    sessions_count = count_sessions(&cached_records);
+                    tx.send(IndexerEvent::Loaded {
+                        records: cached_records,
+                    })
+                    .ok();
+                }
+                Some(store)
+            }
+            Err(err) => {
+                tx.send(IndexerEvent::Warn {
+                    message: format!("cache unavailable, falling back to full scan: {err:#}"),
+                })
+                .ok();
+                None
+            }
+        },
+        None => None,
+    };
+    if cache_store.is_none() {
+        let out = run_full_scan(&cfg, tx, total_files)?;
+        tx.send(IndexerEvent::Done { records: out }).ok();
+        return Ok(());
+    }
+
+    let cached_fingerprints = if let Some(store) = cache_store.as_ref() {
+        store.fingerprints_for_keys(&unit_keys)?
+    } else {
+        Default::default()
+    };
+    let mut cache_changed = false;
+
+    for (processed_files, input) in inputs.into_iter().enumerate() {
+        let processed_files = processed_files.saturating_add(1);
+        let current = input.path().to_path_buf();
+        let unit_key = cache::unit_key(&current);
+
+        if let Some(store) = cache_store.as_mut() {
+            let fingerprint = fingerprint_for_input(&input)?;
+            if cached_fingerprints.get(&unit_key) == Some(&fingerprint) {
+            } else {
+                let mut records: Vec<MessageRecord> = Vec::new();
+                let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
+                match index_input(input.clone(), &mut records, &mut sessions) {
+                    Ok(()) => {
+                        store.replace_unit(&unit_key, &current, &fingerprint, &records)?;
+                        cache_changed = true;
+                    }
+                    Err(e) => {
+                        tx.send(IndexerEvent::Warn {
+                            message: format!("読み取り失敗: {}: {e}", current.display()),
+                        })
+                        .ok();
+                    }
+                }
+            }
+        }
+
+        tx.send(IndexerEvent::Progress {
+            processed_files,
+            total_files,
+            records: records_count,
+            sessions: sessions_count,
+            current,
+        })
+        .ok();
+    }
+
+    let final_records = match cache_store.as_ref() {
+        Some(store) => store.load_records(&unit_keys)?,
+        None => Vec::new(),
+    };
+    if cache_changed || records_count != final_records.len() {
+        records_count = final_records.len();
+        sessions_count = count_sessions(&final_records);
+        tx.send(IndexerEvent::Progress {
+            processed_files: total_files,
+            total_files,
+            records: records_count,
+            sessions: sessions_count,
+            current: PathBuf::from("<cache>"),
+        })
+        .ok();
+    }
+
+    tx.send(IndexerEvent::Done {
+        records: final_records,
+    })
+    .ok();
+    Ok(())
+}
+
+fn count_sessions(records: &[MessageRecord]) -> usize {
+    records
+        .iter()
+        .filter_map(|record| {
+            record
+                .session_id
+                .as_ref()
+                .map(|session_id| (record.source, session_id.clone(), record.account.clone()))
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn fingerprint_for_input(input: &IndexInput) -> anyhow::Result<String> {
+    match input {
+        IndexInput::Jsonl { path, .. } => fingerprint_for_path(path),
+        IndexInput::OpenCodeSession { session_file, .. } => {
+            fingerprint_for_opencode_session(session_file)
+        }
+    }
+}
+
+fn fingerprint_for_path(path: &Path) -> anyhow::Result<String> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("metadata read failed: {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(format!("{}:{modified}", metadata.len()))
+}
+
+fn fingerprint_for_opencode_session(path: &Path) -> anyhow::Result<String> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("metadata read failed: {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let session: OpenCodeSession = serde_json::from_reader(File::open(path)?)
+        .with_context(|| format!("session fingerprint parse failed: {}", path.display()))?;
+    let updated = session
+        .time
+        .as_ref()
+        .and_then(|time| time.updated.or(time.created))
+        .unwrap_or_default();
+    Ok(format!(
+        "{}:{modified}:{}:{updated}:{}:{}",
+        metadata.len(),
+        session.id,
+        session.directory.as_deref().unwrap_or(""),
+        session.title.as_deref().unwrap_or("")
+    ))
+}
+
+fn run_full_scan(
+    cfg: &IndexerConfig,
+    tx: &mpsc::Sender<IndexerEvent>,
+    total_files: usize,
+) -> anyhow::Result<Vec<MessageRecord>> {
     let mut out: Vec<MessageRecord> = Vec::new();
     let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
 
-    for (processed_files, input) in inputs.into_iter().enumerate() {
+    for (processed_files, input) in
+        collect_index_inputs(&cfg.roots, &cfg.extra_files, &cfg.opencode_storage_roots)
+            .into_iter()
+            .enumerate()
+    {
         let processed_files = processed_files.saturating_add(1);
         let current = input.path().to_path_buf();
         match index_input(input, &mut out, &mut sessions) {
@@ -287,8 +487,7 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
         .ok();
     }
 
-    tx.send(IndexerEvent::Done { records: out }).ok();
-    Ok(())
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -420,9 +619,7 @@ fn index_input(
     sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<()> {
     match input {
-        IndexInput::Jsonl { path, account } => {
-            index_file(&path, account.as_deref(), out, sessions)
-        }
+        IndexInput::Jsonl { path, account } => index_file(&path, account.as_deref(), out, sessions),
         IndexInput::OpenCodeSession {
             storage_root,
             session_file,
@@ -741,10 +938,7 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     path.to_path_buf()
 }
 
-fn discover_account_config_dirs(
-    home: &Path,
-    kind: AccountConfigKind,
-) -> Vec<(String, PathBuf)> {
+fn discover_account_config_dirs(home: &Path, kind: AccountConfigKind) -> Vec<(String, PathBuf)> {
     let prefix = match kind {
         AccountConfigKind::Codex => ".codex-",
         AccountConfigKind::Claude => ".claude-",
@@ -1019,6 +1213,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        sync::mpsc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1046,6 +1241,33 @@ mod tests {
 
     fn contains_path(entries: &[JsonlInputRoot], path: &Path) -> bool {
         entries.iter().any(|entry| entry.path == path)
+    }
+
+    fn recv_events(rx: &mpsc::Receiver<IndexerEvent>) -> Vec<IndexerEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn basic_cfg_for_jsonl(path: &Path) -> IndexerConfig {
+        IndexerConfig {
+            roots: vec![JsonlInputRoot {
+                path: path.to_path_buf(),
+                account: None,
+            }],
+            extra_files: Vec::new(),
+            opencode_storage_roots: Vec::new(),
+        }
+    }
+
+    fn basic_cfg_for_opencode(storage: &Path) -> IndexerConfig {
+        IndexerConfig {
+            roots: Vec::new(),
+            extra_files: Vec::new(),
+            opencode_storage_roots: vec![storage.to_path_buf()],
+        }
     }
 
     #[test]
@@ -1099,8 +1321,7 @@ mod tests {
         let line = r#"{"type":"user","cwd":"/x","sessionId":"s2","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let mut ctx = FileContext::default();
-        let rec =
-            extract_record(&v, Path::new("/tmp/c.jsonl"), 5, &mut ctx, Some("work")).unwrap();
+        let rec = extract_record(&v, Path::new("/tmp/c.jsonl"), 5, &mut ctx, Some("work")).unwrap();
         assert_eq!(rec.account.as_deref(), Some("work"));
     }
 
@@ -1127,7 +1348,10 @@ mod tests {
         assert!(contains_path(&files, &root.join("a.jsonl")));
         assert!(contains_path(&files, &root.join("nested/d.jsonl")));
         assert!(!contains_path(&files, &root.join("subagents/b.jsonl")));
-        assert!(!contains_path(&files, &root.join("nested/subagents/c.jsonl")));
+        assert!(!contains_path(
+            &files,
+            &root.join("nested/subagents/c.jsonl")
+        ));
     }
 
     #[test]
@@ -1296,16 +1520,16 @@ mod tests {
 
         assert!(codex.contains(&("work".to_string(), home.join(".codex-work"))));
         assert!(!codex.iter().any(|(account, _)| account.is_empty()));
-        assert!(claude.contains(&(
-            "personal".to_string(),
-            home.join(".claude-personal")
-        )));
+        assert!(claude.contains(&("personal".to_string(), home.join(".claude-personal"))));
     }
 
     #[test]
     fn format_epoch_timestamp_formats_seconds_and_millis_as_rfc3339() {
         assert_eq!(format_epoch_timestamp(220), "1970-01-01T00:03:40Z");
-        assert_eq!(format_epoch_timestamp(1_704_067_200_000), "2024-01-01T00:00:00Z");
+        assert_eq!(
+            format_epoch_timestamp(1_704_067_200_000),
+            "2024-01-01T00:00:00Z"
+        );
     }
 
     #[test]
@@ -1322,6 +1546,148 @@ mod tests {
         assert_eq!(
             expand_tilde(Path::new("/abs/path"), Some(home)),
             PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn run_indexer_loads_cached_records_on_second_run() {
+        let tmp = TempDir::new("agent-history-cache-jsonl");
+        let jsonl = tmp.path.join("history.jsonl");
+        let cache_db = tmp.path.join("index.sqlite");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello cache\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let first_events = recv_events(&rx1);
+        assert!(
+            first_events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Done { .. }))
+        );
+        assert!(
+            !first_events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Loaded { .. }))
+        );
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        let second_events = recv_events(&rx2);
+        assert!(
+            second_events.iter().any(
+                |event| matches!(event, IndexerEvent::Loaded { records } if records.len() == 1)
+            )
+        );
+        assert!(
+            second_events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Done { records } if records.len() == 1))
+        );
+    }
+
+    #[test]
+    fn run_indexer_skips_unchanged_opencode_session_children() {
+        let tmp = TempDir::new("agent-history-cache-opencode");
+        let storage = tmp.path.join("storage");
+        let cache_db = tmp.path.join("index.sqlite");
+        let sid = "ses_demo";
+        let mid = "msg_demo";
+
+        fs::create_dir_all(storage.join("session/global")).unwrap();
+        fs::create_dir_all(storage.join(format!("message/{sid}"))).unwrap();
+        fs::create_dir_all(storage.join(format!("part/{mid}"))).unwrap();
+
+        fs::write(
+            storage.join("session/global/ses_demo.json"),
+            r#"{
+  "id": "ses_demo",
+  "directory": "/tmp/project",
+  "title": "demo title",
+  "time": { "created": 100, "updated": 300 }
+}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            storage.join(format!("message/{sid}/{mid}.json")),
+            r#"{
+  "id": "msg_demo",
+  "sessionID": "ses_demo",
+  "role": "assistant",
+  "time": { "created": 120, "completed": 250 }
+}"#,
+        )
+        .unwrap();
+
+        let part_file = storage.join(format!("part/{mid}/prt_1.json"));
+        fs::write(
+            &part_file,
+            r#"{
+  "type": "text",
+  "text": "hello from cache",
+  "time": { "start": 200, "end": 220 }
+}"#,
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_opencode(&storage);
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let first_events = recv_events(&rx1);
+        assert!(first_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
+
+        fs::write(&part_file, "{not valid json").unwrap();
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        let second_events = recv_events(&rx2);
+        assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Loaded { records } if records.iter().any(|record| record.text == "hello from cache"))));
+        assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
+    }
+
+    #[test]
+    fn run_indexer_rebuild_index_ignores_existing_cache_load() {
+        let tmp = TempDir::new("agent-history-cache-rebuild");
+        let jsonl = tmp.path.join("history.jsonl");
+        let cache_db = tmp.path.join("index.sqlite");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello rebuild\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let _ = recv_events(&rx1);
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), true).unwrap();
+        let events = recv_events(&rx2);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Loaded { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Done { records } if records.len() == 1))
         );
     }
 }
