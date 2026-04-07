@@ -1,8 +1,8 @@
-use crate::{args::Args, cache};
+use crate::{args::Args, cache, telemetry};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
     env,
@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Instant,
     time::UNIX_EPOCH,
 };
 use walkdir::WalkDir;
@@ -238,6 +239,11 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
                 tx,
                 None,
                 false,
+                (!args.no_telemetry).then(|| {
+                    args.telemetry_log
+                        .clone()
+                        .unwrap_or_else(telemetry::default_log_path)
+                }),
             );
         };
 
@@ -276,6 +282,11 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
         tx,
         (!args.no_cache).then(cache::default_db_path),
         args.rebuild_index,
+        (!args.no_telemetry).then(|| {
+            args.telemetry_log
+                .clone()
+                .unwrap_or_else(telemetry::default_log_path)
+        }),
     )
 }
 
@@ -284,22 +295,82 @@ fn run_indexer(
     tx: &mpsc::Sender<IndexerEvent>,
     cache_path: Option<PathBuf>,
     rebuild_index: bool,
+    telemetry_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let indexer_started = Instant::now();
     let inputs = collect_index_inputs(&cfg.roots, &cfg.extra_files, &cfg.opencode_storage_roots);
     let unit_keys: Vec<String> = inputs
         .iter()
         .map(|input| cache::unit_key(input.path()))
         .collect();
-
-    tx.send(IndexerEvent::Discovered {
-        total_files: inputs.len(),
-    })
-    .ok();
-
     let total_files = inputs.len();
+    let cache_path_string = cache_path.as_ref().map(|path| path.display().to_string());
+    let telemetry_path_string = telemetry_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut telemetry_failed = false;
+    let mut telemetry = match telemetry_path {
+        Some(path) => match telemetry::TelemetrySink::open(&path) {
+            Ok(sink) => Some(sink),
+            Err(err) => {
+                tx.send(IndexerEvent::Warn {
+                    message: format!("telemetry unavailable: {err:#}"),
+                })
+                .ok();
+                None
+            }
+        },
+        None => None,
+    };
+    let mut emit = |kind: &str, data: Value| {
+        if telemetry_failed {
+            return;
+        }
+        if let Some(sink) = telemetry.as_mut()
+            && let Err(err) = sink.emit(kind, data)
+        {
+            telemetry_failed = true;
+            tx.send(IndexerEvent::Warn {
+                message: format!("telemetry log write failed: {err:#}"),
+            })
+            .ok();
+        }
+    };
+
+    emit(
+        "indexer_started",
+        json!({
+            "total_files": total_files,
+            "cache_enabled": cache_path_string.is_some(),
+            "cache_path": cache_path_string,
+            "rebuild_index": rebuild_index,
+            "telemetry_path": telemetry_path_string,
+        }),
+    );
+
+    tx.send(IndexerEvent::Discovered { total_files }).ok();
 
     if cache_path.is_none() {
-        let out = run_full_scan(inputs, tx, total_files)?;
+        let full_scan_started = Instant::now();
+        let out = run_full_scan(inputs, tx, total_files, &mut emit)?;
+        emit(
+            "full_scan_finished",
+            json!({
+                "duration_ms": full_scan_started.elapsed().as_millis(),
+                "records": out.len(),
+                "sessions": count_sessions(&out),
+                "total_files": total_files,
+            }),
+        );
+        emit(
+            "indexer_finished",
+            json!({
+                "duration_ms": indexer_started.elapsed().as_millis(),
+                "records": out.len(),
+                "sessions": count_sessions(&out),
+                "total_files": total_files,
+            }),
+        );
         tx.send(IndexerEvent::Done { records: out }).ok();
         return Ok(());
     }
@@ -308,59 +379,138 @@ fn run_indexer(
     let mut sessions_count = 0usize;
 
     let mut cache_store = match cache_path {
-        Some(path) => match cache::CacheStore::open(&path, rebuild_index) {
-            Ok(mut store) => {
-                let removed = store.prune_missing_units()?;
-                if removed > 0 {
-                    tx.send(IndexerEvent::Warn {
-                        message: format!("removed {removed} stale cached sources"),
-                    })
-                    .ok();
-                }
+        Some(path) => {
+            let cache_open_started = Instant::now();
+            match cache::CacheStore::open(&path, rebuild_index) {
+                Ok(mut store) => {
+                    let cache_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
+                    emit(
+                        "cache_open_finished",
+                        json!({
+                            "path": path.display().to_string(),
+                            "duration_ms": cache_open_started.elapsed().as_millis(),
+                            "rebuild_index": rebuild_index,
+                            "cache_bytes": cache_bytes,
+                        }),
+                    );
 
-                let cached_records = store.load_records(&unit_keys)?;
-                if !cached_records.is_empty() {
-                    records_count = cached_records.len();
-                    sessions_count = count_sessions(&cached_records);
-                    tx.send(IndexerEvent::Loaded {
-                        records: cached_records,
+                    let prune_started = Instant::now();
+                    let removed = store.prune_missing_units()?;
+                    emit(
+                        "cache_prune_finished",
+                        json!({
+                            "path": path.display().to_string(),
+                            "duration_ms": prune_started.elapsed().as_millis(),
+                            "removed_units": removed,
+                        }),
+                    );
+                    if removed > 0 {
+                        tx.send(IndexerEvent::Warn {
+                            message: format!("removed {removed} stale cached sources"),
+                        })
+                        .ok();
+                    }
+
+                    let cache_load_started = Instant::now();
+                    let cached_records = store.load_records(&unit_keys)?;
+                    emit(
+                        "cache_load_finished",
+                        json!({
+                            "path": path.display().to_string(),
+                            "duration_ms": cache_load_started.elapsed().as_millis(),
+                            "records": cached_records.len(),
+                            "sessions": count_sessions(&cached_records),
+                            "requested_units": unit_keys.len(),
+                        }),
+                    );
+                    if !cached_records.is_empty() {
+                        records_count = cached_records.len();
+                        sessions_count = count_sessions(&cached_records);
+                        tx.send(IndexerEvent::Loaded {
+                            records: cached_records,
+                        })
+                        .ok();
+                    }
+                    Some(store)
+                }
+                Err(err) => {
+                    emit(
+                        "cache_open_failed",
+                        json!({
+                            "path": path.display().to_string(),
+                            "duration_ms": cache_open_started.elapsed().as_millis(),
+                            "error": format!("{err:#}"),
+                        }),
+                    );
+                    tx.send(IndexerEvent::Warn {
+                        message: format!("cache unavailable, falling back to full scan: {err:#}"),
                     })
                     .ok();
+                    None
                 }
-                Some(store)
             }
-            Err(err) => {
-                tx.send(IndexerEvent::Warn {
-                    message: format!("cache unavailable, falling back to full scan: {err:#}"),
-                })
-                .ok();
-                None
-            }
-        },
+        }
         None => None,
     };
     if cache_store.is_none() {
-        let out = run_full_scan(inputs, tx, total_files)?;
+        let full_scan_started = Instant::now();
+        let out = run_full_scan(inputs, tx, total_files, &mut emit)?;
+        emit(
+            "full_scan_finished",
+            json!({
+                "duration_ms": full_scan_started.elapsed().as_millis(),
+                "records": out.len(),
+                "sessions": count_sessions(&out),
+                "total_files": total_files,
+                "reason": "cache_unavailable",
+            }),
+        );
+        emit(
+            "indexer_finished",
+            json!({
+                "duration_ms": indexer_started.elapsed().as_millis(),
+                "records": out.len(),
+                "sessions": count_sessions(&out),
+                "total_files": total_files,
+            }),
+        );
         tx.send(IndexerEvent::Done { records: out }).ok();
         return Ok(());
     }
 
+    let fingerprint_started = Instant::now();
     let cached_fingerprints = if let Some(store) = cache_store.as_ref() {
         store.fingerprints_for_keys(&unit_keys)?
     } else {
         Default::default()
     };
+    emit(
+        "fingerprint_scan_finished",
+        json!({
+            "duration_ms": fingerprint_started.elapsed().as_millis(),
+            "total_units": unit_keys.len(),
+            "cached_units": cached_fingerprints.len(),
+        }),
+    );
     let mut cache_changed = false;
     let mut processed_files = 0usize;
     let mut opencode_jobs: Vec<(usize, IndexInput)> = Vec::new();
     let mut opencode_meta: Vec<Option<(String, PathBuf, String)>> = vec![None; total_files];
+    let mut skipped_units = 0usize;
+    let mut refreshed_units = 0usize;
+    let mut refreshed_jsonl_units = 0usize;
+    let mut refreshed_opencode_units = 0usize;
+    let mut failed_units = 0usize;
+    let refresh_started = Instant::now();
 
     for (idx, input) in inputs.iter().cloned().enumerate() {
         let current = input.path().to_path_buf();
         let unit_key = cache::unit_key(&current);
         let fingerprint = fingerprint_for_input(&input)?;
+        let source_kind = input.telemetry_source_kind();
 
         if cached_fingerprints.get(&unit_key) == Some(&fingerprint) {
+            skipped_units = skipped_units.saturating_add(1);
             processed_files = processed_files.saturating_add(1);
             tx.send(IndexerEvent::Progress {
                 processed_files,
@@ -382,11 +532,26 @@ fn run_indexer(
         match index_input_to_chunk(input) {
             Ok(chunk) => {
                 let current = chunk.current.clone();
+                let records_added = chunk.records.len();
+                let sessions_added = chunk.sessions.len();
+                let cache_write_started = Instant::now();
                 if let Some(store) = cache_store.as_mut() {
                     store.replace_unit(&unit_key, &current, &fingerprint, &chunk.records)?;
                 }
+                refreshed_units = refreshed_units.saturating_add(1);
+                refreshed_jsonl_units = refreshed_jsonl_units.saturating_add(1);
                 cache_changed = true;
                 processed_files = processed_files.saturating_add(1);
+                emit(
+                    "unit_reindexed",
+                    json!({
+                        "source": source_kind,
+                        "path": current.display().to_string(),
+                        "records": records_added,
+                        "sessions": sessions_added,
+                        "cache_write_ms": cache_write_started.elapsed().as_millis(),
+                    }),
+                );
                 tx.send(IndexerEvent::Progress {
                     processed_files,
                     total_files,
@@ -397,7 +562,16 @@ fn run_indexer(
                 .ok();
             }
             Err((current, e)) => {
+                failed_units = failed_units.saturating_add(1);
                 processed_files = processed_files.saturating_add(1);
+                emit(
+                    "unit_failed",
+                    json!({
+                        "source": source_kind,
+                        "path": current.display().to_string(),
+                        "error": e.to_string(),
+                    }),
+                );
                 tx.send(IndexerEvent::Warn {
                     message: format!("読み取り失敗: {}: {e}", current.display()),
                 })
@@ -426,11 +600,26 @@ fn run_indexer(
                     let Some((unit_key, current, fingerprint)) = opencode_meta[index].take() else {
                         continue;
                     };
+                    let records_added = chunk.records.len();
+                    let sessions_added = chunk.sessions.len();
+                    let cache_write_started = Instant::now();
                     if let Some(store) = cache_store.as_mut() {
                         store.replace_unit(&unit_key, &current, &fingerprint, &chunk.records)?;
                     }
+                    refreshed_units = refreshed_units.saturating_add(1);
+                    refreshed_opencode_units = refreshed_opencode_units.saturating_add(1);
                     cache_changed = true;
                     processed_files = processed_files.saturating_add(1);
+                    emit(
+                        "unit_reindexed",
+                        json!({
+                            "source": "opencode",
+                            "path": current.display().to_string(),
+                            "records": records_added,
+                            "sessions": sessions_added,
+                            "cache_write_ms": cache_write_started.elapsed().as_millis(),
+                        }),
+                    );
                     tx.send(IndexerEvent::Progress {
                         processed_files,
                         total_files,
@@ -446,7 +635,16 @@ fn run_indexer(
                     error,
                 } => {
                     let _ = opencode_meta[index].take();
+                    failed_units = failed_units.saturating_add(1);
                     processed_files = processed_files.saturating_add(1);
+                    emit(
+                        "unit_failed",
+                        json!({
+                            "source": "opencode",
+                            "path": current.display().to_string(),
+                            "error": error,
+                        }),
+                    );
                     tx.send(IndexerEvent::Warn {
                         message: format!("読み取り失敗: {}: {error}", current.display()),
                     })
@@ -467,13 +665,40 @@ fn run_indexer(
         }
     }
 
+    emit(
+        "refresh_finished",
+        json!({
+            "duration_ms": refresh_started.elapsed().as_millis(),
+            "total_units": total_files,
+            "skipped_units": skipped_units,
+            "refreshed_units": refreshed_units,
+            "refreshed_jsonl_units": refreshed_jsonl_units,
+            "refreshed_opencode_units": refreshed_opencode_units,
+            "failed_units": failed_units,
+            "cache_changed": cache_changed,
+        }),
+    );
+
+    let final_cache_load_started = Instant::now();
     let final_records = match cache_store.as_ref() {
         Some(store) => store.load_records(&unit_keys)?,
         None => Vec::new(),
     };
+    let final_sessions = count_sessions(&final_records);
+    emit(
+        "cache_reload_finished",
+        json!({
+            "duration_ms": final_cache_load_started.elapsed().as_millis(),
+            "records": final_records.len(),
+            "sessions": final_sessions,
+            "cache_bytes": cache_path_string
+                .as_ref()
+                .and_then(|path| fs::metadata(Path::new(path)).ok().map(|metadata| metadata.len())),
+        }),
+    );
     if cache_changed || records_count != final_records.len() {
         records_count = final_records.len();
-        sessions_count = count_sessions(&final_records);
+        sessions_count = final_sessions;
         tx.send(IndexerEvent::Progress {
             processed_files: total_files,
             total_files,
@@ -488,6 +713,15 @@ fn run_indexer(
         records: final_records,
     })
     .ok();
+    emit(
+        "indexer_finished",
+        json!({
+            "duration_ms": indexer_started.elapsed().as_millis(),
+            "records": records_count,
+            "sessions": sessions_count,
+            "total_files": total_files,
+        }),
+    );
     Ok(())
 }
 
@@ -554,6 +788,7 @@ fn run_full_scan(
     inputs: Vec<IndexInput>,
     tx: &mpsc::Sender<IndexerEvent>,
     total_files: usize,
+    emit: &mut impl FnMut(&str, Value),
 ) -> anyhow::Result<Vec<MessageRecord>> {
     let mut indexed_inputs: Vec<Option<IndexedInputChunk>> = Vec::with_capacity(total_files);
     indexed_inputs.resize_with(total_files, || None);
@@ -573,6 +808,16 @@ fn run_full_scan(
                 records = records.saturating_add(chunk.records.len());
                 sessions.extend(chunk.sessions.iter().cloned());
                 let current = chunk.current.clone();
+                emit(
+                    "unit_reindexed",
+                    json!({
+                        "source": "jsonl",
+                        "path": current.display().to_string(),
+                        "records": chunk.records.len(),
+                        "sessions": chunk.sessions.len(),
+                        "cache_write_ms": 0,
+                    }),
+                );
                 indexed_inputs[idx] = Some(chunk);
                 processed_files = processed_files.saturating_add(1);
                 tx.send(IndexerEvent::Progress {
@@ -585,6 +830,14 @@ fn run_full_scan(
                 .ok();
             }
             Err((current, e)) => {
+                emit(
+                    "unit_failed",
+                    json!({
+                        "source": "jsonl",
+                        "path": current.display().to_string(),
+                        "error": e.to_string(),
+                    }),
+                );
                 processed_files = processed_files.saturating_add(1);
                 tx.send(IndexerEvent::Warn {
                     message: format!("読み取り失敗: {}: {e}", current.display()),
@@ -614,6 +867,16 @@ fn run_full_scan(
                     records = records.saturating_add(chunk.records.len());
                     sessions.extend(chunk.sessions.iter().cloned());
                     let current = chunk.current.clone();
+                    emit(
+                        "unit_reindexed",
+                        json!({
+                            "source": "opencode",
+                            "path": current.display().to_string(),
+                            "records": chunk.records.len(),
+                            "sessions": chunk.sessions.len(),
+                            "cache_write_ms": 0,
+                        }),
+                    );
                     indexed_inputs[index] = Some(chunk);
                     processed_files = processed_files.saturating_add(1);
                     tx.send(IndexerEvent::Progress {
@@ -626,6 +889,14 @@ fn run_full_scan(
                     .ok();
                 }
                 IndexedInputResult::Failed { current, error, .. } => {
+                    emit(
+                        "unit_failed",
+                        json!({
+                            "source": "opencode",
+                            "path": current.display().to_string(),
+                            "error": error,
+                        }),
+                    );
                     processed_files = processed_files.saturating_add(1);
                     tx.send(IndexerEvent::Warn {
                         message: format!("読み取り失敗: {}: {error}", current.display()),
@@ -692,6 +963,13 @@ impl IndexInput {
         match self {
             Self::Jsonl { path, .. } => path,
             Self::OpenCodeSession { session_file, .. } => session_file,
+        }
+    }
+
+    fn telemetry_source_kind(&self) -> &'static str {
+        match self {
+            Self::Jsonl { .. } => "jsonl",
+            Self::OpenCodeSession { .. } => "opencode",
         }
     }
 }
@@ -1882,7 +2160,7 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let first_events = recv_events(&rx1);
         assert!(
             first_events
@@ -1896,7 +2174,7 @@ mod tests {
         );
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
         let second_events = recv_events(&rx2);
         assert!(
             second_events.iter().any(
@@ -1908,6 +2186,55 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, IndexerEvent::Done { records } if records.len() == 1))
         );
+    }
+
+    #[test]
+    fn run_indexer_writes_telemetry_log_with_cache_metrics() {
+        let tmp = TempDir::new("agent-history-telemetry");
+        let jsonl = tmp.path.join("history.jsonl");
+        let cache_db = tmp.path.join("index.sqlite");
+        let telemetry_log = tmp.path.join("events.jsonl");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"telemetry hello\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+        let (tx, rx) = mpsc::channel();
+        run_indexer(cfg, &tx, Some(cache_db), false, Some(telemetry_log.clone())).unwrap();
+        let _ = recv_events(&rx);
+
+        let body = fs::read_to_string(&telemetry_log).unwrap();
+        let rows: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let kinds: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.get("kind").and_then(|value| value.as_str()))
+            .collect();
+
+        assert!(kinds.contains(&"indexer_started"));
+        assert!(kinds.contains(&"cache_open_finished"));
+        assert!(kinds.contains(&"cache_load_finished"));
+        assert!(kinds.contains(&"fingerprint_scan_finished"));
+        assert!(kinds.contains(&"refresh_finished"));
+        assert!(kinds.contains(&"cache_reload_finished"));
+        assert!(kinds.contains(&"indexer_finished"));
+
+        let refresh = rows
+            .iter()
+            .find(|row| {
+                row.get("kind").and_then(|value| value.as_str()) == Some("refresh_finished")
+            })
+            .unwrap();
+        assert_eq!(refresh["data"]["refreshed_units"].as_u64(), Some(1));
+        assert_eq!(refresh["data"]["failed_units"].as_u64(), Some(0));
     }
 
     #[test]
@@ -1957,14 +2284,14 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let first_events = recv_events(&rx1);
         assert!(first_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
 
         fs::write(&part_file, "{not valid json").unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
         let second_events = recv_events(&rx2);
         assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Loaded { records } if records.iter().any(|record| record.text == "hello from cache"))));
         assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
@@ -1988,11 +2315,11 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let _ = recv_events(&rx1);
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), true).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), true, None).unwrap();
         let events = recv_events(&rx2);
         assert!(
             !events
@@ -2024,7 +2351,7 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx, rx) = mpsc::channel();
-        run_indexer(cfg, &tx, Some(bad_cache_path), false).unwrap();
+        run_indexer(cfg, &tx, Some(bad_cache_path), false, None).unwrap();
         let events = recv_events(&rx);
 
         assert!(events.iter().any(
@@ -2052,7 +2379,7 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2066,7 +2393,7 @@ mod tests {
         .unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(
@@ -2123,7 +2450,7 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2148,7 +2475,7 @@ mod tests {
         .unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(
@@ -2176,13 +2503,13 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
         let _ = recv_events(&rx1);
 
         fs::remove_file(&jsonl).unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(

@@ -36,4 +36,12 @@ pub struct Args {
     /// 永続キャッシュを破棄して再構築する
     #[arg(long)]
     pub rebuild_index: bool,
+
+    /// イベント/メトリクスのJSONLログ出力先
+    #[arg(long, value_name = "PATH")]
+    pub telemetry_log: Option<PathBuf>,
+
+    /// イベント/メトリクスのJSONLログを無効化する
+    #[arg(long)]
+    pub no_telemetry: bool,
 }

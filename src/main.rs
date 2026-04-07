@@ -2,6 +2,7 @@ mod args;
 mod cache;
 mod indexer;
 mod search;
+mod telemetry;
 mod tui;
 
 use anyhow::Context as _;
