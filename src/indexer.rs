@@ -52,16 +52,23 @@ pub struct MessageRecord {
     pub line: u32,
 
     pub session_id: Option<String>,
+    pub account: Option<String>,
     pub cwd: Option<String>,
     pub phase: Option<String>,
 
     pub source: SourceKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JsonlInputRoot {
+    pub path: PathBuf,
+    pub account: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
-    pub roots: Vec<PathBuf>,
-    pub extra_files: Vec<PathBuf>,
+    pub roots: Vec<JsonlInputRoot>,
+    pub extra_files: Vec<JsonlInputRoot>,
     pub opencode_storage_roots: Vec<PathBuf>,
 }
 
@@ -97,6 +104,12 @@ struct FileContext {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountConfigKind {
+    Codex,
+    Claude,
+}
+
 pub fn spawn_indexer_from_args(args: Args) -> mpsc::Receiver<IndexerEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -121,8 +134,8 @@ struct RootScanProgress {
 fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
     let home = env::var_os("HOME").map(PathBuf::from);
 
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut extra_files: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<JsonlInputRoot> = Vec::new();
+    let mut extra_files: Vec<JsonlInputRoot> = Vec::new();
     let mut opencode_storage_roots: Vec<PathBuf> = Vec::new();
 
     if !args.no_default_roots
@@ -130,21 +143,58 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
     {
         let sessions = home.join(".codex/sessions");
         if sessions.is_dir() {
-            roots.push(sessions);
+            roots.push(JsonlInputRoot {
+                path: sessions,
+                account: None,
+            });
         }
         let archived = home.join(".codex/archived_sessions");
         if archived.is_dir() {
-            roots.push(archived);
+            roots.push(JsonlInputRoot {
+                path: archived,
+                account: None,
+            });
         }
 
         let claude_projects = home.join(".claude/projects");
         if claude_projects.is_dir() {
-            roots.push(claude_projects);
+            roots.push(JsonlInputRoot {
+                path: claude_projects,
+                account: None,
+            });
         }
 
         let opencode_storage = home.join(".local/share/opencode/storage");
         if opencode_storage.is_dir() {
             opencode_storage_roots.push(opencode_storage);
+        }
+
+        for (account, dir) in discover_account_config_dirs(home, AccountConfigKind::Codex) {
+            let sessions = dir.join("sessions");
+            if sessions.is_dir() {
+                roots.push(JsonlInputRoot {
+                    path: sessions,
+                    account: Some(account.clone()),
+                });
+            }
+
+            let archived = dir.join("archived_sessions");
+            if archived.is_dir() {
+                roots.push(JsonlInputRoot {
+                    path: archived,
+                    account: Some(account.clone()),
+                });
+            }
+        }
+
+        for (account, dir) in discover_account_config_dirs(home, AccountConfigKind::Claude) {
+            let projects = dir.join("projects");
+            if projects.is_dir() {
+                roots.push(JsonlInputRoot {
+                    path: projects,
+                    account: Some(account),
+                });
+            }
         }
 
         // プロジェクト配下にある `.codex/sessions` なども自動検出して追加する
@@ -162,7 +212,10 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
     }
 
     for root in &args.roots {
-        roots.push(expand_tilde(root, home.as_deref()));
+        roots.push(JsonlInputRoot {
+            path: expand_tilde(root, home.as_deref()),
+            account: None,
+        });
     }
 
     if args.include_history {
@@ -191,7 +244,20 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
 
         let history = home.join(".codex/history.jsonl");
         if history.is_file() {
-            extra_files.push(history);
+            extra_files.push(JsonlInputRoot {
+                path: history,
+                account: None,
+            });
+        }
+
+        for (account, dir) in discover_account_config_dirs(home, AccountConfigKind::Codex) {
+            let history = dir.join("history.jsonl");
+            if history.is_file() {
+                extra_files.push(JsonlInputRoot {
+                    path: history,
+                    account: Some(account),
+                });
+            }
         }
     }
 
@@ -222,7 +288,7 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
 
     let total_files = inputs.len();
     let mut out: Vec<MessageRecord> = Vec::new();
-    let mut sessions: HashSet<(SourceKind, String)> = HashSet::new();
+    let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
 
     for (processed_files, input) in inputs.into_iter().enumerate() {
         let processed_files = processed_files.saturating_add(1);
@@ -253,7 +319,10 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexInput {
-    Jsonl(PathBuf),
+    Jsonl {
+        path: PathBuf,
+        account: Option<String>,
+    },
     OpenCodeSession {
         storage_root: PathBuf,
         session_file: PathBuf,
@@ -263,20 +332,23 @@ enum IndexInput {
 impl IndexInput {
     fn path(&self) -> &Path {
         match self {
-            Self::Jsonl(path) => path,
+            Self::Jsonl { path, .. } => path,
             Self::OpenCodeSession { session_file, .. } => session_file,
         }
     }
 }
 
 fn collect_index_inputs(
-    roots: &[PathBuf],
-    extra_files: &[PathBuf],
+    roots: &[JsonlInputRoot],
+    extra_files: &[JsonlInputRoot],
     opencode_storage_roots: &[PathBuf],
 ) -> Vec<IndexInput> {
     let mut out: Vec<IndexInput> = collect_jsonl_files(roots, extra_files)
         .into_iter()
-        .map(IndexInput::Jsonl)
+        .map(|input| IndexInput::Jsonl {
+            path: input.path,
+            account: input.account,
+        })
         .collect();
     out.extend(collect_opencode_session_files(opencode_storage_roots));
     out.sort();
@@ -284,18 +356,21 @@ fn collect_index_inputs(
     out
 }
 
-fn collect_jsonl_files(roots: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+fn collect_jsonl_files(
+    roots: &[JsonlInputRoot],
+    extra_files: &[JsonlInputRoot],
+) -> Vec<JsonlInputRoot> {
+    let mut out: Vec<JsonlInputRoot> = Vec::new();
 
     for root in roots {
-        if root.is_file() {
-            if root.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                out.push(root.to_path_buf());
+        if root.path.is_file() {
+            if root.path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                out.push(root.clone());
             }
             continue;
         }
 
-        for entry in WalkDir::new(root)
+        for entry in WalkDir::new(&root.path)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
@@ -314,13 +389,16 @@ fn collect_jsonl_files(roots: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBu
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            out.push(path.to_path_buf());
+            out.push(JsonlInputRoot {
+                path: path.to_path_buf(),
+                account: root.account.clone(),
+            });
         }
     }
 
     for file in extra_files {
-        if file.is_file() {
-            out.push(file.to_path_buf());
+        if file.path.is_file() {
+            out.push(file.clone());
         }
     }
 
@@ -365,10 +443,12 @@ fn collect_opencode_session_files(storage_roots: &[PathBuf]) -> Vec<IndexInput> 
 fn index_input(
     input: IndexInput,
     out: &mut Vec<MessageRecord>,
-    sessions: &mut HashSet<(SourceKind, String)>,
+    sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<()> {
     match input {
-        IndexInput::Jsonl(file) => index_file(&file, out, sessions),
+        IndexInput::Jsonl { path, account } => {
+            index_file(&path, account.as_deref(), out, sessions)
+        }
         IndexInput::OpenCodeSession {
             storage_root,
             session_file,
@@ -378,8 +458,9 @@ fn index_input(
 
 fn index_file(
     file: &Path,
+    account: Option<&str>,
     out: &mut Vec<MessageRecord>,
-    sessions: &mut HashSet<(SourceKind, String)>,
+    sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<()> {
     let f = File::open(file)?;
     let mut reader = BufReader::new(f);
@@ -405,9 +486,9 @@ fn index_file(
             continue;
         };
 
-        if let Some(rec) = extract_record(&v, file, line_no, &mut ctx) {
+        if let Some(rec) = extract_record(&v, file, line_no, &mut ctx, account) {
             if let Some(sid) = rec.session_id.as_deref() {
-                sessions.insert((rec.source, sid.to_string()));
+                sessions.insert((rec.source, sid.to_string(), rec.account.clone()));
             }
             out.push(rec);
         }
@@ -471,7 +552,7 @@ fn index_opencode_session_file(
     storage_root: &Path,
     session_file: &Path,
     out: &mut Vec<MessageRecord>,
-    sessions: &mut HashSet<(SourceKind, String)>,
+    sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<()> {
     let session: OpenCodeSession = serde_json::from_reader(File::open(session_file)?)?;
     let message_dir = storage_root.join("message").join(&session.id);
@@ -532,6 +613,7 @@ fn index_opencode_session_file(
             file: text_file,
             line: 1,
             session_id: Some(message.session_id.clone()),
+            account: None,
             cwd,
             phase,
             source: SourceKind::OpenCodeSession,
@@ -549,6 +631,7 @@ fn index_opencode_session_file(
             file: session_file.to_path_buf(),
             line: 1,
             session_id: Some(session.id.clone()),
+            account: None,
             cwd: session_cwd,
             phase: Some("title".to_string()),
             source: SourceKind::OpenCodeSession,
@@ -557,7 +640,7 @@ fn index_opencode_session_file(
     }
 
     if records_added > 0 {
-        sessions.insert((SourceKind::OpenCodeSession, session.id));
+        sessions.insert((SourceKind::OpenCodeSession, session.id, None));
     }
 
     Ok(())
@@ -634,16 +717,58 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     path.to_path_buf()
 }
 
+fn discover_account_config_dirs(
+    home: &Path,
+    kind: AccountConfigKind,
+) -> Vec<(String, PathBuf)> {
+    let prefix = match kind {
+        AccountConfigKind::Codex => ".codex-",
+        AccountConfigKind::Claude => ".claude-",
+    };
+
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let Ok(entries) = fs::read_dir(home) else {
+        return out;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(account) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let account = account.trim();
+        if account.is_empty() {
+            continue;
+        }
+
+        out.push((account.to_string(), entry.path()));
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn discover_project_codex_stores_with_progress(
     home: &Path,
     mut on_progress: impl FnMut(RootScanProgress),
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
+) -> (Vec<JsonlInputRoot>, Vec<JsonlInputRoot>) {
     const PROGRESS_EVERY_DIRS: usize = 500;
 
     // `~/.codex` は既にデフォルトで入れているので、ここでは「プロジェクト配下」の .codex を拾う。
     // ただしスキャン対象全体をHOME直下にしておくと、ユーザーの作業ディレクトリ構成に依存しない。
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<JsonlInputRoot> = Vec::new();
+    let mut files: Vec<JsonlInputRoot> = Vec::new();
 
     let user_codex = home.join(".codex");
     let walker = WalkDir::new(home)
@@ -669,6 +794,7 @@ fn discover_project_codex_stores_with_progress(
                 }
                 // HOME直下の `.claude` は別ルートで入れるので、ここでは潜らない（スキャン短縮）
                 ".claude" => false,
+                name if name.starts_with(".codex-") || name.starts_with(".claude-") => false,
                 _ => true,
             }
         });
@@ -704,15 +830,24 @@ fn discover_project_codex_stores_with_progress(
 
         let sessions = dir.join("sessions");
         if sessions.is_dir() {
-            roots.push(sessions);
+            roots.push(JsonlInputRoot {
+                path: sessions,
+                account: None,
+            });
         }
         let archived = dir.join("archived_sessions");
         if archived.is_dir() {
-            roots.push(archived);
+            roots.push(JsonlInputRoot {
+                path: archived,
+                account: None,
+            });
         }
         let history = dir.join("history.jsonl");
         if history.is_file() {
-            files.push(history);
+            files.push(JsonlInputRoot {
+                path: history,
+                account: None,
+            });
         }
     }
 
@@ -735,19 +870,20 @@ fn extract_record(
     file: &Path,
     line: u32,
     ctx: &mut FileContext,
+    account: Option<&str>,
 ) -> Option<MessageRecord> {
     // 1) Codex session jsonl
-    if let Some(rec) = extract_codex_session_record(v, file, line, ctx) {
+    if let Some(rec) = extract_codex_session_record(v, file, line, ctx, account) {
         return Some(rec);
     }
 
     // 2) Claude project jsonl (~/.claude/projects/**.jsonl)
-    if let Some(rec) = extract_claude_project_record(v, file, line) {
+    if let Some(rec) = extract_claude_project_record(v, file, line, account) {
         return Some(rec);
     }
 
     // 3) Codex history jsonl (~/.codex/history.jsonl)
-    extract_codex_history_record(v, file, line)
+    extract_codex_history_record(v, file, line, account)
 }
 
 fn extract_content_text(payload: &Value) -> Option<String> {
@@ -770,6 +906,7 @@ fn extract_codex_session_record(
     file: &Path,
     line: u32,
     ctx: &mut FileContext,
+    account: Option<&str>,
 ) -> Option<MessageRecord> {
     let ty = v.get("type").and_then(|x| x.as_str())?;
     let payload = v.get("payload")?;
@@ -820,13 +957,19 @@ fn extract_codex_session_record(
         file: file.to_path_buf(),
         line,
         session_id: ctx.session_id.clone(),
+        account: account.map(|s| s.to_string()),
         cwd: ctx.cwd.clone(),
         phase,
         source: SourceKind::CodexSessionJsonl,
     })
 }
 
-fn extract_claude_project_record(v: &Value, file: &Path, line: u32) -> Option<MessageRecord> {
+fn extract_claude_project_record(
+    v: &Value,
+    file: &Path,
+    line: u32,
+    account: Option<&str>,
+) -> Option<MessageRecord> {
     // 例:
     // {"type":"user", ... , "message":{"role":"user","content":"..."}, "timestamp":"..."}
     // {"type":"assistant", ... , "message":{"role":"assistant","content":[{"type":"text","text":"..."}]}, "timestamp":"..."}
@@ -861,6 +1004,7 @@ fn extract_claude_project_record(v: &Value, file: &Path, line: u32) -> Option<Me
         file: file.to_path_buf(),
         line,
         session_id,
+        account: account.map(|s| s.to_string()),
         cwd,
         phase: None,
         source: SourceKind::ClaudeProjectJsonl,
@@ -918,7 +1062,12 @@ fn extract_claude_message_text(message: &Value) -> Option<String> {
     Some(parts.join("\n"))
 }
 
-fn extract_codex_history_record(v: &Value, file: &Path, line: u32) -> Option<MessageRecord> {
+fn extract_codex_history_record(
+    v: &Value,
+    file: &Path,
+    line: u32,
+    account: Option<&str>,
+) -> Option<MessageRecord> {
     #[derive(Deserialize)]
     struct HistoryLine {
         session_id: Option<String>,
@@ -940,6 +1089,7 @@ fn extract_codex_history_record(v: &Value, file: &Path, line: u32) -> Option<Mes
         file: file.to_path_buf(),
         line,
         session_id: Some(session_id),
+        account: account.map(|s| s.to_string()),
         cwd: None,
         phase: None,
         source: SourceKind::CodexHistoryJsonl,
@@ -976,12 +1126,16 @@ mod tests {
         }
     }
 
+    fn contains_path(entries: &[JsonlInputRoot], path: &Path) -> bool {
+        entries.iter().any(|entry| entry.path == path)
+    }
+
     #[test]
     fn extracts_session_message() {
         let line = r#"{"timestamp":"2026-02-11T14:16:44.023Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"了解。"}],"phase":"commentary"}}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let mut ctx = FileContext::default();
-        let rec = extract_record(&v, Path::new("/tmp/x.jsonl"), 12, &mut ctx).unwrap();
+        let rec = extract_record(&v, Path::new("/tmp/x.jsonl"), 12, &mut ctx, None).unwrap();
         assert_eq!(rec.role, Role::Assistant);
         assert_eq!(rec.phase.as_deref(), Some("commentary"));
         assert_eq!(rec.text, "了解。");
@@ -993,7 +1147,7 @@ mod tests {
         let meta = r#"{"timestamp":"2026-02-11T12:05:47.856Z","type":"session_meta","payload":{"id":"abc","cwd":"/home/tizze/x"}}"#;
         let v: Value = serde_json::from_str(meta).unwrap();
         let mut ctx = FileContext::default();
-        let rec = extract_record(&v, Path::new("/tmp/x.jsonl"), 1, &mut ctx);
+        let rec = extract_record(&v, Path::new("/tmp/x.jsonl"), 1, &mut ctx, None);
         assert!(rec.is_none());
         assert_eq!(ctx.session_id.as_deref(), Some("abc"));
         assert_eq!(ctx.cwd.as_deref(), Some("/home/tizze/x"));
@@ -1004,7 +1158,7 @@ mod tests {
         let line = r#"{"session_id":"s1","ts":123,"text":"hello"}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let mut ctx = FileContext::default();
-        let rec = extract_record(&v, Path::new("/tmp/h.jsonl"), 99, &mut ctx).unwrap();
+        let rec = extract_record(&v, Path::new("/tmp/h.jsonl"), 99, &mut ctx, None).unwrap();
         assert_eq!(rec.text, "hello");
         assert_eq!(rec.session_id.as_deref(), Some("s1"));
         assert_eq!(rec.timestamp.as_deref(), Some("123"));
@@ -1015,11 +1169,21 @@ mod tests {
         let line = r#"{"type":"user","cwd":"/x","sessionId":"s2","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let mut ctx = FileContext::default();
-        let rec = extract_record(&v, Path::new("/tmp/c.jsonl"), 5, &mut ctx).unwrap();
+        let rec = extract_record(&v, Path::new("/tmp/c.jsonl"), 5, &mut ctx, None).unwrap();
         assert_eq!(rec.text, "hi");
         assert_eq!(rec.cwd.as_deref(), Some("/x"));
         assert_eq!(rec.session_id.as_deref(), Some("s2"));
         assert_eq!(rec.source, SourceKind::ClaudeProjectJsonl);
+    }
+
+    #[test]
+    fn extract_record_preserves_account_namespace() {
+        let line = r#"{"type":"user","cwd":"/x","sessionId":"s2","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#;
+        let v: Value = serde_json::from_str(line).unwrap();
+        let mut ctx = FileContext::default();
+        let rec =
+            extract_record(&v, Path::new("/tmp/c.jsonl"), 5, &mut ctx, Some("work")).unwrap();
+        assert_eq!(rec.account.as_deref(), Some("work"));
     }
 
     #[test]
@@ -1035,11 +1199,17 @@ mod tests {
         fs::write(root.join("nested/subagents/c.jsonl"), "{}\n").unwrap();
         fs::write(root.join("nested/d.jsonl"), "{}\n").unwrap();
 
-        let files = collect_jsonl_files(&[root.to_path_buf()], &[]);
-        assert!(files.contains(&root.join("a.jsonl")));
-        assert!(files.contains(&root.join("nested/d.jsonl")));
-        assert!(!files.contains(&root.join("subagents/b.jsonl")));
-        assert!(!files.contains(&root.join("nested/subagents/c.jsonl")));
+        let files = collect_jsonl_files(
+            &[JsonlInputRoot {
+                path: root.to_path_buf(),
+                account: None,
+            }],
+            &[],
+        );
+        assert!(contains_path(&files, &root.join("a.jsonl")));
+        assert!(contains_path(&files, &root.join("nested/d.jsonl")));
+        assert!(!contains_path(&files, &root.join("subagents/b.jsonl")));
+        assert!(!contains_path(&files, &root.join("nested/subagents/c.jsonl")));
     }
 
     #[test]
@@ -1134,7 +1304,7 @@ mod tests {
         assert_eq!(out[0].session_id.as_deref(), Some("ses_demo"));
         assert_eq!(out[0].timestamp.as_deref(), Some("220"));
         assert_eq!(out[0].phase.as_deref(), Some("orchestrator"));
-        assert!(sessions.contains(&(SourceKind::OpenCodeSession, "ses_demo".to_string())));
+        assert!(sessions.contains(&(SourceKind::OpenCodeSession, "ses_demo".to_string(), None)));
     }
 
     #[test]
@@ -1214,17 +1384,32 @@ mod tests {
 
         let (roots, files) = discover_project_codex_stores_with_progress(home, |_| {});
 
-        assert!(roots.contains(&home.join("projects/p1/.codex/sessions")));
-        assert!(roots.contains(&home.join("projects/p2/.codex/archived_sessions")));
-        assert!(files.contains(&home.join("projects/p3/.codex/history.jsonl")));
+        assert!(contains_path(&roots, &home.join("projects/p1/.codex/sessions")));
+        assert!(contains_path(
+            &roots,
+            &home.join("projects/p2/.codex/archived_sessions")
+        ));
+        assert!(contains_path(
+            &files,
+            &home.join("projects/p3/.codex/history.jsonl")
+        ));
 
         // user-scope の ~/.codex は対象外
-        assert!(!roots.contains(&home.join(".codex/sessions")));
+        assert!(!contains_path(&roots, &home.join(".codex/sessions")));
 
         // 除外配下
-        assert!(!roots.contains(&home.join("projects/p4/.git/.codex/sessions")));
-        assert!(!roots.contains(&home.join("projects/p5/node_modules/.codex/sessions")));
-        assert!(!roots.contains(&home.join(".claude/projects/p6/.codex/sessions")));
+        assert!(!contains_path(
+            &roots,
+            &home.join("projects/p4/.git/.codex/sessions")
+        ));
+        assert!(!contains_path(
+            &roots,
+            &home.join("projects/p5/node_modules/.codex/sessions")
+        ));
+        assert!(!contains_path(
+            &roots,
+            &home.join(".claude/projects/p6/.codex/sessions")
+        ));
     }
 
     #[test]
@@ -1246,6 +1431,27 @@ mod tests {
         assert_eq!(last.found_files, files.len());
         assert_eq!(last.current, home.to_path_buf());
         assert!(last.scanned_dirs >= 1);
+    }
+
+    #[test]
+    fn discover_account_config_dirs_finds_suffix_profiles_with_sanity_checks() {
+        let tmp = TempDir::new("agent-history-account-dirs");
+        let home = &tmp.path;
+
+        fs::create_dir_all(home.join(".codex-work")).unwrap();
+        fs::create_dir_all(home.join(".claude-personal")).unwrap();
+        fs::write(home.join(".codex-bad"), "not a dir").unwrap();
+        fs::create_dir_all(home.join(".codex-")).unwrap();
+
+        let codex = discover_account_config_dirs(home, AccountConfigKind::Codex);
+        let claude = discover_account_config_dirs(home, AccountConfigKind::Claude);
+
+        assert!(codex.contains(&("work".to_string(), home.join(".codex-work"))));
+        assert!(!codex.iter().any(|(account, _)| account.is_empty()));
+        assert!(claude.contains(&(
+            "personal".to_string(),
+            home.join(".claude-personal")
+        )));
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub struct Args {
     #[arg(long = "root", value_name = "PATH")]
     pub roots: Vec<PathBuf>,
 
-    /// デフォルト検索ルート（~/.codex/sessions と ~/.codex/archived_sessions）を無効化
+    /// デフォルト検索ルート（~/.codex, ~/.codex-*, ~/.claude, ~/.claude-* など）を無効化
     #[arg(long)]
     pub no_default_roots: bool,
 

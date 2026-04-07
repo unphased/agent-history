@@ -53,6 +53,7 @@ struct IndexingProgress {
 struct SessionSummary {
     source: SourceKind,
     session_id: String,
+    account: Option<String>,
     first_user_idx: usize,
     last_ts: Option<String>,
     dir: String,
@@ -86,6 +87,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
     struct SessionKeyRef<'a> {
         source: SourceKind,
         session_id: &'a str,
+        account: Option<&'a str>,
     }
 
     let mut by_session: HashMap<SessionKeyRef<'_>, SessionAgg<'_>> = HashMap::new();
@@ -130,6 +132,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
             .entry(SessionKeyRef {
                 source: rec.source,
                 session_id,
+                account: rec.account.as_deref(),
             })
             .or_default();
 
@@ -166,6 +169,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
             SessionSummary {
                 source: key.source,
                 session_id: key.session_id.to_string(),
+                account: key.account.map(|s| s.to_string()),
                 first_user_idx,
                 last_ts: agg.last_ts.map(|s| s.to_string()),
                 dir: dir_name_from_cwd(
@@ -193,6 +197,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
     items.sort_by(|(a, _), (b, _)| {
         ts_cmp_opt(a.last_ts.as_deref(), b.last_ts.as_deref())
             .reverse()
+            .then_with(|| a.account.cmp(&b.account))
             .then_with(|| a.session_id.cmp(&b.session_id))
             .then_with(|| source_sort_key(a.source).cmp(&source_sort_key(b.source)))
     });
@@ -210,11 +215,15 @@ fn source_sort_key(source: SourceKind) -> u8 {
     }
 }
 
-fn provider_icon(source: SourceKind) -> &'static str {
-    match source {
-        SourceKind::ClaudeProjectJsonl => "[C]",
-        SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => "[O]",
-        SourceKind::OpenCodeSession => "[OC]",
+fn provider_label(source: SourceKind, account: Option<&str>) -> String {
+    let base = match source {
+        SourceKind::ClaudeProjectJsonl => "C",
+        SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => "O",
+        SourceKind::OpenCodeSession => "OC",
+    };
+    match account.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(account) => format!("{base} {account}"),
+        None => base.to_string(),
     }
 }
 
@@ -293,10 +302,10 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
 fn result_line(sess: &SessionSummary, matched: Option<&MessageRecord>, hit_count: usize) -> String {
     let ts = short_ts(sess.last_ts.as_deref());
     let prefix = format!(
-        "{} {} {} {}",
+        "{} {} [{}] {}",
         ts,
+        provider_label(sess.source, sess.account.as_deref()),
         sess.dir,
-        provider_icon(sess.source),
         sess.first_line,
     );
 
@@ -923,6 +932,7 @@ impl App {
                     "timestamp: {}",
                     rec.timestamp.as_deref().unwrap_or("")
                 )),
+                Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                 Line::raw(format!(
                     "role: {role}   phase: {}",
                     rec.phase.as_deref().unwrap_or("")
@@ -970,6 +980,7 @@ impl App {
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
+            Line::raw(format!("account: {}", sess.account.as_deref().unwrap_or(""))),
             Line::raw(format!("source: {}", source_label(sess.source))),
             Line::raw(format!("session opener: {}", sess.first_line)),
             Line::raw(format!(
@@ -1012,6 +1023,7 @@ impl App {
                         "timestamp: {}",
                         rec.timestamp.as_deref().unwrap_or("")
                     )),
+                    Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                     Line::raw(format!(
                         "role: {role}   phase: {}",
                         rec.phase.as_deref().unwrap_or("")
@@ -1459,23 +1471,41 @@ fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarg
 
     match rec.source {
         SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => {
-            let mut args = vec!["resume".to_string()];
+            let mut args = Vec::new();
+            let program = if let Some(account) = rec.account.as_deref() {
+                args.push(account.to_string());
+                "codex-account".to_string()
+            } else {
+                "codex".to_string()
+            };
+            args.push("resume".to_string());
             if let Some(dir) = cwd.as_ref() {
                 args.push("-C".to_string());
                 args.push(dir.to_string_lossy().to_string());
             }
             args.push(sid.to_string());
             Some(ResumeTarget {
-                program: "codex".to_string(),
+                program,
                 args,
                 current_dir: cwd,
             })
         }
-        SourceKind::ClaudeProjectJsonl => Some(ResumeTarget {
-            program: "claude".to_string(),
-            args: vec!["--resume".to_string(), sid.to_string()],
-            current_dir: cwd,
-        }),
+        SourceKind::ClaudeProjectJsonl => {
+            let (program, mut args) = if let Some(account) = rec.account.as_deref() {
+                (
+                    "claude-account".to_string(),
+                    vec![account.to_string(), "--resume".to_string()],
+                )
+            } else {
+                ("claude".to_string(), vec!["--resume".to_string()])
+            };
+            args.push(sid.to_string());
+            Some(ResumeTarget {
+                program,
+                args,
+                current_dir: cwd,
+            })
+        }
         SourceKind::OpenCodeSession => Some(ResumeTarget {
             program: "opencode".to_string(),
             args: vec!["--session".to_string(), sid.to_string()],
@@ -1565,6 +1595,7 @@ mod tests {
             file: PathBuf::from("/tmp/x.jsonl"),
             line: 1,
             session_id: Some("019c5a97-1de5-7371-80ef-72ae0f764f43".to_string()),
+            account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
             source: SourceKind::CodexSessionJsonl,
@@ -1615,6 +1646,7 @@ mod tests {
             file: PathBuf::from("/tmp/x.jsonl"),
             line: 1,
             session_id: Some("8adefc6b-d73e-4a0b-a330-9be4114a5bdb".to_string()),
+            account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
             source: SourceKind::ClaudeProjectJsonl,
@@ -1651,6 +1683,82 @@ mod tests {
     }
 
     #[test]
+    fn resume_target_for_account_scoped_codex_uses_wrapper() {
+        let rec = MessageRecord {
+            timestamp: None,
+            role: Role::User,
+            text: "x".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("sid".to_string()),
+            account: Some("work".to_string()),
+            cwd: None,
+            phase: None,
+            source: SourceKind::CodexSessionJsonl,
+        };
+
+        let app = App {
+            query: String::new(),
+            max_results: 0,
+            all: vec![rec.clone()],
+            sessions: Vec::new(),
+            session_records: Vec::new(),
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        let target = resume_target_for_record(&app, &rec).unwrap();
+        assert_eq!(target.program, "codex-account");
+        assert_eq!(target.args, vec!["work", "resume", "sid"]);
+    }
+
+    #[test]
+    fn resume_target_for_account_scoped_claude_uses_wrapper() {
+        let rec = MessageRecord {
+            timestamp: None,
+            role: Role::User,
+            text: "x".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("sid".to_string()),
+            account: Some("abc".to_string()),
+            cwd: None,
+            phase: None,
+            source: SourceKind::ClaudeProjectJsonl,
+        };
+
+        let app = App {
+            query: String::new(),
+            max_results: 0,
+            all: vec![rec.clone()],
+            sessions: Vec::new(),
+            session_records: Vec::new(),
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        let target = resume_target_for_record(&app, &rec).unwrap();
+        assert_eq!(target.program, "claude-account");
+        assert_eq!(target.args, vec!["abc", "--resume", "sid"]);
+    }
+
+    #[test]
     fn resume_target_for_opencode_uses_session_flag() {
         let tmp = TempDir::new("agent-history");
         let cwd = tmp.path.join("proj");
@@ -1663,6 +1771,7 @@ mod tests {
             file: PathBuf::from("/tmp/x.json"),
             line: 1,
             session_id: Some("ses_demo".to_string()),
+            account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: Some("orchestrator".to_string()),
             source: SourceKind::OpenCodeSession,
@@ -1728,6 +1837,7 @@ mod tests {
             file: PathBuf::from("/tmp/x.jsonl"),
             line: 1,
             session_id: Some(session_id.to_string()),
+            account: None,
             cwd: None,
             phase: None,
             source,
@@ -1791,6 +1901,32 @@ mod tests {
         assert_eq!(all[sessions[1].first_user_idx].role, Role::User);
         assert_eq!(all[sessions[1].first_user_idx].text, "first hello");
         assert_eq!(records[1].len(), 3);
+    }
+
+    #[test]
+    fn build_session_index_keeps_same_session_id_separate_across_accounts() {
+        let mut a = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "account a",
+            "shared",
+            SourceKind::CodexSessionJsonl,
+        );
+        a.account = Some("a".to_string());
+
+        let mut b = mr(
+            Some("2026-02-11T00:00:01Z"),
+            Role::User,
+            "account b",
+            "shared",
+            SourceKind::CodexSessionJsonl,
+        );
+        b.account = Some("b".to_string());
+
+        let (sessions, _) = build_session_index(&[a, b]);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|sess| sess.account.as_deref() == Some("a")));
+        assert!(sessions.iter().any(|sess| sess.account.as_deref() == Some("b")));
     }
 
     #[test]
@@ -1938,8 +2074,8 @@ mod tests {
 
         app.update_results();
         let doc = app.build_preview_doc();
-        assert_eq!(doc.first_match_line, 7);
-        assert_eq!(app.preview_scroll, 5);
+        assert_eq!(doc.first_match_line, 8);
+        assert_eq!(app.preview_scroll, 6);
     }
 
     #[test]
@@ -2172,6 +2308,7 @@ mod tests {
         let sess = SessionSummary {
             source: SourceKind::CodexSessionJsonl,
             session_id: "s1".to_string(),
+            account: None,
             first_user_idx: 0,
             last_ts: Some("2026-02-10T00:00:00Z".to_string()),
             dir: "proj".to_string(),
@@ -2184,6 +2321,7 @@ mod tests {
             file: PathBuf::from("/tmp/x.jsonl"),
             line: 1,
             session_id: Some("s1".to_string()),
+            account: None,
             cwd: None,
             phase: None,
             source: SourceKind::CodexSessionJsonl,
@@ -2211,11 +2349,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_icon_distinguishes_supported_providers() {
-        assert_eq!(provider_icon(SourceKind::ClaudeProjectJsonl), "[C]");
-        assert_eq!(provider_icon(SourceKind::CodexSessionJsonl), "[O]");
-        assert_eq!(provider_icon(SourceKind::CodexHistoryJsonl), "[O]");
-        assert_eq!(provider_icon(SourceKind::OpenCodeSession), "[OC]");
+    fn provider_label_distinguishes_supported_providers() {
+        assert_eq!(provider_label(SourceKind::ClaudeProjectJsonl, None), "C");
+        assert_eq!(provider_label(SourceKind::CodexSessionJsonl, None), "O");
+        assert_eq!(provider_label(SourceKind::CodexHistoryJsonl, None), "O");
+        assert_eq!(provider_label(SourceKind::OpenCodeSession, None), "OC");
+        assert_eq!(
+            provider_label(SourceKind::ClaudeProjectJsonl, Some("abc")),
+            "C abc"
+        );
     }
 
     #[test]

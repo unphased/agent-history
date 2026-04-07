@@ -1,8 +1,23 @@
 # agent-history
 Codex / Claude / OpenCode の会話履歴を、プロジェクト横断で全文検索できるTUIツール。
 
+## このforkでの大きな変更
+upstream の `origin/main` と比べると、このforkはかなり大きく拡張されています。
+
+- OpenCode の履歴インデックス化と resume 対応を追加。
+- 検索結果を「ただセッションが出るだけ」から改善し、マッチした断片、マッチしたメッセージのプレビュー、実際のヒット位置を中心にした pager 表示に対応。
+- 結果一覧とプレビューの両方でクエリハイライトを追加。
+- プレビューを大幅強化し、キーボードスクロール、マウスホイールスクロール、左右ペインでのホイール振り分け、折り返し行を考慮したスクロール制御、複数ヒットの連続表示に対応。
+- 巨大セッションでも状況を把握しやすいように、複数マッチの表示件数やクエリ出現回数の集計を出すよう改善。
+- 結果一覧の表示形式と provider 表示を見直し、一覧性を向上。
+- `~/.codex-work` や `~/.claude-work` のようなアカウント別ディレクトリを自動検出し、別 namespace として扱い、`codex-account <name>` / `claude-account <name>` で resume できるように拡張。
+
+要するに、もはや upstream の最初の検索TUIのままではなく、複数の agent 実装と複数アカウントを横断して扱えるローカル履歴ブラウザに近いものになっています。
+
 - Codex: `~/.codex/sessions/**.jsonl` / `~/.codex/archived_sessions/**.jsonl`
+- Codexアカウント: `~/.codex-<account>/{sessions,archived_sessions}/**.jsonl`
 - Claude: `~/.claude/projects/**.jsonl`
+- Claudeアカウント: `~/.claude-<account>/projects/**.jsonl`
 - OpenCode: `~/.local/share/opencode/storage/{session,message,part}`
 - 追加: `$HOME` 配下の `**/.codex/{sessions,archived_sessions}` と `**/.codex/history.jsonl` を自動検出（`.git`, `node_modules` などは除外）
 
@@ -15,7 +30,9 @@ cargo install --path .
 ## 必要なもの
 - Rust toolchain（ソースからビルド/インストールする場合）
 - 任意: `codex` CLI（`Enter`でOpenAI/Codexセッションをresumeする場合）
+- 任意: `codex-account` ラッパー（`~/.codex-work` のようなアカウント別Codexセッションを `Enter` でresumeする場合）
 - 任意: `claude` CLI（`Enter`でClaudeセッションをresumeする場合）
+- 任意: `claude-account` ラッパー（`~/.claude-work` のようなアカウント別Claudeセッションを `Enter` でresumeする場合）
 - 任意: `opencode` CLI（`Enter`でOpenCodeセッションをresumeする場合）
 - 任意: `$PAGER`（未指定なら`less -R`。`Ctrl+o`で使用）
 
@@ -34,11 +51,13 @@ cargo run --release
 ```
 
 ### 表示
-結果一覧は `日時(最終更新) ディレクトリ名 C|O|OC 最初の発言(1行目)`。
+結果一覧は `日時(最終更新) C|O|OC[ account] [ディレクトリ名] 最初の発言(1行目)`。
 
 - `C`: Claude
 - `O`: OpenAI/Codex
 - `OC`: OpenCode
+- `~/.claude-work` や `~/.codex-work` のようなアカウント別ホームディレクトリは `C work` / `O work` のように表示します
+- セッションのディレクトリ名は `[instrumenter]` のように角括弧で表示します
 
 ※ Codexのログは先頭に `AGENTS.md` や `<environment_context>` が入ることがあるので、一覧の「最初の発言」からは除外します。  
 （それしか無いセッションは一覧に出しません）  
@@ -71,7 +90,7 @@ agent-history --query "GitHub Actions"
 - `Ctrl+u`: クエリ全消し
 - `↑/↓`: 選択移動
 - `PageUp/PageDown`: ページ移動
-- `Enter`: 選択中の会話を `codex resume` / `claude --resume` / `opencode --session` で開く（CLIが必要）
+- `Enter`: 選択中の会話を `codex resume` / `claude --resume` / `opencode --session`、またはアカウント別セッションなら `codex-account <name>` / `claude-account <name>` で開く
 - `Ctrl+o`: 選択中の該当ファイル周辺を `$PAGER`（未指定なら `less -R`）で開く
 - `Esc` / `Ctrl+c`: 終了
 
