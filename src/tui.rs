@@ -266,7 +266,7 @@ fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
                     .unwrap_or_default();
                 out.push(format!(
                     "{label_prefix}{}{}",
-                    osc8_file_hyperlink(path, &path.display().to_string()),
+                    file_url_for_path(path),
                     exists
                 ));
             }
@@ -300,20 +300,12 @@ fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
                     .as_deref()
                     .map(|label| format!("{label}: "))
                     .unwrap_or_default();
-                out.push(format!(
-                    "{label_prefix}{}",
-                    osc8_file_hyperlink(&path, &path.display().to_string())
-                ));
+                out.push(format!("{label_prefix}{}", file_url_for_path(&path)));
             }
         }
     }
 
     out
-}
-
-fn osc8_file_hyperlink(path: &Path, label: &str) -> String {
-    let url = file_url_for_path(path);
-    format!("\u{1b}]8;;{url}\u{1b}\\{label}\u{1b}]8;;\u{1b}\\")
 }
 
 fn file_url_for_path(path: &Path) -> String {
@@ -1084,11 +1076,7 @@ fn handle_key(
                     Some(target) => {
                         let sid = rec.session_id.as_deref().unwrap_or("");
                         let status = run_with_tui_suspended(terminal, || {
-                            let mut cmd = Command::new(&target.program);
-                            cmd.args(&target.args);
-                            if let Some(cwd) = target.current_dir.as_ref() {
-                                cmd.current_dir(cwd);
-                            }
+                            let mut cmd = configured_resume_command(&target);
 
                             for line in resume_loading_lines(&target, sid) {
                                 eprintln!("{line}");
@@ -2061,17 +2049,43 @@ struct ResumeTarget {
     current_dir: Option<PathBuf>,
 }
 
+fn resume_command_string(target: &ResumeTarget) -> String {
+    let mut parts = Vec::with_capacity(target.args.len() + 1);
+    parts.push(shell_escape(&target.program));
+    parts.extend(target.args.iter().map(|arg| shell_escape(arg)));
+    parts.join(" ")
+}
+
+fn resume_shell_command(target: &ResumeTarget) -> String {
+    let cmd = resume_command_string(target);
+    if let Some(cwd) = target.current_dir.as_ref() {
+        format!(
+            "cd {} && exec {}",
+            shell_escape(&cwd.to_string_lossy()),
+            cmd
+        )
+    } else {
+        format!("exec {cmd}")
+    }
+}
+
+fn configured_resume_command(target: &ResumeTarget) -> Command {
+    let shell = env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut cmd = Command::new(shell);
+    cmd.arg("-ic").arg(resume_shell_command(target));
+    cmd
+}
+
 fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     out.push(format!("resuming: {} {}", target.program, session_id));
     if let Some(cwd) = target.current_dir.as_ref() {
         out.push(format!("cwd: {}", cwd.display()));
     }
-    out.push(format!(
-        "command: {} {}",
-        target.program,
-        target.args.join(" ")
-    ));
+    out.push(format!("command: {}", resume_shell_command(target)));
     out.push(String::new());
     out
 }
@@ -2569,7 +2583,49 @@ mod tests {
         let lines = resume_loading_lines(&target, "sid");
         assert_eq!(lines[0], "resuming: codex sid");
         assert_eq!(lines[1], "cwd: /x");
-        assert_eq!(lines[2], "command: codex resume -C /x sid");
+        assert_eq!(
+            lines[2],
+            "command: cd '/x' && exec 'codex' 'resume' '-C' '/x' 'sid'"
+        );
+    }
+
+    #[test]
+    fn resume_shell_command_uses_exec_without_cwd() {
+        let target = ResumeTarget {
+            program: "claude-account".to_string(),
+            args: vec![
+                "work".to_string(),
+                "--resume".to_string(),
+                "sid".to_string(),
+            ],
+            current_dir: None,
+        };
+
+        assert_eq!(
+            resume_shell_command(&target),
+            "exec 'claude-account' 'work' '--resume' 'sid'"
+        );
+    }
+
+    #[test]
+    fn configured_resume_command_uses_shell_with_interactive_command() {
+        let target = ResumeTarget {
+            program: "codex".to_string(),
+            args: vec!["resume".to_string(), "sid".to_string()],
+            current_dir: Some(PathBuf::from("/tmp/proj dir")),
+        };
+
+        let cmd = configured_resume_command(&target);
+        let program = cmd.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(!program.is_empty());
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-ic");
+        assert_eq!(args[1], "cd '/tmp/proj dir' && exec 'codex' 'resume' 'sid'");
     }
 
     fn mr(
@@ -3006,7 +3062,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_record_images_returns_osc8_file_links() {
+    fn materialize_record_images_returns_file_urls() {
         let rec = MessageRecord {
             timestamp: None,
             role: Role::User,
@@ -3030,7 +3086,7 @@ mod tests {
         let rendered = materialize_record_images(&rec);
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("inline: "));
-        assert!(rendered[0].contains("\u{1b}]8;;file:///"));
+        assert!(rendered[0].contains("file:///"));
         assert!(rendered[0].contains("agent-history-images"));
     }
 
