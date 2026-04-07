@@ -201,9 +201,9 @@ fn source_sort_key(source: SourceKind) -> u8 {
 
 fn provider_icon(source: SourceKind) -> &'static str {
     match source {
-        SourceKind::ClaudeProjectJsonl => "C",
-        SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => "O",
-        SourceKind::OpenCodeSession => "OC",
+        SourceKind::ClaudeProjectJsonl => "[C]",
+        SourceKind::CodexSessionJsonl | SourceKind::CodexHistoryJsonl => "[O]",
+        SourceKind::OpenCodeSession => "[OC]",
     }
 }
 
@@ -1634,10 +1634,10 @@ mod tests {
 
     #[test]
     fn provider_icon_distinguishes_supported_providers() {
-        assert_eq!(provider_icon(SourceKind::ClaudeProjectJsonl), "C");
-        assert_eq!(provider_icon(SourceKind::CodexSessionJsonl), "O");
-        assert_eq!(provider_icon(SourceKind::CodexHistoryJsonl), "O");
-        assert_eq!(provider_icon(SourceKind::OpenCodeSession), "OC");
+        assert_eq!(provider_icon(SourceKind::ClaudeProjectJsonl), "[C]");
+        assert_eq!(provider_icon(SourceKind::CodexSessionJsonl), "[O]");
+        assert_eq!(provider_icon(SourceKind::CodexHistoryJsonl), "[O]");
+        assert_eq!(provider_icon(SourceKind::OpenCodeSession), "[OC]");
     }
 
     #[test]
