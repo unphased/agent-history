@@ -1,16 +1,17 @@
 # AGENTS.md
-常に日本語で返答する｡
-コストや時間を度外視し､最もシンプルで､最も素晴らしいものを作るよう常に努める｡
-仕様は要求を実現するための最もシンプルなものを目指す｡
+Always respond in English.
+Disregard cost and time, and always strive to create the simplest and best possible solution.
+Aim for the simplest possible specification that fulfills the request.
 
-# 作業手順
-1. 指示が曖昧な場合は必ず確認する。
-2. コード/設定/リポジトリ内ドキュメントを確認し、分からない点だけ質問する。
-3. 疑問点が解消されたら自動で作業を開始する｡可能な限り自動で作業する｡
+# Workflow
+1. If the instructions are ambiguous, always ask for clarification.
+2. Review the code, configuration, and repository documentation, and ask questions only about what remains unclear.
+3. Once any uncertainties are resolved, start the work automatically. Automate as much of the work as possible.
 
-# ドキュメント案内
-このフォルダには設計・仕様・運用のドキュメントを集約しています。
+Refer to ~/GLOBAL_AGENTS.md (in particular git auto commit behavior).
 
-## 提案の仕方
-- 明確な代替案がある場合のみ簡潔に提案（コスト/メリットを1行で）。
+# Documentation Guide
+This folder consolidates design, specification, and operations documents.
 
+## How To Make Proposals
+- Offer concise proposals only when there is a clear alternative (one line for cost/benefit).
