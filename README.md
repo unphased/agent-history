@@ -2,7 +2,8 @@
 Project-wide full-text search TUI for Codex / Claude / OpenCode conversation logs.
 
 ## Fork Changes
-Compared with upstream `origin/main`, this fork has diverged substantially.
+Compared with upstream `origin/main`, this fork has diverged substantially. Below is a list, initially exhaustive, but
+now no longer updated, of improvments I've (slu) added to the project.
 
 - Added OpenCode history indexing and session resume support.
 - Parallelized OpenCode session indexing so large storage trees refresh faster.
