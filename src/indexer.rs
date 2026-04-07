@@ -821,6 +821,7 @@ fn discover_project_codex_stores_with_progress(
     let mut files: Vec<JsonlInputRoot> = Vec::new();
 
     let user_codex = home.join(".codex");
+    let user_library = home.join("Library");
     let walker = WalkDir::new(home)
         .follow_links(false)
         .max_depth(10)
@@ -831,6 +832,10 @@ fn discover_project_codex_stores_with_progress(
             }
             // `~/.codex` は巨大になりやすいので探索対象から外す（既にデフォルトで別途読み込む）
             if e.path() == user_codex {
+                return false;
+            }
+            // macOS の ~/Library は巨大で、プロジェクト探索先としてはノイズが大きすぎる。
+            if e.path() == user_library {
                 return false;
             }
             let name = e.file_name().to_string_lossy();
@@ -1459,6 +1464,23 @@ mod tests {
         assert!(!contains_path(
             &roots,
             &home.join(".claude/projects/p6/.codex/sessions")
+        ));
+    }
+
+    #[test]
+    fn discover_project_codex_stores_skips_macos_library_tree() {
+        let tmp = TempDir::new("agent-history-macos-library");
+        let home = &tmp.path;
+
+        fs::create_dir_all(home.join("projects/p1/.codex/sessions")).unwrap();
+        fs::create_dir_all(home.join("Library/Mobile Documents/app/.codex/sessions")).unwrap();
+
+        let (roots, _) = discover_project_codex_stores_with_progress(home, |_| {});
+
+        assert!(contains_path(&roots, &home.join("projects/p1/.codex/sessions")));
+        assert!(!contains_path(
+            &roots,
+            &home.join("Library/Mobile Documents/app/.codex/sessions")
         ));
     }
 
