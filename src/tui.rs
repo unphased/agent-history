@@ -264,7 +264,11 @@ fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
                     .as_deref()
                     .map(|label| format!("{label}: "))
                     .unwrap_or_default();
-                out.push(format!("{label_prefix}{}{}", path.display(), exists));
+                out.push(format!(
+                    "{label_prefix}{}{}",
+                    osc8_file_hyperlink(path, &path.display().to_string()),
+                    exists
+                ));
             }
             ImageAttachment {
                 kind:
@@ -274,12 +278,6 @@ fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
                     },
                 label,
             } => {
-                let Some((_, encoded)) = data_url.split_once(',') else {
-                    continue;
-                };
-                let Ok(bytes) = STANDARD.decode(encoded) else {
-                    continue;
-                };
                 let session = rec.session_id.as_deref().unwrap_or("session");
                 let filename = format!(
                     "{}-{}-{}.{}",
@@ -290,18 +288,46 @@ fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
                 );
                 let path = base.join(filename);
                 if !path.exists() {
+                    let Some((_, encoded)) = data_url.split_once(',') else {
+                        continue;
+                    };
+                    let Ok(bytes) = STANDARD.decode(encoded) else {
+                        continue;
+                    };
                     let _ = fs::write(&path, bytes);
                 }
                 let label_prefix = label
                     .as_deref()
                     .map(|label| format!("{label}: "))
                     .unwrap_or_default();
-                out.push(format!("{label_prefix}{}", path.display()));
+                out.push(format!(
+                    "{label_prefix}{}",
+                    osc8_file_hyperlink(&path, &path.display().to_string())
+                ));
             }
         }
     }
 
     out
+}
+
+fn osc8_file_hyperlink(path: &Path, label: &str) -> String {
+    let url = file_url_for_path(path);
+    format!("\u{1b}]8;;{url}\u{1b}\\{label}\u{1b}]8;;\u{1b}\\")
+}
+
+fn file_url_for_path(path: &Path) -> String {
+    let mut encoded = String::from("file://");
+    let raw = path.to_string_lossy();
+    for b in raw.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                encoded.push(*b as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    encoded
 }
 
 fn sanitize_for_filename(value: &str) -> String {
@@ -2971,6 +2997,41 @@ mod tests {
         assert!(rendered.contains("assistant reply"));
         assert!(rendered.contains("/tmp/opencode/part/msg1/prt_1.json:1"));
         assert!(rendered.contains("/tmp/opencode/part/msg2/prt_1.json:1"));
+    }
+
+    #[test]
+    fn file_url_for_path_percent_encodes_spaces() {
+        let url = file_url_for_path(Path::new("/tmp/agent history/demo 1.png"));
+        assert_eq!(url, "file:///tmp/agent%20history/demo%201.png");
+    }
+
+    #[test]
+    fn materialize_record_images_returns_osc8_file_links() {
+        let rec = MessageRecord {
+            timestamp: None,
+            role: Role::User,
+            text: "image".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 7,
+            session_id: Some("ses demo".to_string()),
+            account: None,
+            cwd: None,
+            phase: None,
+            images: vec![ImageAttachment {
+                kind: ImageAttachmentKind::DataUrl {
+                    media_type: "image/png".to_string(),
+                    data_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                },
+                label: Some("inline".to_string()),
+            }],
+            source: SourceKind::CodexSessionJsonl,
+        };
+
+        let rendered = materialize_record_images(&rec);
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("inline: "));
+        assert!(rendered[0].contains("\u{1b}]8;;file:///"));
+        assert!(rendered[0].contains("agent-history-images"));
     }
 
     #[test]
