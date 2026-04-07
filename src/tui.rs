@@ -73,6 +73,14 @@ struct SessionHit {
     hit_count: usize,
 }
 
+struct PreviewDoc {
+    lines: Vec<Line<'static>>,
+    first_match_line: usize,
+}
+
+const PREVIEW_MAX_MATCHES: usize = 100;
+const PREVIEW_MAX_LINES: usize = 5000;
+
 fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<usize>>) {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     struct SessionKeyRef<'a> {
@@ -210,6 +218,37 @@ fn provider_icon(source: SourceKind) -> &'static str {
     }
 }
 
+fn source_label(source: SourceKind) -> &'static str {
+    match source {
+        SourceKind::CodexSessionJsonl => "codex_session",
+        SourceKind::CodexHistoryJsonl => "codex_history",
+        SourceKind::ClaudeProjectJsonl => "claude_project",
+        SourceKind::OpenCodeSession => "opencode_session",
+    }
+}
+
+fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    cmp::max(1, line.width().div_ceil(width))
+}
+
+fn preview_visual_line_count(lines: &[Line<'_>], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| wrapped_line_height(line, width))
+        .sum()
+}
+
+fn preview_visual_line_offset(lines: &[Line<'_>], raw_line_index: usize, width: usize) -> usize {
+    lines
+        .iter()
+        .take(raw_line_index.min(lines.len()))
+        .map(|line| wrapped_line_height(line, width))
+        .sum()
+}
+
 fn short_ts(ts: Option<&str>) -> &str {
     let ts = ts.unwrap_or("");
     ts.get(0..19).unwrap_or(ts)
@@ -307,6 +346,13 @@ fn highlighted_line(
     Line::from(spans)
 }
 
+fn record_match_occurrence_count(query: &str, rec: &MessageRecord) -> usize {
+    rec.text
+        .lines()
+        .map(|line| search::find_match_ranges(query, line).len())
+        .sum()
+}
+
 fn looks_like_codex_title_task_prompt(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("You are a helpful assistant. You will be presented with a user prompt")
@@ -401,6 +447,7 @@ struct App {
     selected: usize,
     offset: usize,
     preview_scroll: usize,
+    preview_scroll_reset_pending: bool,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -458,6 +505,7 @@ fn run_app(
         selected: 0,
         offset: 0,
         preview_scroll: 0,
+        preview_scroll_reset_pending: false,
         last_query: String::new(),
         last_results: Vec::new(),
         indexing: IndexingProgress {
@@ -819,11 +867,6 @@ impl App {
         self.filtered.get(self.selected).copied()
     }
 
-    fn selected_session(&self) -> Option<&SessionSummary> {
-        let hit = self.selected_hit()?;
-        self.sessions.get(hit.session_idx)
-    }
-
     fn selected_record(&self) -> Option<&MessageRecord> {
         let hit = self.selected_hit()?;
         if let Some(idx) = hit.matched_record_idx {
@@ -834,49 +877,197 @@ impl App {
     }
 
     fn reset_preview_scroll_to_match(&mut self) {
-        self.preview_scroll = self.preview_first_match_line().saturating_sub(2);
+        self.preview_scroll = self.build_preview_doc().first_match_line.saturating_sub(2);
+        self.preview_scroll_reset_pending = true;
     }
 
-    fn preview_first_match_line(&self) -> usize {
+    fn build_preview_doc(&self) -> PreviewDoc {
         let query = self.query.trim();
+        let base_style = Style::default();
+        let match_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let Some(hit) = self.selected_hit() else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
+        };
+        let Some(sess) = self.sessions.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
+        };
+
         if query.is_empty() {
-            return 0;
-        }
+            let Some(rec) = self.selected_record() else {
+                return PreviewDoc {
+                    lines: vec![Line::raw("(no match)")],
+                    first_match_line: 0,
+                };
+            };
 
-        let Some(rec) = self.selected_record() else {
-            return 0;
-        };
+            let role = match rec.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+                Role::Unknown => "unknown",
+            };
 
-        let header_lines = self.preview_header_line_count();
-        for (idx, line) in rec.text.lines().enumerate() {
-            if !search::find_match_ranges(query, line).is_empty() {
-                return header_lines + idx;
+            let mut lines = vec![
+                Line::raw(format!(
+                    "timestamp: {}",
+                    rec.timestamp.as_deref().unwrap_or("")
+                )),
+                Line::raw(format!(
+                    "role: {role}   phase: {}",
+                    rec.phase.as_deref().unwrap_or("")
+                )),
+                Line::raw(format!("cwd: {}", rec.cwd.as_deref().unwrap_or(""))),
+                Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)),
+                Line::raw(format!("source: {}", source_label(rec.source))),
+                Line::raw(""),
+            ];
+            lines.extend(
+                rec.text
+                    .lines()
+                    .map(|l| highlighted_line(l, query, base_style, match_style)),
+            );
+            if rec.text.lines().count() == 0 {
+                lines.push(Line::raw(""));
             }
+
+            return PreviewDoc {
+                lines,
+                first_match_line: 0,
+            };
         }
 
-        0
-    }
-
-    fn preview_header_line_count(&self) -> usize {
-        let mut count = 5usize;
-        if let Some(hit) = self.selected_hit()
-            && hit.matched_record_idx.is_some()
-        {
-            count += 2;
-        }
-        count + 1
-    }
-
-    fn preview_total_lines(&self) -> usize {
-        let Some(rec) = self.selected_record() else {
-            return 1;
+        let compiled = search::CompiledQuery::new(query);
+        let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
         };
-        self.preview_header_line_count() + cmp::max(1, rec.text.lines().count())
+
+        let matched_indices: Vec<usize> = record_idxs
+            .iter()
+            .copied()
+            .filter(|&idx| compiled.matches_record(&self.all[idx]))
+            .collect();
+
+        let total_matches = matched_indices.len();
+        let total_occurrences: usize = matched_indices
+            .iter()
+            .map(|&idx| record_match_occurrence_count(query, &self.all[idx]))
+            .sum();
+        let shown_match_target = cmp::min(total_matches, PREVIEW_MAX_MATCHES);
+
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::raw(format!("session id: {}", sess.session_id)),
+            Line::raw(format!("source: {}", source_label(sess.source))),
+            Line::raw(format!("session opener: {}", sess.first_line)),
+            Line::raw(format!(
+                "showing {} of {} matching messages",
+                shown_match_target, total_matches
+            )),
+            Line::raw(format!(
+                "total query occurrences in shown message text: {total_occurrences}"
+            )),
+            Line::raw(format!(
+                "preview limits: {} matches, {} lines",
+                PREVIEW_MAX_MATCHES, PREVIEW_MAX_LINES
+            )),
+            Line::raw(""),
+        ];
+
+        let first_match_line = lines.len();
+        let mut shown_matches = 0usize;
+        let mut lines_used = lines.len();
+        let mut line_limited = false;
+
+        for (i, &rec_idx) in matched_indices.iter().enumerate() {
+            if shown_matches >= PREVIEW_MAX_MATCHES {
+                break;
+            }
+            let rec = &self.all[rec_idx];
+            let role = match rec.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+                Role::Unknown => "unknown",
+            };
+            let occurrence_count = record_match_occurrence_count(query, rec);
+
+            let section: Vec<Line<'static>> = {
+                let mut section = vec![
+                    Line::raw(format!("-- hit {}/{} --", i + 1, total_matches)),
+                    Line::raw(format!(
+                        "timestamp: {}",
+                        rec.timestamp.as_deref().unwrap_or("")
+                    )),
+                    Line::raw(format!(
+                        "role: {role}   phase: {}",
+                        rec.phase.as_deref().unwrap_or("")
+                    )),
+                    Line::raw(format!("cwd: {}", rec.cwd.as_deref().unwrap_or(""))),
+                    Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)),
+                    Line::raw(format!(
+                        "query occurrences in this message: {occurrence_count}"
+                    )),
+                    Line::raw(""),
+                ];
+                section.extend(
+                    rec.text
+                        .lines()
+                        .map(|l| highlighted_line(l, query, base_style, match_style)),
+                );
+                if rec.text.lines().count() == 0 {
+                    section.push(Line::raw(""));
+                }
+                section.push(Line::raw(""));
+                section
+            };
+
+            if lines_used.saturating_add(section.len()) > PREVIEW_MAX_LINES {
+                line_limited = true;
+                break;
+            }
+
+            lines_used += section.len();
+            lines.extend(section);
+            shown_matches += 1;
+        }
+
+        if shown_matches < total_matches || line_limited {
+            let omitted_matches = total_matches.saturating_sub(shown_matches);
+            let reason = if line_limited {
+                format!("line limit ({PREVIEW_MAX_LINES})")
+            } else {
+                format!("match limit ({PREVIEW_MAX_MATCHES})")
+            };
+            lines.push(Line::raw(format!(
+                "... truncated preview: {} more matching messages not shown due to {}",
+                omitted_matches, reason
+            )));
+        }
+
+        PreviewDoc {
+            lines,
+            first_match_line,
+        }
     }
 
     fn scroll_preview_lines(&mut self, delta: i32) {
         let cur = self.preview_scroll as i32;
         self.preview_scroll = cmp::max(0, cur + delta) as usize;
+        self.preview_scroll_reset_pending = false;
     }
 
     fn scroll_preview_page(&mut self, dir: i32) {
@@ -1079,68 +1270,24 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // Preview
     let preview_area = main[1];
     let preview_inner_height = preview_area.height.saturating_sub(2) as usize;
-    let preview_total_lines = app.preview_total_lines();
+    let preview_inner_width = preview_area.width.saturating_sub(2) as usize;
+    let preview_doc = app.build_preview_doc();
+    if app.preview_scroll_reset_pending {
+        let first_match_visual_line = preview_visual_line_offset(
+            &preview_doc.lines,
+            preview_doc.first_match_line,
+            preview_inner_width,
+        );
+        app.preview_scroll = first_match_visual_line.saturating_sub(2);
+        app.preview_scroll_reset_pending = false;
+    }
+    let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
-    let preview = if let Some(rec) = app.selected_record() {
-        let selected_hit = app.selected_hit();
-        let selected_session = app.selected_session();
-        let source = match rec.source {
-            SourceKind::CodexSessionJsonl => "codex_session",
-            SourceKind::CodexHistoryJsonl => "codex_history",
-            SourceKind::ClaudeProjectJsonl => "claude_project",
-            SourceKind::OpenCodeSession => "opencode_session",
-        };
-        let role = match rec.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => "system",
-            Role::Tool => "tool",
-            Role::Unknown => "unknown",
-        };
-
-        let mut header: Vec<Line> = vec![
-            Line::raw(format!(
-                "timestamp: {}",
-                rec.timestamp.as_deref().unwrap_or("")
-            )),
-            Line::raw(format!(
-                "role: {role}   phase: {}",
-                rec.phase.as_deref().unwrap_or("")
-            )),
-            Line::raw(format!("cwd: {}", rec.cwd.as_deref().unwrap_or(""))),
-            Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)),
-            Line::raw(format!("source: {source}")),
-        ];
-
-        if let (Some(hit), Some(sess)) = (selected_hit, selected_session)
-            && hit.matched_record_idx.is_some()
-        {
-            header.push(Line::raw(format!("session opener: {}", sess.first_line)));
-            header.push(Line::raw(format!("session hits: {}", hit.hit_count)));
-        }
-        header.push(Line::raw(""));
-
-        let preview_match_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
-        header.extend(
-            rec.text
-                .lines()
-                .map(|l| highlighted_line(l, query, Style::default(), preview_match_style)),
-        );
-
-        Paragraph::new(Text::from(header))
-            .block(Block::default().borders(Borders::ALL).title("Preview"))
-            .scroll((app.preview_scroll as u16, 0))
-            .wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new("(no match)")
-            .block(Block::default().borders(Borders::ALL).title("Preview"))
-            .scroll((app.preview_scroll as u16, 0))
-            .wrap(Wrap { trim: false })
-    };
+    let preview = Paragraph::new(Text::from(preview_doc.lines))
+        .block(Block::default().borders(Borders::ALL).title("Preview"))
+        .scroll((app.preview_scroll as u16, 0))
+        .wrap(Wrap { trim: false });
     f.render_widget(preview, preview_area);
 
     let footer = Layout::default()
@@ -1433,6 +1580,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1482,6 +1630,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1529,6 +1678,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1693,6 +1843,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1703,7 +1854,7 @@ mod tests {
         app.update_results();
         assert_eq!(app.filtered.len(), 1);
 
-        let sess = app.selected_session().unwrap();
+        let sess = app.sessions.get(app.selected_hit().unwrap().session_idx).unwrap();
         assert_eq!(sess.session_id, "a");
 
         let hit = app.selected_hit().unwrap();
@@ -1743,6 +1894,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1776,6 +1928,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1784,8 +1937,69 @@ mod tests {
         };
 
         app.update_results();
-        assert_eq!(app.preview_first_match_line(), 10);
-        assert_eq!(app.preview_scroll, 8);
+        let doc = app.build_preview_doc();
+        assert_eq!(doc.first_match_line, 7);
+        assert_eq!(app.preview_scroll, 5);
+    }
+
+    #[test]
+    fn preview_doc_includes_multiple_matching_records() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first needle needle",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second needle",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: "needle".to_string(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        app.update_results();
+        let doc = app.build_preview_doc();
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("showing 2 of 2 matching messages"));
+        assert!(rendered.contains("total query occurrences in shown message text: 3"));
+        assert!(rendered.contains("-- hit 1/2 --"));
+        assert!(rendered.contains("-- hit 2/2 --"));
+        assert!(rendered.contains("query occurrences in this message: 2"));
+        assert!(rendered.contains("query occurrences in this message: 1"));
+        assert!(rendered.contains("first needle"));
+        assert!(rendered.contains("second needle"));
     }
 
     #[test]
@@ -1808,6 +2022,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 1,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1843,6 +2058,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1929,6 +2145,7 @@ mod tests {
             selected: 0,
             offset: 0,
             preview_scroll: 0,
+            preview_scroll_reset_pending: false,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
