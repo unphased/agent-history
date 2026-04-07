@@ -33,8 +33,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
-    time::Duration,
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -1050,7 +1049,7 @@ fn handle_key(
     match key.code {
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(rec) = app.selected_record() {
-                open_in_pager(terminal, rec)?;
+                open_in_pager(terminal, app, rec)?;
             }
         }
         KeyCode::Enter => {
@@ -1895,13 +1894,23 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
 fn open_in_pager(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
     rec: &MessageRecord,
 ) -> anyhow::Result<()> {
     let pager = env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
-    let file = shell_escape(&rec.file.to_string_lossy());
-    let start = rec.line.saturating_sub(40).max(1);
-    let end = rec.line.saturating_add(200);
-    let cmd = format!("nl -ba {file} | sed -n '{start},{end}p' | {pager}");
+    let (file_path, cmd) = if rec.source == SourceKind::OpenCodeSession {
+        let file_path = write_opencode_session_pager_file(app, rec)?;
+        let file = shell_escape(&file_path.to_string_lossy());
+        (Some(file_path), format!("nl -ba {file} | {pager}"))
+    } else {
+        let file = shell_escape(&rec.file.to_string_lossy());
+        let start = rec.line.saturating_sub(40).max(1);
+        let end = rec.line.saturating_add(200);
+        (
+            None,
+            format!("nl -ba {file} | sed -n '{start},{end}p' | {pager}"),
+        )
+    };
     let _ = run_with_tui_suspended(terminal, || {
         Command::new("sh")
             .arg("-lc")
@@ -1909,7 +1918,101 @@ fn open_in_pager(
             .status()
             .context("pager起動に失敗しました")
     });
+    if let Some(path) = file_path {
+        let _ = fs::remove_file(path);
+    }
     Ok(())
+}
+
+fn write_opencode_session_pager_file(app: &App, rec: &MessageRecord) -> anyhow::Result<PathBuf> {
+    let body = build_opencode_session_pager_text(app, rec);
+    let path = std::env::temp_dir().join(format!(
+        "agent-history-opencode-session-{}-{}.txt",
+        sanitize_for_filename(rec.session_id.as_deref().unwrap_or("session")),
+        unix_now_nanos()
+    ));
+    fs::write(&path, body)
+        .with_context(|| format!("pager temp write failed: {}", path.display()))?;
+    Ok(path)
+}
+
+fn build_opencode_session_pager_text(app: &App, rec: &MessageRecord) -> String {
+    let Some(hit) = app.selected_hit() else {
+        return rec.text.clone();
+    };
+    let Some(sess) = app.sessions.get(hit.session_idx) else {
+        return rec.text.clone();
+    };
+    let Some(indices) = app.session_records.get(hit.session_idx) else {
+        return rec.text.clone();
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("session id: {}\n", sess.session_id));
+    out.push_str(&format!(
+        "source: {}\n",
+        source_label(SourceKind::OpenCodeSession)
+    ));
+    if let Some(account) = sess.account.as_deref() {
+        out.push_str(&format!("account: {account}\n"));
+    }
+    out.push_str(&format!("session opener: {}\n", sess.first_line));
+    out.push('\n');
+
+    for (pos, &idx) in indices.iter().enumerate() {
+        let Some(item) = app.all.get(idx) else {
+            continue;
+        };
+        let role = match item.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+            Role::Tool => "tool",
+            Role::Unknown => "unknown",
+        };
+        out.push_str(&format!("== message {} ==\n", pos + 1));
+        out.push_str(&format!(
+            "timestamp: {}\n",
+            short_ts(item.timestamp.as_deref())
+        ));
+        out.push_str(&format!("role: {role}\n"));
+        if let Some(phase) = item.phase.as_deref()
+            && !phase.trim().is_empty()
+        {
+            out.push_str(&format!("phase: {phase}\n"));
+        }
+        if let Some(cwd) = item.cwd.as_deref()
+            && !cwd.trim().is_empty()
+        {
+            out.push_str(&format!("cwd: {cwd}\n"));
+        }
+        out.push_str(&format!(
+            "source file: {}:{}\n",
+            item.file.display(),
+            item.line
+        ));
+        if !item.images.is_empty() {
+            out.push_str(&format!("images: {}\n", item.images.len()));
+            for path in materialize_record_images(item) {
+                out.push_str(&format!("image file: {path}\n"));
+            }
+        }
+        out.push('\n');
+        out.push_str(&item.text);
+        if !item.text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+fn unix_now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 fn shell_escape(s: &str) -> String {
@@ -2816,6 +2919,58 @@ mod tests {
         assert!(rendered.contains("latest run events:"));
         assert!(rendered.contains("unit_reindexed: ms=55"));
         assert!(rendered.contains("parts=300"));
+    }
+
+    #[test]
+    fn build_opencode_session_pager_text_includes_whole_session() {
+        let all = vec![
+            MessageRecord {
+                timestamp: Some("2026-02-10T00:00:01Z".to_string()),
+                role: Role::User,
+                text: "session opener".to_string(),
+                file: PathBuf::from("/tmp/opencode/part/msg1/prt_1.json"),
+                line: 1,
+                session_id: Some("ses_demo".to_string()),
+                account: None,
+                cwd: Some("/tmp/project".to_string()),
+                phase: Some("title".to_string()),
+                images: Vec::new(),
+                source: SourceKind::OpenCodeSession,
+            },
+            MessageRecord {
+                timestamp: Some("2026-02-10T00:00:02Z".to_string()),
+                role: Role::Assistant,
+                text: "assistant reply".to_string(),
+                file: PathBuf::from("/tmp/opencode/part/msg2/prt_1.json"),
+                line: 1,
+                session_id: Some("ses_demo".to_string()),
+                account: None,
+                cwd: Some("/tmp/project".to_string()),
+                phase: Some("orchestrator".to_string()),
+                images: Vec::new(),
+                source: SourceKind::OpenCodeSession,
+            },
+        ];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = empty_app();
+        app.ready = true;
+        app.all = all;
+        app.sessions = sessions;
+        app.session_records = session_records;
+        app.filtered = vec![SessionHit {
+            session_idx: 0,
+            matched_record_idx: None,
+            hit_count: 0,
+        }];
+
+        let rendered = build_opencode_session_pager_text(&app, &app.all[0]);
+        assert!(rendered.contains("session id: ses_demo"));
+        assert!(rendered.contains("== message 1 =="));
+        assert!(rendered.contains("== message 2 =="));
+        assert!(rendered.contains("session opener"));
+        assert!(rendered.contains("assistant reply"));
+        assert!(rendered.contains("/tmp/opencode/part/msg1/prt_1.json:1"));
+        assert!(rendered.contains("/tmp/opencode/part/msg2/prt_1.json:1"));
     }
 
     #[test]
