@@ -1,14 +1,15 @@
 use crate::{args::Args, cache};
 use anyhow::Context as _;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     fs::{self, File},
     io::{BufRead as _, BufReader},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::UNIX_EPOCH,
 };
@@ -44,6 +45,23 @@ pub enum SourceKind {
     OpenCodeSession,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub kind: ImageAttachmentKind,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageAttachmentKind {
+    DataUrl {
+        media_type: String,
+        data_url: String,
+    },
+    LocalPath {
+        path: PathBuf,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
     pub timestamp: Option<String>,
@@ -57,6 +75,7 @@ pub struct MessageRecord {
     pub account: Option<String>,
     pub cwd: Option<String>,
     pub phase: Option<String>,
+    pub images: Vec<ImageAttachment>,
 
     pub source: SourceKind,
 }
@@ -280,7 +299,7 @@ fn run_indexer(
     let total_files = inputs.len();
 
     if cache_path.is_none() {
-        let out = run_full_scan(&cfg, tx, total_files)?;
+        let out = run_full_scan(inputs, tx, total_files)?;
         tx.send(IndexerEvent::Done { records: out }).ok();
         return Ok(());
     }
@@ -321,7 +340,7 @@ fn run_indexer(
         None => None,
     };
     if cache_store.is_none() {
-        let out = run_full_scan(&cfg, tx, total_files)?;
+        let out = run_full_scan(inputs, tx, total_files)?;
         tx.send(IndexerEvent::Done { records: out }).ok();
         return Ok(());
     }
@@ -332,41 +351,120 @@ fn run_indexer(
         Default::default()
     };
     let mut cache_changed = false;
+    let mut processed_files = 0usize;
+    let mut opencode_jobs: Vec<(usize, IndexInput)> = Vec::new();
+    let mut opencode_meta: Vec<Option<(String, PathBuf, String)>> = vec![None; total_files];
 
-    for (processed_files, input) in inputs.into_iter().enumerate() {
-        let processed_files = processed_files.saturating_add(1);
+    for (idx, input) in inputs.iter().cloned().enumerate() {
         let current = input.path().to_path_buf();
         let unit_key = cache::unit_key(&current);
+        let fingerprint = fingerprint_for_input(&input)?;
 
-        if let Some(store) = cache_store.as_mut() {
-            let fingerprint = fingerprint_for_input(&input)?;
-            if cached_fingerprints.get(&unit_key) == Some(&fingerprint) {
-            } else {
-                let mut records: Vec<MessageRecord> = Vec::new();
-                let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
-                match index_input(input.clone(), &mut records, &mut sessions) {
-                    Ok(()) => {
-                        store.replace_unit(&unit_key, &current, &fingerprint, &records)?;
-                        cache_changed = true;
+        if cached_fingerprints.get(&unit_key) == Some(&fingerprint) {
+            processed_files = processed_files.saturating_add(1);
+            tx.send(IndexerEvent::Progress {
+                processed_files,
+                total_files,
+                records: records_count,
+                sessions: sessions_count,
+                current,
+            })
+            .ok();
+            continue;
+        }
+
+        if matches!(input, IndexInput::OpenCodeSession { .. }) {
+            opencode_meta[idx] = Some((unit_key, current.clone(), fingerprint));
+            opencode_jobs.push((idx, input));
+            continue;
+        }
+
+        match index_input_to_chunk(input) {
+            Ok(chunk) => {
+                let current = chunk.current.clone();
+                if let Some(store) = cache_store.as_mut() {
+                    store.replace_unit(&unit_key, &current, &fingerprint, &chunk.records)?;
+                }
+                cache_changed = true;
+                processed_files = processed_files.saturating_add(1);
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records: records_count,
+                    sessions: sessions_count,
+                    current,
+                })
+                .ok();
+            }
+            Err((current, e)) => {
+                processed_files = processed_files.saturating_add(1);
+                tx.send(IndexerEvent::Warn {
+                    message: format!("読み取り失敗: {}: {e}", current.display()),
+                })
+                .ok();
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records: records_count,
+                    sessions: sessions_count,
+                    current,
+                })
+                .ok();
+            }
+        }
+    }
+
+    if !opencode_jobs.is_empty() {
+        let job_count = opencode_jobs.len();
+        let (rx, handles) = spawn_opencode_index_workers(opencode_jobs);
+        for _ in 0..job_count {
+            let Ok(result) = rx.recv() else {
+                break;
+            };
+            match result {
+                IndexedInputResult::Indexed { index, chunk } => {
+                    let Some((unit_key, current, fingerprint)) = opencode_meta[index].take() else {
+                        continue;
+                    };
+                    if let Some(store) = cache_store.as_mut() {
+                        store.replace_unit(&unit_key, &current, &fingerprint, &chunk.records)?;
                     }
-                    Err(e) => {
-                        tx.send(IndexerEvent::Warn {
-                            message: format!("読み取り失敗: {}: {e}", current.display()),
-                        })
-                        .ok();
-                    }
+                    cache_changed = true;
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records: records_count,
+                        sessions: sessions_count,
+                        current,
+                    })
+                    .ok();
+                }
+                IndexedInputResult::Failed {
+                    index,
+                    current,
+                    error,
+                } => {
+                    let _ = opencode_meta[index].take();
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Warn {
+                        message: format!("読み取り失敗: {}: {error}", current.display()),
+                    })
+                    .ok();
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records: records_count,
+                        sessions: sessions_count,
+                        current,
+                    })
+                    .ok();
                 }
             }
         }
-
-        tx.send(IndexerEvent::Progress {
-            processed_files,
-            total_files,
-            records: records_count,
-            sessions: sessions_count,
-            current,
-        })
-        .ok();
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 
     let final_records = match cache_store.as_ref() {
@@ -453,41 +551,128 @@ fn fingerprint_for_opencode_session(path: &Path) -> anyhow::Result<String> {
 }
 
 fn run_full_scan(
-    cfg: &IndexerConfig,
+    inputs: Vec<IndexInput>,
     tx: &mpsc::Sender<IndexerEvent>,
     total_files: usize,
 ) -> anyhow::Result<Vec<MessageRecord>> {
-    let mut out: Vec<MessageRecord> = Vec::new();
+    let mut indexed_inputs: Vec<Option<IndexedInputChunk>> = Vec::with_capacity(total_files);
+    indexed_inputs.resize_with(total_files, || None);
     let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
+    let mut records = 0usize;
+    let mut processed_files = 0usize;
+    let mut opencode_jobs: Vec<(usize, IndexInput)> = Vec::new();
 
-    for (processed_files, input) in
-        collect_index_inputs(&cfg.roots, &cfg.extra_files, &cfg.opencode_storage_roots)
-            .into_iter()
-            .enumerate()
-    {
-        let processed_files = processed_files.saturating_add(1);
-        let current = input.path().to_path_buf();
-        match index_input(input, &mut out, &mut sessions) {
-            Ok(()) => {}
-            Err(e) => {
+    for (idx, input) in inputs.into_iter().enumerate() {
+        if matches!(input, IndexInput::OpenCodeSession { .. }) {
+            opencode_jobs.push((idx, input));
+            continue;
+        }
+
+        match index_input_to_chunk(input) {
+            Ok(chunk) => {
+                records = records.saturating_add(chunk.records.len());
+                sessions.extend(chunk.sessions.iter().cloned());
+                let current = chunk.current.clone();
+                indexed_inputs[idx] = Some(chunk);
+                processed_files = processed_files.saturating_add(1);
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records,
+                    sessions: sessions.len(),
+                    current,
+                })
+                .ok();
+            }
+            Err((current, e)) => {
+                processed_files = processed_files.saturating_add(1);
                 tx.send(IndexerEvent::Warn {
                     message: format!("読み取り失敗: {}: {e}", current.display()),
                 })
                 .ok();
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records,
+                    sessions: sessions.len(),
+                    current,
+                })
+                .ok();
             }
         }
+    }
 
-        tx.send(IndexerEvent::Progress {
-            processed_files,
-            total_files,
-            records: out.len(),
-            sessions: sessions.len(),
-            current,
-        })
-        .ok();
+    if !opencode_jobs.is_empty() {
+        let job_count = opencode_jobs.len();
+        let (rx, handles) = spawn_opencode_index_workers(opencode_jobs);
+        for _ in 0..job_count {
+            let Ok(result) = rx.recv() else {
+                break;
+            };
+            match result {
+                IndexedInputResult::Indexed { index, chunk } => {
+                    records = records.saturating_add(chunk.records.len());
+                    sessions.extend(chunk.sessions.iter().cloned());
+                    let current = chunk.current.clone();
+                    indexed_inputs[index] = Some(chunk);
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records,
+                        sessions: sessions.len(),
+                        current,
+                    })
+                    .ok();
+                }
+                IndexedInputResult::Failed { current, error, .. } => {
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Warn {
+                        message: format!("読み取り失敗: {}: {error}", current.display()),
+                    })
+                    .ok();
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records,
+                        sessions: sessions.len(),
+                        current,
+                    })
+                    .ok();
+                }
+            }
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    let mut out: Vec<MessageRecord> = Vec::with_capacity(records);
+    for chunk in indexed_inputs.into_iter().flatten() {
+        out.extend(chunk.records);
     }
 
     Ok(out)
+}
+
+#[derive(Debug)]
+struct IndexedInputChunk {
+    current: PathBuf,
+    records: Vec<MessageRecord>,
+    sessions: HashSet<(SourceKind, String, Option<String>)>,
+}
+
+#[derive(Debug)]
+enum IndexedInputResult {
+    Indexed {
+        index: usize,
+        chunk: IndexedInputChunk,
+    },
+    Failed {
+        index: usize,
+        current: PathBuf,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -625,6 +810,67 @@ fn index_input(
             session_file,
         } => index_opencode_session_file(&storage_root, &session_file, out, sessions),
     }
+}
+
+fn index_input_to_chunk(input: IndexInput) -> Result<IndexedInputChunk, (PathBuf, anyhow::Error)> {
+    let current = input.path().to_path_buf();
+    let mut records = Vec::new();
+    let mut sessions = HashSet::new();
+    match index_input(input, &mut records, &mut sessions) {
+        Ok(()) => Ok(IndexedInputChunk {
+            current,
+            records,
+            sessions,
+        }),
+        Err(e) => Err((current, e)),
+    }
+}
+
+fn spawn_opencode_index_workers(
+    jobs: Vec<(usize, IndexInput)>,
+) -> (
+    mpsc::Receiver<IndexedInputResult>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            loop {
+                let next_job = {
+                    let mut queue = queue.lock().expect("opencode work queue poisoned");
+                    queue.pop_front()
+                };
+                let Some((index, input)) = next_job else {
+                    break;
+                };
+
+                let result = match index_input_to_chunk(input) {
+                    Ok(chunk) => IndexedInputResult::Indexed { index, chunk },
+                    Err((current, error)) => IndexedInputResult::Failed {
+                        index,
+                        current,
+                        error: format!("{error:#}"),
+                    },
+                };
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    (rx, handles)
 }
 
 fn index_file(
@@ -787,6 +1033,7 @@ fn index_opencode_session_file(
             account: None,
             cwd,
             phase,
+            images: Vec::new(),
             source: SourceKind::OpenCodeSession,
         });
         records_added = records_added.saturating_add(1);
@@ -805,6 +1052,7 @@ fn index_opencode_session_file(
             account: None,
             cwd: session_cwd,
             phase: Some("title".to_string()),
+            images: Vec::new(),
             source: SourceKind::OpenCodeSession,
         });
         records_added = 1;
@@ -1013,6 +1261,69 @@ fn extract_content_text(payload: &Value) -> Option<String> {
     Some(parts.join("\n"))
 }
 
+fn extract_codex_content_images(payload: &Value) -> Vec<ImageAttachment> {
+    let Some(content) = payload.get("content").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for item in content {
+        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        match item_type {
+            "input_image" => {
+                let Some(image_url) = item.get("image_url").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if let Some(media_type) = parse_data_url_media_type(image_url) {
+                    out.push(ImageAttachment {
+                        kind: ImageAttachmentKind::DataUrl {
+                            media_type,
+                            data_url: image_url.to_string(),
+                        },
+                        label: item
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string()),
+                    });
+                }
+            }
+            "local_image" => {
+                let Some(path) = item
+                    .get("path")
+                    .or_else(|| item.get("local_path"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                out.push(ImageAttachment {
+                    kind: ImageAttachmentKind::LocalPath {
+                        path: PathBuf::from(path),
+                    },
+                    label: item
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn parse_data_url_media_type(data_url: &str) -> Option<String> {
+    let rest = data_url.strip_prefix("data:")?;
+    let (meta, _) = rest.split_once(',')?;
+    let media_type = meta.split(';').next()?.trim();
+    if media_type.is_empty() {
+        return None;
+    }
+    Some(media_type.to_string())
+}
+
 fn extract_codex_session_record(
     v: &Value,
     file: &Path,
@@ -1061,6 +1372,7 @@ fn extract_codex_session_record(
         .map(|s| s.to_string());
 
     let text = extract_content_text(payload)?;
+    let images = extract_codex_content_images(payload);
 
     Some(MessageRecord {
         timestamp,
@@ -1072,6 +1384,7 @@ fn extract_codex_session_record(
         account: account.map(|s| s.to_string()),
         cwd: ctx.cwd.clone(),
         phase,
+        images,
         source: SourceKind::CodexSessionJsonl,
     })
 }
@@ -1119,6 +1432,7 @@ fn extract_claude_project_record(
         account: account.map(|s| s.to_string()),
         cwd,
         phase: None,
+        images: Vec::new(),
         source: SourceKind::ClaudeProjectJsonl,
     })
 }
@@ -1204,6 +1518,7 @@ fn extract_codex_history_record(
         account: account.map(|s| s.to_string()),
         cwd: None,
         phase: None,
+        images: Vec::new(),
         source: SourceKind::CodexHistoryJsonl,
     })
 }
@@ -1688,6 +2003,195 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, IndexerEvent::Done { records } if records.len() == 1))
+        );
+    }
+
+    #[test]
+    fn run_indexer_falls_back_to_full_scan_when_cache_open_fails() {
+        let tmp = TempDir::new("agent-history-cache-fallback");
+        let jsonl = tmp.path.join("history.jsonl");
+        let bad_cache_path = tmp.path.join("not-a-db");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello fallback\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(&bad_cache_path).unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+        let (tx, rx) = mpsc::channel();
+        run_indexer(cfg, &tx, Some(bad_cache_path), false).unwrap();
+        let events = recv_events(&rx);
+
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Warn { message } if message.contains("cache unavailable"))
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello fallback"))
+        ));
+    }
+
+    #[test]
+    fn run_indexer_refreshes_changed_jsonl_cache_contents() {
+        let tmp = TempDir::new("agent-history-cache-refresh-jsonl");
+        let jsonl = tmp.path.join("history.jsonl");
+        let cache_db = tmp.path.join("index.sqlite");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"before change\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let _ = recv_events(&rx1);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"after change\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        let events = recv_events(&rx2);
+
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Loaded { records } if records.iter().any(|record| record.text == "before change"))
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "after change"))
+        ));
+    }
+
+    #[test]
+    fn run_indexer_refreshes_changed_opencode_session_contents() {
+        let tmp = TempDir::new("agent-history-cache-refresh-opencode");
+        let storage = tmp.path.join("storage");
+        let cache_db = tmp.path.join("index.sqlite");
+        let sid = "ses_demo";
+        let mid = "msg_demo";
+        let session_file = storage.join("session/global/ses_demo.json");
+        let part_file = storage.join(format!("part/{mid}/prt_1.json"));
+
+        fs::create_dir_all(storage.join("session/global")).unwrap();
+        fs::create_dir_all(storage.join(format!("message/{sid}"))).unwrap();
+        fs::create_dir_all(storage.join(format!("part/{mid}"))).unwrap();
+
+        fs::write(
+            &session_file,
+            r#"{
+  "id": "ses_demo",
+  "directory": "/tmp/project",
+  "title": "demo title",
+  "time": { "created": 100, "updated": 300 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            storage.join(format!("message/{sid}/{mid}.json")),
+            r#"{
+  "id": "msg_demo",
+  "sessionID": "ses_demo",
+  "role": "assistant",
+  "time": { "created": 120, "completed": 250 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            &part_file,
+            r#"{
+  "type": "text",
+  "text": "before opencode refresh",
+  "time": { "start": 200, "end": 220 }
+}"#,
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_opencode(&storage);
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let _ = recv_events(&rx1);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &part_file,
+            r#"{
+  "type": "text",
+  "text": "after opencode refresh",
+  "time": { "start": 200, "end": 220 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            &session_file,
+            r#"{
+  "id": "ses_demo",
+  "directory": "/tmp/project",
+  "title": "demo title",
+  "time": { "created": 100, "updated": 301 }
+}"#,
+        )
+        .unwrap();
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        let events = recv_events(&rx2);
+
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Loaded { records } if records.iter().any(|record| record.text == "before opencode refresh"))
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "after opencode refresh"))
+        ));
+    }
+
+    #[test]
+    fn run_indexer_prunes_deleted_jsonl_source_from_cache() {
+        let tmp = TempDir::new("agent-history-cache-delete-jsonl");
+        let jsonl = tmp.path.join("history.jsonl");
+        let cache_db = tmp.path.join("index.sqlite");
+
+        fs::write(
+            &jsonl,
+            concat!(
+                "{\"timestamp\":\"2026-02-11T12:05:47.856Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"timestamp\":\"2026-02-11T12:06:47.856Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"to be deleted\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = basic_cfg_for_jsonl(&jsonl);
+        let (tx1, rx1) = mpsc::channel();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false).unwrap();
+        let _ = recv_events(&rx1);
+
+        fs::remove_file(&jsonl).unwrap();
+
+        let (tx2, rx2) = mpsc::channel();
+        run_indexer(cfg, &tx2, Some(cache_db), false).unwrap();
+        let events = recv_events(&rx2);
+
+        assert!(events.iter().any(
+            |event| matches!(event, IndexerEvent::Warn { message } if message.contains("stale cached sources"))
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, IndexerEvent::Done { records } if records.is_empty()))
         );
     }
 }

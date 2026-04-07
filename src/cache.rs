@@ -1,4 +1,4 @@
-use crate::indexer::{MessageRecord, Role, SourceKind};
+use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind};
 use anyhow::Context as _;
 use rusqlite::{Connection, Transaction, params};
 use std::{
@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct CacheStore {
     conn: Connection,
@@ -98,7 +98,7 @@ impl CacheStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, source \
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source \
                  FROM message_records WHERE unit_key IN ({placeholders}) ORDER BY unit_key, ord"
             );
             let mut stmt = self
@@ -116,7 +116,9 @@ impl CacheStore {
                     account: row.get(6)?,
                     cwd: row.get(7)?,
                     phase: row.get(8)?,
-                    source: source_from_db(row.get::<_, i64>(9)?),
+                    images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
+                        .unwrap_or_default(),
+                    source: source_from_db(row.get::<_, i64>(10)?),
                 })
             })?;
             for row in rows {
@@ -148,8 +150,8 @@ impl CacheStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO message_records (
-                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, source
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .context("cache record statement failed")?;
 
@@ -166,6 +168,7 @@ impl CacheStore {
                     rec.account,
                     rec.cwd,
                     rec.phase,
+                    serde_json::to_string(&rec.images).unwrap_or_else(|_| "[]".to_string()),
                     source_to_db(rec.source),
                 ])
                 .context("cache record insert failed")?;
@@ -235,12 +238,13 @@ impl CacheStore {
                     account TEXT,
                     cwd TEXT,
                     phase TEXT,
+                    images_json TEXT NOT NULL DEFAULT '[]',
                     source INTEGER NOT NULL,
                     PRIMARY KEY (unit_key, ord),
                     FOREIGN KEY (unit_key) REFERENCES source_units(unit_key) ON DELETE CASCADE
                  );
                  CREATE INDEX IF NOT EXISTS idx_message_records_session_id ON message_records(session_id);
-                 PRAGMA user_version = 1;",
+                 PRAGMA user_version = 2;",
             )
             .context("cache schema create failed")?;
 
@@ -325,9 +329,108 @@ fn source_from_db(value: i64) -> SourceKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), unix_now()))
+    }
 
     #[test]
     fn unit_key_uses_path_string() {
         assert_eq!(unit_key(Path::new("/tmp/demo")), "/tmp/demo");
+    }
+
+    #[test]
+    fn prune_missing_units_removes_deleted_entries() {
+        let root = temp_root("agent-history-cache-test");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.sqlite");
+        let source_path = root.join("source.jsonl");
+        fs::write(&source_path, "{}\n").unwrap();
+
+        let mut store = CacheStore::open(&db_path, false).unwrap();
+        let record = MessageRecord {
+            timestamp: None,
+            role: Role::User,
+            text: "hello".to_string(),
+            file: source_path.clone(),
+            line: 1,
+            session_id: Some("s1".to_string()),
+            account: None,
+            cwd: None,
+            phase: None,
+            images: Vec::new(),
+            source: SourceKind::CodexSessionJsonl,
+        };
+        let key = unit_key(&source_path);
+        store
+            .replace_unit(&key, &source_path, "fingerprint", &[record])
+            .unwrap();
+
+        fs::remove_file(&source_path).unwrap();
+        assert_eq!(store.prune_missing_units().unwrap(), 1);
+        assert!(store.load_records(&[key]).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_rejects_newer_schema_versions() {
+        let root = temp_root("agent-history-cache-newer");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.sqlite");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+
+        let err = match CacheStore::open(&db_path, false) {
+            Ok(_) => panic!("expected newer schema version to fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("newer than supported"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_resets_older_schema_versions() {
+        let root = temp_root("agent-history-cache-reset");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.sqlite");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE stale_table (id INTEGER)", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(conn);
+
+        let store = CacheStore::open(&db_path, false).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let source_units_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='source_units'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_records_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_units_count, 1);
+        assert_eq!(message_records_count, 1);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -215,6 +215,7 @@ mod tests {
             account: None,
             cwd: Some("/home/tizze".to_string()),
             phase: None,
+            images: Vec::new(),
             source: SourceKind::CodexSessionJsonl,
         }
     }

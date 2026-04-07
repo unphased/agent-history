@@ -1,9 +1,12 @@
 use crate::{
     args::Args,
-    indexer::{IndexerEvent, MessageRecord, Role, SourceKind},
+    indexer::{
+        ImageAttachment, ImageAttachmentKind, IndexerEvent, MessageRecord, Role, SourceKind,
+    },
     search,
 };
 use anyhow::Context as _;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor,
     event::{
@@ -227,6 +230,93 @@ fn source_label(source: SourceKind) -> &'static str {
         SourceKind::CodexHistoryJsonl => "codex_history",
         SourceKind::ClaudeProjectJsonl => "claude_project",
         SourceKind::OpenCodeSession => "opencode_session",
+    }
+}
+
+fn image_output_dir() -> PathBuf {
+    std::env::temp_dir().join("agent-history-images")
+}
+
+fn file_extension_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "bin",
+    }
+}
+
+fn materialize_record_images(rec: &MessageRecord) -> Vec<String> {
+    let mut out = Vec::new();
+    let base = image_output_dir();
+    let _ = fs::create_dir_all(&base);
+
+    for (idx, image) in rec.images.iter().enumerate() {
+        match image {
+            ImageAttachment {
+                kind: ImageAttachmentKind::LocalPath { path },
+                label,
+            } => {
+                let exists = if path.exists() { "" } else { " (missing)" };
+                let label_prefix = label
+                    .as_deref()
+                    .map(|label| format!("{label}: "))
+                    .unwrap_or_default();
+                out.push(format!("{label_prefix}{}{}", path.display(), exists));
+            }
+            ImageAttachment {
+                kind:
+                    ImageAttachmentKind::DataUrl {
+                        media_type,
+                        data_url,
+                    },
+                label,
+            } => {
+                let Some((_, encoded)) = data_url.split_once(',') else {
+                    continue;
+                };
+                let Ok(bytes) = STANDARD.decode(encoded) else {
+                    continue;
+                };
+                let session = rec.session_id.as_deref().unwrap_or("session");
+                let filename = format!(
+                    "{}-{}-{}.{}",
+                    sanitize_for_filename(session),
+                    rec.line,
+                    idx + 1,
+                    file_extension_for_media_type(media_type)
+                );
+                let path = base.join(filename);
+                if !path.exists() {
+                    let _ = fs::write(&path, bytes);
+                }
+                let label_prefix = label
+                    .as_deref()
+                    .map(|label| format!("{label}: "))
+                    .unwrap_or_default();
+                out.push(format!("{label_prefix}{}", path.display()));
+            }
+        }
+    }
+
+    out
+}
+
+fn sanitize_for_filename(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "image".to_string()
+    } else {
+        out
     }
 }
 
@@ -1111,6 +1201,13 @@ impl App {
                 Line::raw(format!("source: {}", source_label(rec.source))),
                 Line::raw(""),
             ];
+            if !rec.images.is_empty() {
+                lines.push(Line::raw(format!("images: {}", rec.images.len())));
+                for path in materialize_record_images(rec) {
+                    lines.push(Line::raw(format!("image file: {path}")));
+                }
+                lines.push(Line::raw(""));
+            }
             lines.extend(
                 rec.text
                     .lines()
@@ -1202,8 +1299,15 @@ impl App {
                     Line::raw(format!(
                         "query occurrences in this message: {occurrence_count}"
                     )),
+                    Line::raw(format!("images: {}", rec.images.len())),
                     Line::raw(""),
                 ];
+                if !rec.images.is_empty() {
+                    for path in materialize_record_images(rec) {
+                        section.push(Line::raw(format!("image file: {path}")));
+                    }
+                    section.push(Line::raw(""));
+                }
                 section.extend(
                     rec.text
                         .lines()
@@ -1724,6 +1828,25 @@ mod tests {
         }
     }
 
+    fn empty_app() -> App {
+        App {
+            query: String::new(),
+            max_results: 0,
+            all: Vec::new(),
+            sessions: Vec::new(),
+            session_records: Vec::new(),
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: false,
+        }
+    }
+
     #[test]
     fn resume_target_for_codex_uses_codex_resume_with_cd_when_cwd_exists() {
         let tmp = TempDir::new("agent-history");
@@ -1740,6 +1863,7 @@ mod tests {
             account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
+            images: Vec::new(),
             source: SourceKind::CodexSessionJsonl,
         };
 
@@ -1775,6 +1899,61 @@ mod tests {
     }
 
     #[test]
+    fn handle_indexer_event_loaded_then_done_replaces_results() {
+        let cached = MessageRecord {
+            timestamp: Some("2026-01-01T00:00:00.000Z".to_string()),
+            role: Role::User,
+            text: "cached text".to_string(),
+            file: PathBuf::from("/tmp/cached.jsonl"),
+            line: 1,
+            session_id: Some("cached-session".to_string()),
+            account: None,
+            cwd: Some("/tmp/cached".to_string()),
+            phase: None,
+            images: Vec::new(),
+            source: SourceKind::CodexSessionJsonl,
+        };
+        let refreshed = MessageRecord {
+            timestamp: Some("2026-01-02T00:00:00.000Z".to_string()),
+            role: Role::User,
+            text: "refreshed text".to_string(),
+            file: PathBuf::from("/tmp/refreshed.jsonl"),
+            line: 1,
+            session_id: Some("refreshed-session".to_string()),
+            account: None,
+            cwd: Some("/tmp/refreshed".to_string()),
+            phase: None,
+            images: Vec::new(),
+            source: SourceKind::CodexSessionJsonl,
+        };
+
+        let mut app = empty_app();
+        handle_indexer_event(
+            &mut app,
+            IndexerEvent::Loaded {
+                records: vec![cached.clone()],
+            },
+        );
+        assert!(app.ready);
+        assert_eq!(app.all.len(), 1);
+        assert_eq!(app.all[0].text, "cached text");
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.indexing.records, 1);
+
+        handle_indexer_event(
+            &mut app,
+            IndexerEvent::Done {
+                records: vec![refreshed.clone()],
+            },
+        );
+        assert_eq!(app.all.len(), 1);
+        assert_eq!(app.all[0].text, "refreshed text");
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].session_id, "refreshed-session");
+        assert_eq!(app.indexing.records, 1);
+    }
+
+    #[test]
     fn resume_target_for_claude_uses_claude_resume() {
         let tmp = TempDir::new("agent-history");
         let cwd = tmp.path.join("proj");
@@ -1790,6 +1969,7 @@ mod tests {
             account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
+            images: Vec::new(),
             source: SourceKind::ClaudeProjectJsonl,
         };
 
@@ -1834,6 +2014,7 @@ mod tests {
             account: Some("work".to_string()),
             cwd: None,
             phase: None,
+            images: Vec::new(),
             source: SourceKind::CodexSessionJsonl,
         };
 
@@ -1871,6 +2052,7 @@ mod tests {
             account: Some("abc".to_string()),
             cwd: None,
             phase: None,
+            images: Vec::new(),
             source: SourceKind::ClaudeProjectJsonl,
         };
 
@@ -1912,6 +2094,7 @@ mod tests {
             account: None,
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: Some("orchestrator".to_string()),
+            images: Vec::new(),
             source: SourceKind::OpenCodeSession,
         };
 
@@ -1977,6 +2160,7 @@ mod tests {
             account: None,
             cwd: None,
             phase: None,
+            images: Vec::new(),
             source,
         }
     }
@@ -2465,6 +2649,7 @@ mod tests {
             account: None,
             cwd: None,
             phase: None,
+            images: Vec::new(),
             source: SourceKind::CodexSessionJsonl,
         };
 
