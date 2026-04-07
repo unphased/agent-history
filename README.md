@@ -19,7 +19,7 @@ In short: this is no longer just the original upstream search UI. It now behaves
 - Claude: `~/.claude/projects/**.jsonl`
 - Claude accounts: `~/.claude-<account>/projects/**.jsonl`
 - OpenCode: `~/.local/share/opencode/storage/{session,message,part}`
-- Auto-discovery: project-local `**/.codex/{sessions,archived_sessions}` and `**/.codex/history.jsonl` under `$HOME` (skips `.git`, `node_modules`, etc.)
+- Extra locations: use `--root` explicitly if you want to scan anything outside those home-scoped defaults
 
 Japanese README: `README.ja.md`
 

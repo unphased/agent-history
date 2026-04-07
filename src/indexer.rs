@@ -74,12 +74,6 @@ pub struct IndexerConfig {
 
 #[derive(Debug)]
 pub enum IndexerEvent {
-    RootScanProgress {
-        scanned_dirs: usize,
-        found_roots: usize,
-        found_files: usize,
-        current: PathBuf,
-    },
     Discovered {
         total_files: usize,
     },
@@ -121,14 +115,6 @@ pub fn spawn_indexer_from_args(args: Args) -> mpsc::Receiver<IndexerEvent> {
         }
     });
     rx
-}
-
-#[derive(Debug, Clone)]
-struct RootScanProgress {
-    scanned_dirs: usize,
-    found_roots: usize,
-    found_files: usize,
-    current: PathBuf,
 }
 
 fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
@@ -197,18 +183,6 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
             }
         }
 
-        // プロジェクト配下にある `.codex/sessions` なども自動検出して追加する
-        let (more_roots, more_files) = discover_project_codex_stores_with_progress(home, |p| {
-            tx.send(IndexerEvent::RootScanProgress {
-                scanned_dirs: p.scanned_dirs,
-                found_roots: p.found_roots,
-                found_files: p.found_files,
-                current: p.current,
-            })
-            .ok();
-        });
-        roots.extend(more_roots);
-        extra_files.extend(more_files);
     }
 
     for root in &args.roots {
@@ -809,117 +783,6 @@ fn discover_account_config_dirs(
     out
 }
 
-fn discover_project_codex_stores_with_progress(
-    home: &Path,
-    mut on_progress: impl FnMut(RootScanProgress),
-) -> (Vec<JsonlInputRoot>, Vec<JsonlInputRoot>) {
-    const PROGRESS_EVERY_DIRS: usize = 500;
-
-    // `~/.codex` は既にデフォルトで入れているので、ここでは「プロジェクト配下」の .codex を拾う。
-    // ただしスキャン対象全体をHOME直下にしておくと、ユーザーの作業ディレクトリ構成に依存しない。
-    let mut roots: Vec<JsonlInputRoot> = Vec::new();
-    let mut files: Vec<JsonlInputRoot> = Vec::new();
-
-    let user_codex = home.join(".codex");
-    let user_library = home.join("Library");
-    let walker = WalkDir::new(home)
-        .follow_links(false)
-        .max_depth(10)
-        .into_iter()
-        .filter_entry(|e| {
-            if !e.file_type().is_dir() {
-                return true;
-            }
-            // `~/.codex` は巨大になりやすいので探索対象から外す（既にデフォルトで別途読み込む）
-            if e.path() == user_codex {
-                return false;
-            }
-            // macOS の ~/Library は巨大で、プロジェクト探索先としてはノイズが大きすぎる。
-            if e.path() == user_library {
-                return false;
-            }
-            let name = e.file_name().to_string_lossy();
-            match name.as_ref() {
-                // どの `.codex` 配下でも会話履歴の本体なので潜らない（`.codex` 自体だけ見えれば十分）
-                "sessions" | "archived_sessions" => false,
-                ".git" | "node_modules" | "target" | ".next" | ".turbo" | "dist" | "build"
-                | ".venv" | ".cache" | ".local" | ".npm" | ".cargo" | ".rustup" | ".mozilla"
-                | ".vscode-server" | ".cursor" | ".cursor-server" | "snap" | "google-cloud-sdk" => {
-                    false
-                }
-                // HOME直下の `.claude` は別ルートで入れるので、ここでは潜らない（スキャン短縮）
-                ".claude" => false,
-                name if name.starts_with(".codex-") || name.starts_with(".claude-") => false,
-                _ => true,
-            }
-        });
-
-    let mut scanned_dirs: usize = 0;
-    let mut last_progress: usize = 0;
-
-    for entry in walker.filter_map(Result::ok) {
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-
-        scanned_dirs = scanned_dirs.saturating_add(1);
-        if scanned_dirs == 1 || scanned_dirs.saturating_sub(last_progress) >= PROGRESS_EVERY_DIRS {
-            on_progress(RootScanProgress {
-                scanned_dirs,
-                found_roots: roots.len(),
-                found_files: files.len(),
-                current: entry.path().to_path_buf(),
-            });
-            last_progress = scanned_dirs;
-        }
-
-        if entry.file_name() != ".codex" {
-            continue;
-        }
-
-        let dir = entry.path();
-        // user-scope の ~/.codex は除外（重複回避）
-        if dir == user_codex {
-            continue;
-        }
-
-        let sessions = dir.join("sessions");
-        if sessions.is_dir() {
-            roots.push(JsonlInputRoot {
-                path: sessions,
-                account: None,
-            });
-        }
-        let archived = dir.join("archived_sessions");
-        if archived.is_dir() {
-            roots.push(JsonlInputRoot {
-                path: archived,
-                account: None,
-            });
-        }
-        let history = dir.join("history.jsonl");
-        if history.is_file() {
-            files.push(JsonlInputRoot {
-                path: history,
-                account: None,
-            });
-        }
-    }
-
-    on_progress(RootScanProgress {
-        scanned_dirs,
-        found_roots: roots.len(),
-        found_files: files.len(),
-        current: home.to_path_buf(),
-    });
-
-    roots.sort();
-    roots.dedup();
-    files.sort();
-    files.dedup();
-    (roots, files)
-}
-
 fn extract_record(
     v: &Value,
     file: &Path,
@@ -1416,93 +1279,6 @@ mod tests {
         assert_eq!(out[0].role, Role::User);
         assert_eq!(out[0].file, storage.join("session/global/ses_demo.json"));
         assert_eq!(out[0].phase.as_deref(), Some("title"));
-    }
-
-    #[test]
-    fn discover_project_codex_stores_finds_project_level_codex_dirs() {
-        let tmp = TempDir::new("agent-history-roots");
-        let home = &tmp.path;
-
-        // user-scope は除外されること（重複回避）
-        fs::create_dir_all(home.join(".codex/sessions")).unwrap();
-
-        // プロジェクト配下
-        fs::create_dir_all(home.join("projects/p1/.codex/sessions")).unwrap();
-        fs::create_dir_all(home.join("projects/p2/.codex/archived_sessions")).unwrap();
-        fs::create_dir_all(home.join("projects/p3/.codex")).unwrap();
-        fs::write(home.join("projects/p3/.codex/history.jsonl"), "{}\n").unwrap();
-
-        // 除外ディレクトリ配下は検出しない
-        fs::create_dir_all(home.join("projects/p4/.git/.codex/sessions")).unwrap();
-        fs::create_dir_all(home.join("projects/p5/node_modules/.codex/sessions")).unwrap();
-        fs::create_dir_all(home.join(".claude/projects/p6/.codex/sessions")).unwrap();
-
-        let (roots, files) = discover_project_codex_stores_with_progress(home, |_| {});
-
-        assert!(contains_path(&roots, &home.join("projects/p1/.codex/sessions")));
-        assert!(contains_path(
-            &roots,
-            &home.join("projects/p2/.codex/archived_sessions")
-        ));
-        assert!(contains_path(
-            &files,
-            &home.join("projects/p3/.codex/history.jsonl")
-        ));
-
-        // user-scope の ~/.codex は対象外
-        assert!(!contains_path(&roots, &home.join(".codex/sessions")));
-
-        // 除外配下
-        assert!(!contains_path(
-            &roots,
-            &home.join("projects/p4/.git/.codex/sessions")
-        ));
-        assert!(!contains_path(
-            &roots,
-            &home.join("projects/p5/node_modules/.codex/sessions")
-        ));
-        assert!(!contains_path(
-            &roots,
-            &home.join(".claude/projects/p6/.codex/sessions")
-        ));
-    }
-
-    #[test]
-    fn discover_project_codex_stores_skips_macos_library_tree() {
-        let tmp = TempDir::new("agent-history-macos-library");
-        let home = &tmp.path;
-
-        fs::create_dir_all(home.join("projects/p1/.codex/sessions")).unwrap();
-        fs::create_dir_all(home.join("Library/Mobile Documents/app/.codex/sessions")).unwrap();
-
-        let (roots, _) = discover_project_codex_stores_with_progress(home, |_| {});
-
-        assert!(contains_path(&roots, &home.join("projects/p1/.codex/sessions")));
-        assert!(!contains_path(
-            &roots,
-            &home.join("Library/Mobile Documents/app/.codex/sessions")
-        ));
-    }
-
-    #[test]
-    fn discover_project_codex_stores_reports_progress() {
-        let tmp = TempDir::new("agent-history-roots-progress");
-        let home = &tmp.path;
-
-        fs::create_dir_all(home.join("p/.codex/sessions")).unwrap();
-        fs::write(home.join("p/.codex/history.jsonl"), "{}\n").unwrap();
-
-        let mut events: Vec<RootScanProgress> = Vec::new();
-        let (roots, files) = discover_project_codex_stores_with_progress(home, |p| {
-            events.push(p);
-        });
-
-        assert!(!events.is_empty());
-        let last = events.last().unwrap();
-        assert_eq!(last.found_roots, roots.len());
-        assert_eq!(last.found_files, files.len());
-        assert_eq!(last.current, home.to_path_buf());
-        assert!(last.scanned_dirs >= 1);
     }
 
     #[test]

@@ -35,12 +35,6 @@ use std::{
 
 #[derive(Debug, Default, Clone)]
 struct IndexingProgress {
-    scanning_roots: bool,
-    scanned_dirs: usize,
-    found_roots: usize,
-    found_files: usize,
-    scan_current: Option<PathBuf>,
-
     total_files: usize,
     processed_files: usize,
     records: usize,
@@ -653,8 +647,6 @@ struct App {
 
     indexing: IndexingProgress,
     ready: bool,
-
-    spinner: usize,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -707,13 +699,8 @@ fn run_app(
         preview_scroll_reset_pending: false,
         last_query: String::new(),
         last_results: Vec::new(),
-        indexing: IndexingProgress {
-            // root 探索が重いので、最初から「探索中」を出しておく
-            scanning_roots: !args.no_default_roots,
-            ..IndexingProgress::default()
-        },
+        indexing: IndexingProgress::default(),
         ready: false,
-        spinner: 0,
     };
 
     loop {
@@ -746,20 +733,7 @@ fn run_app(
 
 fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
     match ev {
-        IndexerEvent::RootScanProgress {
-            scanned_dirs,
-            found_roots,
-            found_files,
-            current,
-        } => {
-            app.indexing.scanning_roots = true;
-            app.indexing.scanned_dirs = scanned_dirs;
-            app.indexing.found_roots = found_roots;
-            app.indexing.found_files = found_files;
-            app.indexing.scan_current = Some(current);
-        }
         IndexerEvent::Discovered { total_files } => {
-            app.indexing.scanning_roots = false;
             app.indexing.total_files = total_files;
         }
         IndexerEvent::Progress {
@@ -769,7 +743,6 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
             sessions,
             current,
         } => {
-            app.indexing.scanning_roots = false;
             app.indexing.processed_files = processed_files;
             app.indexing.total_files = total_files;
             app.indexing.records = records;
@@ -1336,62 +1309,35 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
             .split(root[1]);
 
-        if app.indexing.scanning_roots && app.indexing.total_files == 0 {
-            let spinners: [char; 4] = ['|', '/', '-', '\\'];
-            let ch = spinners[app.spinner % spinners.len()];
-            app.spinner = app.spinner.wrapping_add(1);
-
-            let loading = Paragraph::new(format!("{ch} Scanning projects under $HOME..."))
-                .block(Block::default().borders(Borders::ALL).title("Loading"))
-                .wrap(Wrap { trim: false });
-            f.render_widget(loading, main[0]);
-
-            let mut lines = vec![Line::raw(format!(
-                "dirs: {}   roots: {}   history_files: {}",
-                app.indexing.scanned_dirs, app.indexing.found_roots, app.indexing.found_files
-            ))];
-            if let Some(cur) = app.indexing.scan_current.as_ref() {
-                lines.push(Line::raw(format!("current: {}", cur.display())));
-            }
-            if let Some(w) = app.indexing.last_warn.as_deref() {
-                lines.push(Line::raw(format!("warn: {w}")));
-            }
-            let p = Paragraph::new(Text::from(lines))
-                .block(Block::default().borders(Borders::ALL).title("Status"))
-                .wrap(Wrap { trim: false });
-            f.render_widget(p, main[1]);
+        let pct = if app.indexing.total_files == 0 {
+            0u16
         } else {
-            let pct = if app.indexing.total_files == 0 {
-                0u16
-            } else {
-                ((app.indexing.processed_files.saturating_mul(100)) / app.indexing.total_files)
-                    as u16
-            };
+            ((app.indexing.processed_files.saturating_mul(100)) / app.indexing.total_files) as u16
+        };
 
-            let gauge = Gauge::default()
-                .block(Block::default().borders(Borders::ALL).title("Indexing"))
-                .gauge_style(Style::default().fg(Color::Cyan))
-                .percent(pct);
-            f.render_widget(gauge, main[0]);
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("Indexing"))
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .percent(pct);
+        f.render_widget(gauge, main[0]);
 
-            let mut lines = vec![Line::raw(format!(
-                "files: {}/{}   records: {}   sessions: {}",
-                app.indexing.processed_files,
-                app.indexing.total_files,
-                app.indexing.records,
-                app.indexing.sessions
-            ))];
-            if let Some(cur) = app.indexing.current.as_ref() {
-                lines.push(Line::raw(format!("current: {}", cur.display())));
-            }
-            if let Some(w) = app.indexing.last_warn.as_deref() {
-                lines.push(Line::raw(format!("warn: {w}")));
-            }
-            let p = Paragraph::new(Text::from(lines))
-                .block(Block::default().borders(Borders::ALL).title("Status"))
-                .wrap(Wrap { trim: false });
-            f.render_widget(p, main[1]);
+        let mut lines = vec![Line::raw(format!(
+            "files: {}/{}   records: {}   sessions: {}",
+            app.indexing.processed_files,
+            app.indexing.total_files,
+            app.indexing.records,
+            app.indexing.sessions
+        ))];
+        if let Some(cur) = app.indexing.current.as_ref() {
+            lines.push(Line::raw(format!("current: {}", cur.display())));
         }
+        if let Some(w) = app.indexing.last_warn.as_deref() {
+            lines.push(Line::raw(format!("warn: {w}")));
+        }
+        let p = Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("Status"))
+            .wrap(Wrap { trim: false });
+        f.render_widget(p, main[1]);
 
         let footer = Layout::default()
             .direction(Direction::Vertical)
@@ -1806,7 +1752,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -1857,7 +1802,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -1902,7 +1846,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -1940,7 +1883,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -1982,7 +1924,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2174,7 +2115,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         app.update_results();
@@ -2225,7 +2165,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         app.update_results();
@@ -2259,7 +2198,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         app.update_results();
@@ -2302,7 +2240,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         app.update_results();
@@ -2353,7 +2290,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         app.scroll_preview_lines(-10);
@@ -2389,7 +2325,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         route_mouse(
@@ -2476,7 +2411,6 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
-            spinner: 0,
         };
 
         route_mouse(
