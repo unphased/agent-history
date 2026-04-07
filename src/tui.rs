@@ -15,7 +15,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
 use std::{
@@ -275,6 +275,33 @@ fn result_line(sess: &SessionSummary, matched: Option<&MessageRecord>, hit_count
     } else {
         format!("{prefix} :: {snippet}")
     }
+}
+
+fn highlighted_line(
+    text: &str,
+    query: &str,
+    base_style: Style,
+    match_style: Style,
+) -> Line<'static> {
+    let ranges = search::find_match_ranges(query, text);
+    if ranges.is_empty() {
+        return Line::from(vec![Span::styled(text.to_string(), base_style)]);
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = 0usize;
+    for (start, end) in ranges {
+        if start > last {
+            spans.push(Span::styled(text[last..start].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), match_style));
+        last = end;
+    }
+    if last < text.len() {
+        spans.push(Span::styled(text[last..].to_string(), base_style));
+    }
+
+    Line::from(spans)
 }
 
 fn looks_like_codex_title_task_prompt(text: &str) -> bool {
@@ -866,6 +893,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let visible_start = cmp::min(app.offset, total);
     let visible_end = cmp::min(visible_start + inner_height, total);
+    let query = app.query.trim();
+    let result_match_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line> = Vec::new();
     for hit in app.filtered[visible_start..visible_end].iter() {
@@ -873,7 +905,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             continue;
         };
         let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
-        lines.push(Line::raw(result_line(sess, matched, hit.hit_count)));
+        lines.push(highlighted_line(
+            &result_line(sess, matched, hit.hit_count),
+            query,
+            Style::default(),
+            result_match_style,
+        ));
     }
 
     let results = Paragraph::new(Text::from(lines)).block(
@@ -924,7 +961,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
         header.push(Line::raw(""));
 
-        header.extend(rec.text.lines().map(|l| Line::raw(l.to_string())));
+        let preview_match_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        header.extend(
+            rec.text
+                .lines()
+                .map(|l| highlighted_line(l, query, Style::default(), preview_match_style)),
+        );
 
         Paragraph::new(Text::from(header))
             .block(Block::default().borders(Borders::ALL).title("Preview"))
@@ -975,13 +1020,20 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             return;
         };
         let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
-        let line = result_line(sess, matched, hit.hit_count);
-        let p = Paragraph::new(line).style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        let selected_base_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+        let selected_match_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let p = Paragraph::new(Text::from(vec![highlighted_line(
+            &result_line(sess, matched, hit.hit_count),
+            query,
+            selected_base_style,
+            selected_match_style,
+        )]));
         f.render_widget(p, highlight_area);
     }
 }
@@ -1563,6 +1615,21 @@ mod tests {
         assert!(line.contains("session opener"));
         assert!(line.contains("matching context"));
         assert!(line.contains("[3 hits]"));
+    }
+
+    #[test]
+    fn highlighted_line_splits_matching_spans() {
+        let line = highlighted_line(
+            "Hello there hello",
+            "hello",
+            Style::default(),
+            Style::default().fg(Color::Yellow),
+        );
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "Hello");
+        assert_eq!(line.spans[1].content.as_ref(), " there ");
+        assert_eq!(line.spans[2].content.as_ref(), "hello");
     }
 
     #[test]

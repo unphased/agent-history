@@ -63,6 +63,37 @@ impl CompiledQuery {
     }
 }
 
+pub fn find_match_ranges(query: &str, haystack: &str) -> Vec<(usize, usize)> {
+    let compiled = CompiledQuery::new(query);
+    if compiled.tokens.is_empty() {
+        return vec![];
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for token in &compiled.tokens {
+        ranges.extend(find_token_ranges(haystack, token));
+    }
+
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+
+    for (start, end) in ranges {
+        if let Some((_, cur_end)) = merged.last_mut()
+            && start <= *cur_end
+        {
+            *cur_end = (*cur_end).max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+
+    merged
+}
+
 fn record_matches_token(rec: &MessageRecord, token: &Token) -> bool {
     if contains_token(&rec.text, token) {
         return true;
@@ -82,6 +113,20 @@ fn record_matches_token(rec: &MessageRecord, token: &Token) -> bool {
         return true;
     }
     false
+}
+
+fn find_token_ranges(haystack: &str, token: &Token) -> Vec<(usize, usize)> {
+    if token.raw.is_empty() {
+        return vec![];
+    }
+
+    match token.lower_ascii.as_deref() {
+        Some(lower) => find_ascii_case_insensitive_ranges(haystack.as_bytes(), lower),
+        None => haystack
+            .match_indices(&token.raw)
+            .map(|(start, matched)| (start, start + matched.len()))
+            .collect(),
+    }
 }
 
 fn contains_token(haystack: &str, token: &Token) -> bool {
@@ -121,6 +166,31 @@ fn contains_ascii_case_insensitive_bytes(haystack: &[u8], needle_lower: &[u8]) -
         }
     }
     false
+}
+
+fn find_ascii_case_insensitive_ranges(haystack: &[u8], needle_lower: &[u8]) -> Vec<(usize, usize)> {
+    let n = needle_lower;
+    if n.is_empty() || n.len() > haystack.len() {
+        return vec![];
+    }
+
+    let mut ranges = Vec::new();
+    for i in 0..=haystack.len() - n.len() {
+        if haystack[i].to_ascii_lowercase() != n[0] {
+            continue;
+        }
+        let mut ok = true;
+        for j in 1..n.len() {
+            if haystack[i + j].to_ascii_lowercase() != n[j] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            ranges.push((i, i + n.len()));
+        }
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -167,5 +237,18 @@ mod tests {
     fn compiled_query_matches_as_expected() {
         let r = rec("Hello World");
         assert!(CompiledQuery::new("hello").matches_record(&r));
+    }
+
+    #[test]
+    fn find_match_ranges_finds_ascii_case_insensitive_matches() {
+        assert_eq!(
+            find_match_ranges("hello", "Hello there hello"),
+            vec![(0, 5), (12, 17)]
+        );
+    }
+
+    #[test]
+    fn find_match_ranges_merges_overlapping_matches() {
+        assert_eq!(find_match_ranges("ell llo", "Hello"), vec![(1, 5)]);
     }
 }
