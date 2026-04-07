@@ -5,12 +5,17 @@ Codex / Claude / OpenCode の会話履歴を、プロジェクト横断で全文
 upstream の `origin/main` と比べると、このforkはかなり大きく拡張されています。
 
 - OpenCode の履歴インデックス化と resume 対応を追加。
+- OpenCode セッションのインデックス作成を並列化し、大きなストレージでも更新を速くしました。
 - 検索結果を「ただセッションが出るだけ」から改善し、マッチした断片、マッチしたメッセージのプレビュー、実際のヒット位置を中心にした pager 表示に対応。
 - 結果一覧とプレビューの両方でクエリハイライトを追加。
 - プレビューを大幅強化し、キーボードスクロール、マウスホイールスクロール、左右ペインでのホイール振り分け、折り返し行を考慮したスクロール制御、複数ヒットの連続表示に対応。
 - 巨大セッションでも状況を把握しやすいように、複数マッチの表示件数やクエリ出現回数の集計を出すよう改善。
 - 結果一覧の表示形式と provider 表示を見直し、一覧性を向上。
 - `~/.codex-work` や `~/.claude-work` のようなアカウント別ディレクトリを自動検出し、別 namespace として扱い、`codex-account <name>` / `claude-account <name>` で resume できるように拡張。
+- 永続 SQLite キャッシュを追加し、差分更新・削除済みソースの prune・fingerprint による再利用で、毎回のフルスキャンを避けるようにしました。
+- キャッシュ制御用に `--no-cache` と `--rebuild-index` を追加しました。
+- インデックス処理とキャッシュ処理のライフサイクルを記録する JSONL telemetry を追加し、無効化フラグと出力先指定フラグも追加しました。
+- Codex の画像添付を抽出してインデックスに保持し、プレビューに出せるようにしました。
 
 要するに、もはや upstream の最初の検索TUIのままではなく、複数の agent 実装と複数アカウントを横断して扱えるローカル履歴ブラウザに近いものになっています。
 
@@ -38,6 +43,16 @@ cargo install --path .
 
 ※ `fzf` のような外部fuzzy finderは不要です。
 
+## アーキテクチャメモ
+- 永続キャッシュのデフォルト保存先は `~/.local/state/agent-history/index.sqlite` です。
+- telemetry のデフォルト保存先は `~/.local/state/agent-history/events.jsonl` です。
+- `AGENT_HISTORY_CACHE_DB` でキャッシュDBの保存先を上書きできます。
+- `AGENT_HISTORY_TELEMETRY_LOG` で telemetry ログの保存先を上書きできます。
+- キャッシュ対象の各ソースは fingerprint で判定し、変化していないファイル/セッションは再利用します。
+- 消えたソースはキャッシュから自動で prune されます。
+- OpenCode セッションの再インデックスは並列実行されます。
+- Codex の画像添付はプレビューでパスとして表示され、埋め込み画像データは必要時にテンポラリディレクトリへ展開されます。
+
 ## 使い方
 ```bash
 agent-history
@@ -62,6 +77,7 @@ cargo run --release
 ※ Codexのログは先頭に `AGENTS.md` や `<environment_context>` が入ることがあるので、一覧の「最初の発言」からは除外します。  
 （それしか無いセッションは一覧に出しません）  
 ※ `subagents/` 配下のログは量が多くノイズになりやすいので、デフォルトでは探索対象から除外します。
+※ マッチした Codex レコードに画像添付がある場合、プレビューにはそのファイルパスを表示します。
 
 ### オプション
 ```bash
@@ -73,6 +89,18 @@ agent-history --no-default-roots --root /path/to/dir
 
 # 追加で ~/.codex/history.jsonl も取り込む（簡易テキスト）
 agent-history --history
+
+# 永続キャッシュを使わず毎回フルスキャン
+agent-history --no-cache
+
+# 永続キャッシュを破棄して再構築
+agent-history --rebuild-index
+
+# telemetry JSONL の出力先を指定
+agent-history --telemetry-log /tmp/agent-history-events.jsonl
+
+# telemetry ログを無効化
+agent-history --no-telemetry
 
 # 起動時クエリ
 agent-history --query "DMARC"
