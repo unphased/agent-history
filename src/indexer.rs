@@ -544,13 +544,13 @@ fn run_indexer(
                 processed_files = processed_files.saturating_add(1);
                 emit(
                     "unit_reindexed",
-                    json!({
-                        "source": source_kind,
-                        "path": current.display().to_string(),
-                        "records": records_added,
-                        "sessions": sessions_added,
-                        "cache_write_ms": cache_write_started.elapsed().as_millis(),
-                    }),
+                    unit_reindexed_payload(
+                        &current,
+                        records_added,
+                        sessions_added,
+                        cache_write_started.elapsed().as_millis(),
+                        &chunk.telemetry,
+                    ),
                 );
                 tx.send(IndexerEvent::Progress {
                     processed_files,
@@ -612,13 +612,13 @@ fn run_indexer(
                     processed_files = processed_files.saturating_add(1);
                     emit(
                         "unit_reindexed",
-                        json!({
-                            "source": "opencode",
-                            "path": current.display().to_string(),
-                            "records": records_added,
-                            "sessions": sessions_added,
-                            "cache_write_ms": cache_write_started.elapsed().as_millis(),
-                        }),
+                        unit_reindexed_payload(
+                            &current,
+                            records_added,
+                            sessions_added,
+                            cache_write_started.elapsed().as_millis(),
+                            &chunk.telemetry,
+                        ),
                     );
                     tx.send(IndexerEvent::Progress {
                         processed_files,
@@ -810,13 +810,13 @@ fn run_full_scan(
                 let current = chunk.current.clone();
                 emit(
                     "unit_reindexed",
-                    json!({
-                        "source": "jsonl",
-                        "path": current.display().to_string(),
-                        "records": chunk.records.len(),
-                        "sessions": chunk.sessions.len(),
-                        "cache_write_ms": 0,
-                    }),
+                    unit_reindexed_payload(
+                        &current,
+                        chunk.records.len(),
+                        chunk.sessions.len(),
+                        0,
+                        &chunk.telemetry,
+                    ),
                 );
                 indexed_inputs[idx] = Some(chunk);
                 processed_files = processed_files.saturating_add(1);
@@ -869,13 +869,13 @@ fn run_full_scan(
                     let current = chunk.current.clone();
                     emit(
                         "unit_reindexed",
-                        json!({
-                            "source": "opencode",
-                            "path": current.display().to_string(),
-                            "records": chunk.records.len(),
-                            "sessions": chunk.sessions.len(),
-                            "cache_write_ms": 0,
-                        }),
+                        unit_reindexed_payload(
+                            &current,
+                            chunk.records.len(),
+                            chunk.sessions.len(),
+                            0,
+                            &chunk.telemetry,
+                        ),
                     );
                     indexed_inputs[index] = Some(chunk);
                     processed_files = processed_files.saturating_add(1);
@@ -931,6 +931,7 @@ struct IndexedInputChunk {
     current: PathBuf,
     records: Vec<MessageRecord>,
     sessions: HashSet<(SourceKind, String, Option<String>)>,
+    telemetry: IndexTelemetry,
 }
 
 #[derive(Debug)]
@@ -944,6 +945,51 @@ enum IndexedInputResult {
         current: PathBuf,
         error: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct IndexTelemetry {
+    source: &'static str,
+    duration_ms: u128,
+    opencode: Option<OpenCodeIndexTelemetry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenCodeIndexTelemetry {
+    message_files: usize,
+    messages_with_text: usize,
+    part_files: usize,
+    text_parts: usize,
+    part_parse_failures: usize,
+    used_title_fallback: bool,
+}
+
+fn unit_reindexed_payload(
+    path: &Path,
+    records: usize,
+    sessions: usize,
+    cache_write_ms: u128,
+    telemetry: &IndexTelemetry,
+) -> Value {
+    let mut payload = json!({
+        "source": telemetry.source,
+        "path": path.display().to_string(),
+        "records": records,
+        "sessions": sessions,
+        "duration_ms": telemetry.duration_ms,
+        "cache_write_ms": cache_write_ms,
+    });
+
+    if let Some(opencode) = telemetry.opencode.as_ref() {
+        payload["message_files"] = json!(opencode.message_files);
+        payload["messages_with_text"] = json!(opencode.messages_with_text);
+        payload["part_files"] = json!(opencode.part_files);
+        payload["text_parts"] = json!(opencode.text_parts);
+        payload["part_parse_failures"] = json!(opencode.part_parse_failures);
+        payload["used_title_fallback"] = json!(opencode.used_title_fallback);
+    }
+
+    payload
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1080,13 +1126,30 @@ fn index_input(
     input: IndexInput,
     out: &mut Vec<MessageRecord>,
     sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IndexTelemetry> {
     match input {
-        IndexInput::Jsonl { path, account } => index_file(&path, account.as_deref(), out, sessions),
+        IndexInput::Jsonl { path, account } => {
+            let started = Instant::now();
+            index_file(&path, account.as_deref(), out, sessions)?;
+            Ok(IndexTelemetry {
+                source: "jsonl",
+                duration_ms: started.elapsed().as_millis(),
+                opencode: None,
+            })
+        }
         IndexInput::OpenCodeSession {
             storage_root,
             session_file,
-        } => index_opencode_session_file(&storage_root, &session_file, out, sessions),
+        } => {
+            let started = Instant::now();
+            let opencode =
+                index_opencode_session_file(&storage_root, &session_file, out, sessions)?;
+            Ok(IndexTelemetry {
+                source: "opencode",
+                duration_ms: started.elapsed().as_millis(),
+                opencode: Some(opencode),
+            })
+        }
     }
 }
 
@@ -1095,10 +1158,11 @@ fn index_input_to_chunk(input: IndexInput) -> Result<IndexedInputChunk, (PathBuf
     let mut records = Vec::new();
     let mut sessions = HashSet::new();
     match index_input(input, &mut records, &mut sessions) {
-        Ok(()) => Ok(IndexedInputChunk {
+        Ok(telemetry) => Ok(IndexedInputChunk {
             current,
             records,
             sessions,
+            telemetry,
         }),
         Err(e) => Err((current, e)),
     }
@@ -1248,11 +1312,12 @@ fn index_opencode_session_file(
     session_file: &Path,
     out: &mut Vec<MessageRecord>,
     sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<OpenCodeIndexTelemetry> {
+    let mut telemetry = OpenCodeIndexTelemetry::default();
     let session: OpenCodeSession = serde_json::from_reader(File::open(session_file)?)?;
     let message_dir = storage_root.join("message").join(&session.id);
     if !message_dir.is_dir() {
-        return Ok(());
+        return Ok(telemetry);
     }
 
     let session_cwd = session.directory.as_deref().map(str::to_string);
@@ -1273,15 +1338,24 @@ fn index_opencode_session_file(
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
     message_files.sort();
+    telemetry.message_files = message_files.len();
 
     let mut records_added = 0usize;
 
     for message_file in message_files {
         let message: OpenCodeMessage = serde_json::from_reader(File::open(&message_file)?)?;
         let part_dir = storage_root.join("part").join(&message.id);
-        let Some((text, text_file, timestamp)) = extract_opencode_message_text(&part_dir)? else {
+        let part_result = extract_opencode_message_text(&part_dir)?;
+        telemetry.part_files = telemetry.part_files.saturating_add(part_result.part_files);
+        telemetry.text_parts = telemetry.text_parts.saturating_add(part_result.text_parts);
+        telemetry.part_parse_failures = telemetry
+            .part_parse_failures
+            .saturating_add(part_result.part_parse_failures);
+
+        let Some((text, text_file, timestamp)) = part_result.payload else {
             continue;
         };
+        telemetry.messages_with_text = telemetry.messages_with_text.saturating_add(1);
 
         let role = Role::from_str(&message.role);
         let cwd = message
@@ -1320,6 +1394,7 @@ fn index_opencode_session_file(
     if records_added == 0
         && let Some(title) = fallback_title
     {
+        telemetry.used_title_fallback = true;
         out.push(MessageRecord {
             timestamp: session_ts,
             role: Role::User,
@@ -1340,14 +1415,24 @@ fn index_opencode_session_file(
         sessions.insert((SourceKind::OpenCodeSession, session.id, None));
     }
 
-    Ok(())
+    Ok(telemetry)
 }
 
-fn extract_opencode_message_text(
-    part_dir: &Path,
-) -> anyhow::Result<Option<(String, PathBuf, Option<String>)>> {
+struct OpenCodeMessageTextResult {
+    payload: Option<(String, PathBuf, Option<String>)>,
+    part_files: usize,
+    text_parts: usize,
+    part_parse_failures: usize,
+}
+
+fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMessageTextResult> {
     if !part_dir.is_dir() {
-        return Ok(None);
+        return Ok(OpenCodeMessageTextResult {
+            payload: None,
+            part_files: 0,
+            text_parts: 0,
+            part_parse_failures: 0,
+        });
     }
 
     let mut part_files: Vec<PathBuf> = fs::read_dir(part_dir)?
@@ -1356,15 +1441,21 @@ fn extract_opencode_message_text(
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
     part_files.sort();
+    let part_file_count = part_files.len();
 
     let mut texts: Vec<String> = Vec::new();
     let mut first_text_file: Option<PathBuf> = None;
     let mut last_ts: Option<i64> = None;
+    let mut text_parts = 0usize;
+    let mut part_parse_failures = 0usize;
 
     for part_file in part_files {
         let part: OpenCodePart = match serde_json::from_reader(File::open(&part_file)?) {
             Ok(part) => part,
-            Err(_) => continue,
+            Err(_) => {
+                part_parse_failures = part_parse_failures.saturating_add(1);
+                continue;
+            }
         };
 
         if part.part_type != "text" {
@@ -1382,6 +1473,7 @@ fn extract_opencode_message_text(
         if first_text_file.is_none() {
             first_text_file = Some(part_file.clone());
         }
+        text_parts = text_parts.saturating_add(1);
         texts.push(text.to_string());
 
         if let Some(ts) = part.time.as_ref().and_then(|t| t.end.or(t.start)) {
@@ -1390,14 +1482,24 @@ fn extract_opencode_message_text(
     }
 
     if texts.is_empty() {
-        return Ok(None);
+        return Ok(OpenCodeMessageTextResult {
+            payload: None,
+            part_files: part_file_count,
+            text_parts,
+            part_parse_failures,
+        });
     }
 
-    Ok(Some((
-        texts.join("\n"),
-        first_text_file.unwrap_or_else(|| part_dir.to_path_buf()),
-        last_ts.map(format_epoch_timestamp),
-    )))
+    Ok(OpenCodeMessageTextResult {
+        payload: Some((
+            texts.join("\n"),
+            first_text_file.unwrap_or_else(|| part_dir.to_path_buf()),
+            last_ts.map(format_epoch_timestamp),
+        )),
+        part_files: part_file_count,
+        text_parts,
+        part_parse_failures,
+    })
 }
 
 fn format_epoch_timestamp(ts: i64) -> String {
@@ -2023,7 +2125,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut sessions = HashSet::new();
-        index_opencode_session_file(
+        let telemetry = index_opencode_session_file(
             &storage,
             &storage.join("session/global/ses_demo.json"),
             &mut out,
@@ -2039,6 +2141,11 @@ mod tests {
         assert_eq!(out[0].session_id.as_deref(), Some("ses_demo"));
         assert_eq!(out[0].timestamp.as_deref(), Some("1970-01-01T00:03:40Z"));
         assert_eq!(out[0].phase.as_deref(), Some("orchestrator"));
+        assert_eq!(telemetry.message_files, 1);
+        assert_eq!(telemetry.messages_with_text, 1);
+        assert_eq!(telemetry.part_files, 2);
+        assert_eq!(telemetry.text_parts, 1);
+        assert!(!telemetry.used_title_fallback);
         assert!(sessions.contains(&(SourceKind::OpenCodeSession, "ses_demo".to_string(), None)));
     }
 
@@ -2083,7 +2190,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut sessions = HashSet::new();
-        index_opencode_session_file(
+        let telemetry = index_opencode_session_file(
             &storage,
             &storage.join("session/global/ses_demo.json"),
             &mut out,
@@ -2096,6 +2203,11 @@ mod tests {
         assert_eq!(out[0].role, Role::User);
         assert_eq!(out[0].file, storage.join("session/global/ses_demo.json"));
         assert_eq!(out[0].phase.as_deref(), Some("title"));
+        assert_eq!(telemetry.message_files, 1);
+        assert_eq!(telemetry.messages_with_text, 0);
+        assert_eq!(telemetry.part_files, 1);
+        assert_eq!(telemetry.text_parts, 0);
+        assert!(telemetry.used_title_fallback);
     }
 
     #[test]

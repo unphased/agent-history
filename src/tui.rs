@@ -3,7 +3,7 @@ use crate::{
     indexer::{
         ImageAttachment, ImageAttachmentKind, IndexerEvent, MessageRecord, Role, SourceKind,
     },
-    search,
+    search, telemetry,
 };
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -24,6 +24,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
+use serde_json::Value;
 use std::{
     cmp,
     collections::HashMap,
@@ -362,6 +363,121 @@ fn first_non_empty_line(s: &str) -> &str {
 
 fn compact_single_line(s: &str) -> String {
     first_non_empty_line(s).replace(['\t', '\n'], " ")
+}
+
+fn latest_lines(path: &Path, max_lines: usize) -> Vec<String> {
+    let Ok(body) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = body.lines().map(|line| line.to_string()).collect();
+    if lines.len() > max_lines {
+        let start = lines.len() - max_lines;
+        lines.drain(0..start);
+    }
+    lines
+}
+
+fn telemetry_metric_u64(data: &Value, key: &str) -> Option<u64> {
+    data.get(key).and_then(|value| value.as_u64())
+}
+
+fn telemetry_metric_bool(data: &Value, key: &str) -> Option<bool> {
+    data.get(key).and_then(|value| value.as_bool())
+}
+
+fn telemetry_metric_str<'a>(data: &'a Value, key: &str) -> Option<&'a str> {
+    data.get(key).and_then(|value| value.as_str())
+}
+
+fn format_telemetry_event_line(row: &Value) -> String {
+    let ts = row
+        .get("ts_ms")
+        .map(|value| {
+            value
+                .as_u64()
+                .map(|ts| short_ts(Some(&ts.to_string())))
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_default();
+    let kind = row
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("event");
+    let data = row.get("data").unwrap_or(&Value::Null);
+
+    let summary = match kind {
+        "indexer_started" => format!(
+            "files={} cache={} rebuild={}",
+            telemetry_metric_u64(data, "total_files").unwrap_or(0),
+            data.get("cache_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            data.get("rebuild_index")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        ),
+        "cache_open_finished" => format!(
+            "ms={} bytes={}",
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "cache_bytes").unwrap_or(0)
+        ),
+        "cache_load_finished" | "cache_reload_finished" => format!(
+            "ms={} records={} sessions={} bytes={}",
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "records").unwrap_or(0),
+            telemetry_metric_u64(data, "sessions").unwrap_or(0),
+            telemetry_metric_u64(data, "cache_bytes").unwrap_or(0)
+        ),
+        "fingerprint_scan_finished" => format!(
+            "ms={} total={} cached={}",
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "total_units").unwrap_or(0),
+            telemetry_metric_u64(data, "cached_units").unwrap_or(0)
+        ),
+        "refresh_finished" => format!(
+            "ms={} skipped={} refreshed={} failed={}",
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "skipped_units").unwrap_or(0),
+            telemetry_metric_u64(data, "refreshed_units").unwrap_or(0),
+            telemetry_metric_u64(data, "failed_units").unwrap_or(0)
+        ),
+        "unit_reindexed" => {
+            let mut suffix = format!(
+                "ms={} recs={} msgs={} parts={} text_parts={} parse_failures={}",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                telemetry_metric_u64(data, "records").unwrap_or(0),
+                telemetry_metric_u64(data, "message_files").unwrap_or(0),
+                telemetry_metric_u64(data, "part_files").unwrap_or(0),
+                telemetry_metric_u64(data, "text_parts").unwrap_or(0),
+                telemetry_metric_u64(data, "part_parse_failures").unwrap_or(0)
+            );
+            if telemetry_metric_bool(data, "used_title_fallback").unwrap_or(false) {
+                suffix.push_str(" title_fallback=true");
+            }
+            if let Some(path) = telemetry_metric_str(data, "path") {
+                suffix.push_str(&format!(" path={}", truncate_middle(path, 60)));
+            }
+            suffix
+        }
+        "unit_failed" => format!(
+            "error={} path={}",
+            telemetry_metric_str(data, "error").unwrap_or(""),
+            truncate_middle(telemetry_metric_str(data, "path").unwrap_or(""), 60)
+        ),
+        "indexer_finished" | "full_scan_finished" => format!(
+            "ms={} records={} sessions={}",
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "records").unwrap_or(0),
+            telemetry_metric_u64(data, "sessions").unwrap_or(0)
+        ),
+        _ => serde_json::to_string(data).unwrap_or_default(),
+    };
+
+    if ts.is_empty() {
+        format!("{kind}: {summary}")
+    } else {
+        format!("{ts}  {kind}: {summary}")
+    }
 }
 
 fn truncate_middle(s: &str, max_chars: usize) -> String {
@@ -737,6 +853,8 @@ struct App {
 
     indexing: IndexingProgress,
     ready: bool,
+    telemetry_log_path: Option<PathBuf>,
+    show_telemetry: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -791,6 +909,12 @@ fn run_app(
         last_results: Vec::new(),
         indexing: IndexingProgress::default(),
         ready: false,
+        telemetry_log_path: (!args.no_telemetry).then(|| {
+            args.telemetry_log
+                .clone()
+                .unwrap_or_else(telemetry::default_log_path)
+        }),
+        show_telemetry: false,
     };
 
     loop {
@@ -891,6 +1015,10 @@ fn handle_key(
         }
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.scroll_preview_page(1);
+            return Ok(false);
+        }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_telemetry_view();
             return Ok(false);
         }
         KeyCode::Backspace => {
@@ -1153,6 +1281,10 @@ impl App {
     }
 
     fn build_preview_doc(&self) -> PreviewDoc {
+        if self.show_telemetry {
+            return self.build_telemetry_preview_doc();
+        }
+
         let query = self.query.trim();
         let base_style = Style::default();
         let match_style = Style::default()
@@ -1349,6 +1481,101 @@ impl App {
         }
     }
 
+    fn build_telemetry_preview_doc(&self) -> PreviewDoc {
+        let Some(path) = self.telemetry_log_path.as_ref() else {
+            return PreviewDoc {
+                lines: vec![Line::raw("telemetry disabled")],
+                first_match_line: 0,
+            };
+        };
+
+        let mut lines: Vec<Line<'static>> = vec![Line::raw(format!("log: {}", path.display()))];
+        if let Ok(metadata) = fs::metadata(path) {
+            lines.push(Line::raw(format!("bytes: {}", metadata.len())));
+        }
+
+        let raw_lines = latest_lines(path, 400);
+        if raw_lines.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("(no telemetry events yet)"));
+            return PreviewDoc {
+                lines,
+                first_match_line: 0,
+            };
+        }
+
+        let parsed: Vec<Value> = raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        let latest_start = parsed
+            .iter()
+            .rposition(|row| {
+                row.get("kind").and_then(|value| value.as_str()) == Some("indexer_started")
+            })
+            .unwrap_or(0);
+        let run = &parsed[latest_start..];
+
+        let find_data = |kind: &str| {
+            run.iter()
+                .rev()
+                .find(|row| row.get("kind").and_then(|value| value.as_str()) == Some(kind))
+                .and_then(|row| row.get("data"))
+        };
+
+        if let Some(data) = find_data("cache_open_finished") {
+            lines.push(Line::raw(format!(
+                "cache open: {} ms   size: {} bytes",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                telemetry_metric_u64(data, "cache_bytes").unwrap_or(0)
+            )));
+        }
+        if let Some(data) = find_data("cache_load_finished") {
+            lines.push(Line::raw(format!(
+                "cache load: {} ms   records: {}   sessions: {}",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                telemetry_metric_u64(data, "records").unwrap_or(0),
+                telemetry_metric_u64(data, "sessions").unwrap_or(0)
+            )));
+        }
+        if let Some(data) = find_data("refresh_finished") {
+            lines.push(Line::raw(format!(
+                "refresh: {} ms   skipped: {}   refreshed: {}   failed: {}",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                telemetry_metric_u64(data, "skipped_units").unwrap_or(0),
+                telemetry_metric_u64(data, "refreshed_units").unwrap_or(0),
+                telemetry_metric_u64(data, "failed_units").unwrap_or(0)
+            )));
+        }
+        if let Some(data) = find_data("cache_reload_finished") {
+            lines.push(Line::raw(format!(
+                "cache reload: {} ms   records: {}   sessions: {}",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                telemetry_metric_u64(data, "records").unwrap_or(0),
+                telemetry_metric_u64(data, "sessions").unwrap_or(0)
+            )));
+        }
+        if let Some(data) = find_data("indexer_finished") {
+            lines.push(Line::raw(format!(
+                "total: {} ms",
+                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("latest run events:"));
+        lines.push(Line::raw(""));
+
+        let first_match_line = lines.len();
+        for row in run.iter().rev() {
+            lines.push(Line::raw(format_telemetry_event_line(row)));
+        }
+
+        PreviewDoc {
+            lines,
+            first_match_line,
+        }
+    }
+
     fn scroll_preview_lines(&mut self, delta: i32) {
         let cur = self.preview_scroll as i32;
         self.preview_scroll = cmp::max(0, cur + delta) as usize;
@@ -1391,6 +1618,11 @@ impl App {
             return;
         }
         self.selected = self.filtered.len() - 1;
+        self.reset_preview_scroll_to_match();
+    }
+
+    fn toggle_telemetry_view(&mut self) {
+        self.show_telemetry = !self.show_telemetry;
         self.reset_preview_scroll_to_match();
     }
 }
@@ -1469,6 +1701,54 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
+    if app.show_telemetry {
+        let telemetry_area = root[1];
+        let telemetry_inner_height = telemetry_area.height.saturating_sub(2) as usize;
+        let telemetry_inner_width = telemetry_area.width.saturating_sub(2) as usize;
+        let telemetry_doc = app.build_preview_doc();
+        if app.preview_scroll_reset_pending {
+            let first_match_visual_line = preview_visual_line_offset(
+                &telemetry_doc.lines,
+                telemetry_doc.first_match_line,
+                telemetry_inner_width,
+            );
+            app.preview_scroll = first_match_visual_line.saturating_sub(2);
+            app.preview_scroll_reset_pending = false;
+        }
+        let telemetry_total_lines =
+            preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
+        let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
+        app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+        let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
+            .block(Block::default().borders(Borders::ALL).title("Telemetry"))
+            .scroll((app.preview_scroll as u16, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(telemetry, telemetry_area);
+
+        let footer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
+            .split(root[2]);
+
+        let status = Paragraph::new(
+            app.indexing
+                .last_warn
+                .as_deref()
+                .map(|s| format!("status: {s}"))
+                .unwrap_or_default(),
+        )
+        .style(Style::default().fg(Color::Yellow));
+        f.render_widget(status, footer[0]);
+
+        let keys = Paragraph::new(format!(
+            "Esc/Ctrl+c: quit  Ctrl+t: telemetry  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
+            app.query.trim()
+        ))
+        .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(keys, footer[1]);
+        return;
+    }
+
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
@@ -1543,7 +1823,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     let preview = Paragraph::new(Text::from(preview_doc.lines))
-        .block(Block::default().borders(Borders::ALL).title("Preview"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if app.show_telemetry {
+                    "Telemetry"
+                } else {
+                    "Preview"
+                }),
+        )
         .scroll((app.preview_scroll as u16, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(preview, preview_area);
@@ -1564,7 +1852,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: telemetry  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
         app.query.trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
@@ -1844,6 +2132,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: false,
+            telemetry_log_path: None,
+            show_telemetry: false,
         }
     }
 
@@ -1882,6 +2172,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -1988,6 +2280,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2033,6 +2327,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2071,6 +2367,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2113,6 +2411,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2313,6 +2613,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         app.update_results();
@@ -2366,6 +2668,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         app.update_results();
@@ -2399,6 +2703,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         app.update_results();
@@ -2441,6 +2747,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         app.update_results();
@@ -2464,6 +2772,60 @@ mod tests {
         assert!(rendered.contains("query occurrences in this message: 1"));
         assert!(rendered.contains("first needle"));
         assert!(rendered.contains("second needle"));
+    }
+
+    #[test]
+    fn telemetry_preview_doc_renders_latest_run_summary() {
+        let tmp = TempDir::new("agent-history-telemetry-preview");
+        let log = tmp.path.join("events.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"ts_ms\":1,\"kind\":\"indexer_started\",\"data\":{\"total_files\":10,\"cache_enabled\":true,\"rebuild_index\":true}}\n",
+                "{\"ts_ms\":2,\"kind\":\"cache_open_finished\",\"data\":{\"duration_ms\":7,\"cache_bytes\":4096}}\n",
+                "{\"ts_ms\":3,\"kind\":\"cache_load_finished\",\"data\":{\"duration_ms\":11,\"records\":12,\"sessions\":4}}\n",
+                "{\"ts_ms\":4,\"kind\":\"refresh_finished\",\"data\":{\"duration_ms\":77,\"skipped_units\":8,\"refreshed_units\":2,\"failed_units\":1}}\n",
+                "{\"ts_ms\":5,\"kind\":\"unit_reindexed\",\"data\":{\"source\":\"opencode\",\"path\":\"/tmp/ses.json\",\"duration_ms\":55,\"records\":1,\"message_files\":20,\"part_files\":300,\"text_parts\":200,\"part_parse_failures\":3}}\n",
+                "{\"ts_ms\":6,\"kind\":\"cache_reload_finished\",\"data\":{\"duration_ms\":9,\"records\":13,\"sessions\":4,\"cache_bytes\":8192}}\n",
+                "{\"ts_ms\":7,\"kind\":\"indexer_finished\",\"data\":{\"duration_ms\":120,\"records\":13,\"sessions\":4}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut app = empty_app();
+        app.ready = true;
+        app.telemetry_log_path = Some(log);
+        app.show_telemetry = true;
+
+        let doc = app.build_preview_doc();
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("cache open: 7 ms"));
+        assert!(rendered.contains("cache load: 11 ms"));
+        assert!(rendered.contains("refresh: 77 ms"));
+        assert!(rendered.contains("latest run events:"));
+        assert!(rendered.contains("unit_reindexed: ms=55"));
+        assert!(rendered.contains("parts=300"));
+    }
+
+    #[test]
+    fn toggle_telemetry_view_flips_preview_mode() {
+        let mut app = empty_app();
+        assert!(!app.show_telemetry);
+        app.toggle_telemetry_view();
+        assert!(app.show_telemetry);
+        app.toggle_telemetry_view();
+        assert!(!app.show_telemetry);
     }
 
     #[test]
@@ -2491,6 +2853,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         app.scroll_preview_lines(-10);
@@ -2526,6 +2890,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         route_mouse(
@@ -2612,6 +2978,8 @@ mod tests {
             last_results: vec![],
             indexing: IndexingProgress::default(),
             ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
         };
 
         route_mouse(
