@@ -63,6 +63,13 @@ struct SessionAgg<'a> {
     cwd: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionHit {
+    session_idx: usize,
+    matched_record_idx: Option<usize>,
+    hit_count: usize,
+}
+
 fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<usize>>) {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     struct SessionKeyRef<'a> {
@@ -215,6 +222,61 @@ fn first_non_empty_line(s: &str) -> &str {
     ""
 }
 
+fn compact_single_line(s: &str) -> String {
+    first_non_empty_line(s).replace(['\t', '\n'], " ")
+}
+
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars - 3) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn result_line(sess: &SessionSummary, matched: Option<&MessageRecord>, hit_count: usize) -> String {
+    let ts = short_ts(sess.last_ts.as_deref());
+    let prefix = format!(
+        "{} {} {} {}",
+        ts,
+        sess.dir,
+        provider_icon(sess.source),
+        sess.first_line,
+    );
+
+    let Some(rec) = matched else {
+        return prefix;
+    };
+
+    let snippet = truncate_middle(&compact_single_line(&rec.text), 72);
+    if snippet.is_empty() || snippet == sess.first_line {
+        if hit_count > 1 {
+            return format!("{prefix} [{hit_count} hits]");
+        }
+        return prefix;
+    }
+
+    if hit_count > 1 {
+        format!("{prefix} :: {snippet} [{hit_count} hits]")
+    } else {
+        format!("{prefix} :: {snippet}")
+    }
+}
+
 fn looks_like_codex_title_task_prompt(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("You are a helpful assistant. You will be presented with a user prompt")
@@ -305,7 +367,7 @@ struct App {
     all: Vec<MessageRecord>,
     sessions: Vec<SessionSummary>,
     session_records: Vec<Vec<usize>>,
-    filtered: Vec<usize>,
+    filtered: Vec<SessionHit>,
     selected: usize,
     offset: usize,
 
@@ -548,17 +610,21 @@ impl App {
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
 
-        let prev_selected_global = self.filtered.get(self.selected).copied();
+        let prev_selected_global = self.filtered.get(self.selected).map(|hit| hit.session_idx);
 
         let max = self.max_results;
         let limit = |n: usize| -> bool { max != 0 && n >= max };
 
-        let mut results: Vec<usize> = Vec::new();
+        let mut results: Vec<SessionHit> = Vec::new();
 
         if q.is_empty() {
             let mut i = 0usize;
             while i < self.sessions.len() && !limit(results.len()) {
-                results.push(i);
+                results.push(SessionHit {
+                    session_idx: i,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                });
                 i += 1;
             }
         } else {
@@ -573,8 +639,8 @@ impl App {
 
             let compiled = search::CompiledQuery::new(&q);
             for idx in base {
-                if self.session_matches(idx, &compiled) {
-                    results.push(idx);
+                if let Some(hit) = self.session_match(idx, &compiled) {
+                    results.push(hit);
                     if limit(results.len()) {
                         break;
                     }
@@ -584,36 +650,57 @@ impl App {
 
         self.filtered = results;
         self.last_query = q;
-        self.last_results = self.filtered.clone();
+        self.last_results = self.filtered.iter().map(|hit| hit.session_idx).collect();
 
         self.offset = 0;
         self.selected = 0;
         if let Some(prev) = prev_selected_global
-            && let Some(pos) = self.filtered.iter().position(|&x| x == prev)
+            && let Some(pos) = self.filtered.iter().position(|hit| hit.session_idx == prev)
         {
             self.selected = pos;
         }
     }
 
-    fn session_matches(&self, session_idx: usize, query: &search::CompiledQuery) -> bool {
+    fn session_match(
+        &self,
+        session_idx: usize,
+        query: &search::CompiledQuery,
+    ) -> Option<SessionHit> {
         let Some(record_idxs) = self.session_records.get(session_idx) else {
-            return false;
+            return None;
         };
+        let mut matched_record_idx: Option<usize> = None;
+        let mut hit_count = 0usize;
         for &idx in record_idxs {
             if query.matches_record(&self.all[idx]) {
-                return true;
+                hit_count = hit_count.saturating_add(1);
+                if matched_record_idx.is_none() {
+                    matched_record_idx = Some(idx);
+                }
             }
         }
-        false
+        matched_record_idx.map(|matched_record_idx| SessionHit {
+            session_idx,
+            matched_record_idx: Some(matched_record_idx),
+            hit_count,
+        })
+    }
+
+    fn selected_hit(&self) -> Option<SessionHit> {
+        self.filtered.get(self.selected).copied()
     }
 
     fn selected_session(&self) -> Option<&SessionSummary> {
-        let idx = *self.filtered.get(self.selected)?;
-        self.sessions.get(idx)
+        let hit = self.selected_hit()?;
+        self.sessions.get(hit.session_idx)
     }
 
     fn selected_record(&self) -> Option<&MessageRecord> {
-        let session = self.selected_session()?;
+        let hit = self.selected_hit()?;
+        if let Some(idx) = hit.matched_record_idx {
+            return self.all.get(idx);
+        }
+        let session = self.sessions.get(hit.session_idx)?;
         self.all.get(session.first_user_idx)
     }
 
@@ -781,19 +868,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let visible_end = cmp::min(visible_start + inner_height, total);
 
     let mut lines: Vec<Line> = Vec::new();
-    for &session_idx in app.filtered[visible_start..visible_end].iter() {
-        let Some(sess) = app.sessions.get(session_idx) else {
+    for hit in app.filtered[visible_start..visible_end].iter() {
+        let Some(sess) = app.sessions.get(hit.session_idx) else {
             continue;
         };
-        let ts = short_ts(sess.last_ts.as_deref());
-
-        lines.push(Line::raw(format!(
-            "{} {} {} {}",
-            ts,
-            sess.dir,
-            provider_icon(sess.source),
-            sess.first_line,
-        )));
+        let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
+        lines.push(Line::raw(result_line(sess, matched, hit.hit_count)));
     }
 
     let results = Paragraph::new(Text::from(lines)).block(
@@ -806,6 +886,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // Preview
     let preview_area = main[1];
     let preview = if let Some(rec) = app.selected_record() {
+        let selected_hit = app.selected_hit();
+        let selected_session = app.selected_session();
         let source = match rec.source {
             SourceKind::CodexSessionJsonl => "codex_session",
             SourceKind::CodexHistoryJsonl => "codex_history",
@@ -832,8 +914,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             Line::raw(format!("cwd: {}", rec.cwd.as_deref().unwrap_or(""))),
             Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)),
             Line::raw(format!("source: {source}")),
-            Line::raw(""),
         ];
+
+        if let (Some(hit), Some(sess)) = (selected_hit, selected_session)
+            && hit.matched_record_idx.is_some()
+        {
+            header.push(Line::raw(format!("session opener: {}", sess.first_line)));
+            header.push(Line::raw(format!("session hits: {}", hit.hit_count)));
+        }
+        header.push(Line::raw(""));
 
         header.extend(rec.text.lines().map(|l| Line::raw(l.to_string())));
 
@@ -881,18 +970,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             width: w,
             height: 1,
         };
-        let session_idx = app.filtered[app.selected];
-        let Some(sess) = app.sessions.get(session_idx) else {
+        let hit = app.filtered[app.selected];
+        let Some(sess) = app.sessions.get(hit.session_idx) else {
             return;
         };
-        let ts = short_ts(sess.last_ts.as_deref());
-        let line = format!(
-            "{} {} {} {}",
-            ts,
-            sess.dir,
-            provider_icon(sess.source),
-            sess.first_line
-        );
+        let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
+        let line = result_line(sess, matched, hit.hit_count);
         let p = Paragraph::new(line).style(
             Style::default()
                 .fg(Color::Black)
@@ -1344,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn update_results_matches_any_message_but_selected_record_is_first_user_message() {
+    fn update_results_matches_any_message_and_selected_record_is_the_first_hit() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:00Z"),
@@ -1405,9 +1488,81 @@ mod tests {
         let sess = app.selected_session().unwrap();
         assert_eq!(sess.session_id, "a");
 
+        let hit = app.selected_hit().unwrap();
+        assert_eq!(hit.hit_count, 1);
+
+        let rec = app.selected_record().unwrap();
+        assert_eq!(rec.role, Role::Assistant);
+        assert_eq!(rec.text, "hay needle stack");
+    }
+
+    #[test]
+    fn selected_record_uses_session_opener_when_query_is_empty() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first hello",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-11T00:00:00Z"),
+                Role::Assistant,
+                "hay needle stack",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        app.update_results();
         let rec = app.selected_record().unwrap();
         assert_eq!(rec.role, Role::User);
         assert_eq!(rec.text, "first hello");
+    }
+
+    #[test]
+    fn result_line_includes_match_snippet_and_hit_count() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            first_user_idx: 0,
+            last_ts: Some("2026-02-10T00:00:00Z".to_string()),
+            dir: "proj".to_string(),
+            first_line: "session opener".to_string(),
+        };
+        let rec = MessageRecord {
+            timestamp: None,
+            role: Role::Assistant,
+            text: "this contains the matching context".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("s1".to_string()),
+            cwd: None,
+            phase: None,
+            source: SourceKind::CodexSessionJsonl,
+        };
+
+        let line = result_line(&sess, Some(&rec), 3);
+        assert!(line.contains("session opener"));
+        assert!(line.contains("matching context"));
+        assert!(line.contains("[3 hits]"));
     }
 
     #[test]
