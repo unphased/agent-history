@@ -6,14 +6,17 @@ use crate::{
 use anyhow::Context as _;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
@@ -397,6 +400,7 @@ struct App {
     filtered: Vec<SessionHit>,
     selected: usize,
     offset: usize,
+    preview_scroll: usize,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -412,7 +416,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("raw modeの有効化に失敗")?;
-    execute!(stdout, EnterAlternateScreen, cursor::Hide).context("画面切替に失敗")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        cursor::Hide,
+        EnableMouseCapture
+    )
+    .context("画面切替に失敗")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal初期化に失敗")?;
@@ -421,7 +431,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let res = run_app(&mut terminal, rx, args);
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        cursor::Show,
+        DisableMouseCapture
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     res
@@ -441,6 +457,7 @@ fn run_app(
         filtered: Vec::new(),
         selected: 0,
         offset: 0,
+        preview_scroll: 0,
         last_query: String::new(),
         last_results: Vec::new(),
         indexing: IndexingProgress {
@@ -464,12 +481,16 @@ fn run_app(
         }
 
         let ev = event::read().context("event readに失敗")?;
-        let Event::Key(key) = ev else {
-            continue;
-        };
-
-        if handle_key(terminal, &mut app, key)? {
-            break;
+        match ev {
+            Event::Key(key) => {
+                if handle_key(terminal, &mut app, key)? {
+                    break;
+                }
+            }
+            Event::Mouse(mouse) => {
+                handle_mouse(terminal, &mut app, mouse)?;
+            }
+            _ => {}
         }
     }
 
@@ -537,6 +558,22 @@ fn handle_key(
 
     // インデックス作成中でもクエリ入力だけは先に受け付ける
     match key.code {
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_preview_lines(-1);
+            return Ok(false);
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_preview_lines(1);
+            return Ok(false);
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_preview_page(-1);
+            return Ok(false);
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_preview_page(1);
+            return Ok(false);
+        }
         KeyCode::Backspace => {
             app.query.pop();
             app.update_results();
@@ -633,6 +670,69 @@ fn handle_key(
     Ok(false)
 }
 
+fn app_panes(area: Rect) -> (Rect, Rect) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ]
+            .as_ref(),
+        )
+        .split(area);
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
+        .split(root[1]);
+    (main[0], main[1])
+}
+
+fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
+}
+
+fn handle_mouse(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    mouse: MouseEvent,
+) -> anyhow::Result<()> {
+    if !app.ready {
+        return Ok(());
+    }
+
+    let area = terminal.size().context("terminal size取得に失敗")?;
+    route_mouse(app, area.into(), mouse);
+    Ok(())
+}
+
+fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
+    let (results_area, preview_area) = app_panes(area);
+    let line_step = 3;
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if point_in_rect(mouse.column, mouse.row, preview_area) {
+                app.scroll_preview_lines(-line_step);
+            } else if point_in_rect(mouse.column, mouse.row, results_area) {
+                app.move_selection(-line_step);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if point_in_rect(mouse.column, mouse.row, preview_area) {
+                app.scroll_preview_lines(line_step);
+            } else if point_in_rect(mouse.column, mouse.row, results_area) {
+                app.move_selection(line_step);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl App {
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
@@ -686,6 +786,7 @@ impl App {
         {
             self.selected = pos;
         }
+        self.reset_preview_scroll_to_match();
     }
 
     fn session_match(
@@ -731,6 +832,57 @@ impl App {
         self.all.get(session.first_user_idx)
     }
 
+    fn reset_preview_scroll_to_match(&mut self) {
+        self.preview_scroll = self.preview_first_match_line().saturating_sub(2);
+    }
+
+    fn preview_first_match_line(&self) -> usize {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return 0;
+        }
+
+        let Some(rec) = self.selected_record() else {
+            return 0;
+        };
+
+        let header_lines = self.preview_header_line_count();
+        for (idx, line) in rec.text.lines().enumerate() {
+            if !search::find_match_ranges(query, line).is_empty() {
+                return header_lines + idx;
+            }
+        }
+
+        0
+    }
+
+    fn preview_header_line_count(&self) -> usize {
+        let mut count = 5usize;
+        if let Some(hit) = self.selected_hit()
+            && hit.matched_record_idx.is_some()
+        {
+            count += 2;
+        }
+        count + 1
+    }
+
+    fn preview_total_lines(&self) -> usize {
+        let Some(rec) = self.selected_record() else {
+            return 1;
+        };
+        self.preview_header_line_count() + cmp::max(1, rec.text.lines().count())
+    }
+
+    fn scroll_preview_lines(&mut self, delta: i32) {
+        let cur = self.preview_scroll as i32;
+        self.preview_scroll = cmp::max(0, cur + delta) as usize;
+    }
+
+    fn scroll_preview_page(&mut self, dir: i32) {
+        let delta = 10i32 * dir;
+        self.scroll_preview_lines(delta);
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.filtered.is_empty() {
             self.selected = 0;
@@ -740,6 +892,7 @@ impl App {
         let cur = self.selected as i32;
         let next = cmp::min(max, cmp::max(0, cur + delta));
         self.selected = next as usize;
+        self.reset_preview_scroll_to_match();
     }
 
     fn page(&mut self, dir: i32) {
@@ -752,6 +905,7 @@ impl App {
 
     fn select_first(&mut self) {
         self.selected = 0;
+        self.reset_preview_scroll_to_match();
     }
 
     fn select_last(&mut self) {
@@ -760,6 +914,7 @@ impl App {
             return;
         }
         self.selected = self.filtered.len() - 1;
+        self.reset_preview_scroll_to_match();
     }
 }
 
@@ -922,6 +1077,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Preview
     let preview_area = main[1];
+    let preview_inner_height = preview_area.height.saturating_sub(2) as usize;
+    let preview_total_lines = app.preview_total_lines();
+    let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
+    app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     let preview = if let Some(rec) = app.selected_record() {
         let selected_hit = app.selected_hit();
         let selected_session = app.selected_session();
@@ -973,10 +1132,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
         Paragraph::new(Text::from(header))
             .block(Block::default().borders(Borders::ALL).title("Preview"))
+            .scroll((app.preview_scroll as u16, 0))
             .wrap(Wrap { trim: false })
     } else {
         Paragraph::new("(no match)")
             .block(Block::default().borders(Borders::ALL).title("Preview"))
+            .scroll((app.preview_scroll as u16, 0))
             .wrap(Wrap { trim: false })
     };
     f.render_widget(preview, preview_area);
@@ -997,7 +1158,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Backspace: delete  Ctrl+u: clear  ↑/↓: move  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
         app.query.trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
@@ -1270,6 +1431,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            preview_scroll: 0,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1318,6 +1480,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            preview_scroll: 0,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1364,6 +1527,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            preview_scroll: 0,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1527,6 +1691,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            preview_scroll: 0,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1576,6 +1741,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            preview_scroll: 0,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -1587,6 +1753,200 @@ mod tests {
         let rec = app.selected_record().unwrap();
         assert_eq!(rec.role, Role::User);
         assert_eq!(rec.text, "first hello");
+    }
+
+    #[test]
+    fn update_results_sets_preview_scroll_near_first_matching_line() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "line 1\nline 2\nneedle here\nline 4",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: "needle".to_string(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        app.update_results();
+        assert_eq!(app.preview_first_match_line(), 10);
+        assert_eq!(app.preview_scroll, 8);
+    }
+
+    #[test]
+    fn preview_scroll_line_movement_clamps_at_zero() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "hello",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 1,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        app.scroll_preview_lines(-10);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_preview_scrolls_preview() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "line 1\nline 2\nline 3",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![SessionHit {
+                session_idx: 0,
+                matched_record_idx: None,
+                hit_count: 0,
+            }],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        route_mouse(
+            &mut app,
+            Rect::new(0, 0, 100, 30),
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 80,
+                row: 10,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.preview_scroll, 3);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_results_moves_selection() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::User,
+                "second",
+                "b",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "c",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:04Z"),
+                Role::User,
+                "fourth",
+                "d",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![
+                SessionHit {
+                    session_idx: 0,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+                SessionHit {
+                    session_idx: 1,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+                SessionHit {
+                    session_idx: 2,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+                SessionHit {
+                    session_idx: 3,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+            ],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            spinner: 0,
+        };
+
+        route_mouse(
+            &mut app,
+            Rect::new(0, 0, 100, 30),
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.selected, 3);
     }
 
     #[test]
