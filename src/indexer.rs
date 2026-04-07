@@ -2,12 +2,12 @@ use crate::args::Args;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     fs::{self, File},
     io::{BufRead as _, BufReader},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
 };
 use walkdir::WalkDir;
@@ -261,34 +261,124 @@ fn run_indexer(cfg: IndexerConfig, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::R
     .ok();
 
     let total_files = inputs.len();
-    let mut out: Vec<MessageRecord> = Vec::new();
+    let mut indexed_inputs: Vec<Option<IndexedInputChunk>> = Vec::with_capacity(total_files);
+    indexed_inputs.resize_with(total_files, || None);
     let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
+    let mut records = 0usize;
+    let mut processed_files = 0usize;
+    let mut opencode_jobs: Vec<(usize, IndexInput)> = Vec::new();
 
-    for (processed_files, input) in inputs.into_iter().enumerate() {
-        let processed_files = processed_files.saturating_add(1);
-        let current = input.path().to_path_buf();
-        match index_input(input, &mut out, &mut sessions) {
-            Ok(()) => {}
-            Err(e) => {
+    for (idx, input) in inputs.into_iter().enumerate() {
+        if matches!(input, IndexInput::OpenCodeSession { .. }) {
+            opencode_jobs.push((idx, input));
+            continue;
+        }
+
+        match index_input_to_chunk(input) {
+            Ok(chunk) => {
+                records = records.saturating_add(chunk.records.len());
+                sessions.extend(chunk.sessions.iter().cloned());
+                let current = chunk.current.clone();
+                indexed_inputs[idx] = Some(chunk);
+                processed_files = processed_files.saturating_add(1);
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records,
+                    sessions: sessions.len(),
+                    current,
+                })
+                .ok();
+            }
+            Err((current, e)) => {
+                processed_files = processed_files.saturating_add(1);
                 tx.send(IndexerEvent::Warn {
                     message: format!("読み取り失敗: {}: {e}", current.display()),
                 })
                 .ok();
+                tx.send(IndexerEvent::Progress {
+                    processed_files,
+                    total_files,
+                    records,
+                    sessions: sessions.len(),
+                    current,
+                })
+                .ok();
             }
         }
+    }
 
-        tx.send(IndexerEvent::Progress {
-            processed_files,
-            total_files,
-            records: out.len(),
-            sessions: sessions.len(),
-            current,
-        })
-        .ok();
+    if !opencode_jobs.is_empty() {
+        let job_count = opencode_jobs.len();
+        let (rx, handles) = spawn_opencode_index_workers(opencode_jobs);
+        for _ in 0..job_count {
+            let Ok(result) = rx.recv() else {
+                break;
+            };
+            match result {
+                IndexedInputResult::Indexed { index, chunk } => {
+                    records = records.saturating_add(chunk.records.len());
+                    sessions.extend(chunk.sessions.iter().cloned());
+                    let current = chunk.current.clone();
+                    indexed_inputs[index] = Some(chunk);
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records,
+                        sessions: sessions.len(),
+                        current,
+                    })
+                    .ok();
+                }
+                IndexedInputResult::Failed { current, error, .. } => {
+                    processed_files = processed_files.saturating_add(1);
+                    tx.send(IndexerEvent::Warn {
+                        message: format!("読み取り失敗: {}: {error}", current.display()),
+                    })
+                    .ok();
+                    tx.send(IndexerEvent::Progress {
+                        processed_files,
+                        total_files,
+                        records,
+                        sessions: sessions.len(),
+                        current,
+                    })
+                    .ok();
+                }
+            }
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    let mut out: Vec<MessageRecord> = Vec::with_capacity(records);
+    for chunk in indexed_inputs.into_iter().flatten() {
+        out.extend(chunk.records);
     }
 
     tx.send(IndexerEvent::Done { records: out }).ok();
     Ok(())
+}
+
+#[derive(Debug)]
+struct IndexedInputChunk {
+    current: PathBuf,
+    records: Vec<MessageRecord>,
+    sessions: HashSet<(SourceKind, String, Option<String>)>,
+}
+
+#[derive(Debug)]
+enum IndexedInputResult {
+    Indexed {
+        index: usize,
+        chunk: IndexedInputChunk,
+    },
+    Failed {
+        current: PathBuf,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -428,6 +518,64 @@ fn index_input(
             session_file,
         } => index_opencode_session_file(&storage_root, &session_file, out, sessions),
     }
+}
+
+fn index_input_to_chunk(input: IndexInput) -> Result<IndexedInputChunk, (PathBuf, anyhow::Error)> {
+    let current = input.path().to_path_buf();
+    let mut records = Vec::new();
+    let mut sessions = HashSet::new();
+    match index_input(input, &mut records, &mut sessions) {
+        Ok(()) => Ok(IndexedInputChunk {
+            current,
+            records,
+            sessions,
+        }),
+        Err(e) => Err((current, e)),
+    }
+}
+
+fn spawn_opencode_index_workers(
+    jobs: Vec<(usize, IndexInput)>,
+) -> (
+    mpsc::Receiver<IndexedInputResult>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || loop {
+            let next_job = {
+                let mut queue = queue.lock().expect("opencode work queue poisoned");
+                queue.pop_front()
+            };
+            let Some((index, input)) = next_job else {
+                break;
+            };
+
+            let result = match index_input_to_chunk(input) {
+                Ok(chunk) => IndexedInputResult::Indexed { index, chunk },
+                Err((current, error)) => IndexedInputResult::Failed {
+                    current,
+                    error: format!("{error:#}"),
+                },
+            };
+            if tx.send(result).is_err() {
+                break;
+            }
+        }));
+    }
+    drop(tx);
+
+    (rx, handles)
 }
 
 fn index_file(
