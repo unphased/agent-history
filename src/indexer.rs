@@ -570,7 +570,7 @@ fn index_opencode_session_file(
         .time
         .as_ref()
         .and_then(|t| t.updated.or(t.created))
-        .map(|ts| ts.to_string());
+        .map(format_epoch_timestamp);
 
     let mut message_files: Vec<PathBuf> = fs::read_dir(&message_dir)?
         .filter_map(Result::ok)
@@ -601,7 +601,7 @@ fn index_opencode_session_file(
                     .time
                     .as_ref()
                     .and_then(|t| t.completed.or(t.created))
-                    .map(|ts| ts.to_string())
+                    .map(format_epoch_timestamp)
             })
             .or_else(|| session_ts.clone());
         let phase = message.mode.clone().or(message.agent.clone());
@@ -699,8 +699,58 @@ fn extract_opencode_message_text(
     Ok(Some((
         texts.join("\n"),
         first_text_file.unwrap_or_else(|| part_dir.to_path_buf()),
-        last_ts.map(|ts| ts.to_string()),
+        last_ts.map(format_epoch_timestamp),
     )))
+}
+
+fn format_epoch_timestamp(ts: i64) -> String {
+    let (secs, _) = match epoch_to_unix_seconds_and_nanos(ts) {
+        Some(parts) => parts,
+        None => return ts.to_string(),
+    };
+    format_unix_seconds_rfc3339(secs)
+}
+
+fn epoch_to_unix_seconds_and_nanos(ts: i64) -> Option<(i64, u32)> {
+    let abs = ts.unsigned_abs();
+    let nanos = if abs >= 1_000_000_000_000_000_000 {
+        i128::from(ts)
+    } else if abs >= 1_000_000_000_000_000 {
+        i128::from(ts).checked_mul(1_000)?
+    } else if abs >= 1_000_000_000_000 {
+        i128::from(ts).checked_mul(1_000_000)?
+    } else {
+        i128::from(ts).checked_mul(1_000_000_000)?
+    };
+    let secs = nanos.div_euclid(1_000_000_000);
+    let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+    Some((i64::try_from(secs).ok()?, subsec_nanos))
+}
+
+fn format_unix_seconds_rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as u32, day as u32)
 }
 
 fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
@@ -1302,7 +1352,7 @@ mod tests {
         assert_eq!(out[0].text, "hello from opencode");
         assert_eq!(out[0].cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(out[0].session_id.as_deref(), Some("ses_demo"));
-        assert_eq!(out[0].timestamp.as_deref(), Some("220"));
+        assert_eq!(out[0].timestamp.as_deref(), Some("1970-01-01T00:03:40Z"));
         assert_eq!(out[0].phase.as_deref(), Some("orchestrator"));
         assert!(sessions.contains(&(SourceKind::OpenCodeSession, "ses_demo".to_string(), None)));
     }
@@ -1452,6 +1502,12 @@ mod tests {
             "personal".to_string(),
             home.join(".claude-personal")
         )));
+    }
+
+    #[test]
+    fn format_epoch_timestamp_formats_seconds_and_millis_as_rfc3339() {
+        assert_eq!(format_epoch_timestamp(220), "1970-01-01T00:03:40Z");
+        assert_eq!(format_epoch_timestamp(1_704_067_200_000), "2024-01-01T00:00:00Z");
     }
 
     #[test]

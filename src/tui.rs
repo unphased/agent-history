@@ -258,9 +258,12 @@ fn preview_visual_line_offset(lines: &[Line<'_>], raw_line_index: usize, width: 
         .sum()
 }
 
-fn short_ts(ts: Option<&str>) -> &str {
+fn short_ts(ts: Option<&str>) -> String {
     let ts = ts.unwrap_or("");
-    ts.get(0..19).unwrap_or(ts)
+    if let Some(formatted) = display_timestamp(ts) {
+        return formatted;
+    }
+    ts.get(0..19).unwrap_or(ts).to_string()
 }
 
 fn first_non_empty_line(s: &str) -> &str {
@@ -431,17 +434,204 @@ fn ts_cmp_opt(a: Option<&str>, b: Option<&str>) -> cmp::Ordering {
 }
 
 fn ts_cmp_str(a: &str, b: &str) -> cmp::Ordering {
-    match (parse_epoch(a), parse_epoch(b)) {
+    match (parse_timestamp_nanos(a), parse_timestamp_nanos(b)) {
         (Some(a), Some(b)) => a.cmp(&b),
         _ => a.cmp(b),
     }
 }
 
-fn parse_epoch(s: &str) -> Option<i64> {
+fn parse_timestamp_nanos(s: &str) -> Option<i128> {
+    if let Some(nanos) = parse_rfc3339_timestamp_nanos(s) {
+        return Some(nanos);
+    }
+
+    let epoch = parse_epoch_number(s)?;
+    epoch_to_unix_nanos(epoch)
+}
+
+fn parse_epoch_number(s: &str) -> Option<i64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     s.parse().ok()
+}
+
+fn epoch_to_unix_nanos(ts: i64) -> Option<i128> {
+    let abs = ts.unsigned_abs();
+    let nanos = if abs >= 1_000_000_000_000_000_000 {
+        i128::from(ts)
+    } else if abs >= 1_000_000_000_000_000 {
+        i128::from(ts).checked_mul(1_000)?
+    } else if abs >= 1_000_000_000_000 {
+        i128::from(ts).checked_mul(1_000_000)?
+    } else {
+        i128::from(ts).checked_mul(1_000_000_000)?
+    };
+    Some(nanos)
+}
+
+fn display_timestamp(ts: &str) -> Option<String> {
+    if parse_rfc3339_timestamp_nanos(ts).is_some() {
+        return Some(ts.get(0..19).unwrap_or(ts).to_string());
+    }
+
+    let epoch = parse_epoch_number(ts)?;
+    let nanos = epoch_to_unix_nanos(epoch)?;
+    let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).ok()?;
+    Some(format_unix_seconds_short(secs))
+}
+
+fn parse_rfc3339_timestamp_nanos(s: &str) -> Option<i128> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+
+    let year = parse_digits_i32(bytes, 0, 4)?;
+    if bytes.get(4) != Some(&b'-') {
+        return None;
+    }
+    let month = parse_digits_u32(bytes, 5, 2)?;
+    if bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let day = parse_digits_u32(bytes, 8, 2)?;
+    let sep = *bytes.get(10)?;
+    if sep != b'T' && sep != b't' {
+        return None;
+    }
+    let hour = parse_digits_u32(bytes, 11, 2)?;
+    if bytes.get(13) != Some(&b':') {
+        return None;
+    }
+    let minute = parse_digits_u32(bytes, 14, 2)?;
+    if bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let second = parse_digits_u32(bytes, 17, 2)?;
+
+    let mut idx = 19usize;
+    let mut nanos: i128 = 0;
+    if bytes.get(idx) == Some(&b'.') {
+        idx += 1;
+        let frac_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let frac = &s[frac_start..idx];
+        if frac.is_empty() {
+            return None;
+        }
+        nanos = parse_fractional_nanos(frac)?;
+    }
+
+    let offset_seconds: i32 = match *bytes.get(idx)? {
+        b'Z' | b'z' => {
+            idx += 1;
+            0
+        }
+        b'+' | b'-' => {
+            let sign = if bytes[idx] == b'+' { 1 } else { -1 };
+            idx += 1;
+            let off_hour = parse_digits_i32(bytes, idx, 2)?;
+            idx += 2;
+            if bytes.get(idx) != Some(&b':') {
+                return None;
+            }
+            idx += 1;
+            let off_min = parse_digits_i32(bytes, idx, 2)?;
+            idx += 2;
+            sign * (off_hour * 3_600 + off_min * 60)
+        }
+        _ => return None,
+    };
+
+    if idx != bytes.len() {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    let seconds = i128::from(days) * 86_400
+        + i128::from(hour) * 3_600
+        + i128::from(minute) * 60
+        + i128::from(second)
+        - i128::from(offset_seconds);
+    Some(seconds * 1_000_000_000 + nanos)
+}
+
+fn parse_digits_i32(bytes: &[u8], start: usize, len: usize) -> Option<i32> {
+    parse_digits_u32(bytes, start, len).and_then(|n| i32::try_from(n).ok())
+}
+
+fn parse_digits_u32(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let end = start.checked_add(len)?;
+    let slice = bytes.get(start..end)?;
+    let mut out = 0u32;
+    for &b in slice {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(out)
+}
+
+fn parse_fractional_nanos(frac: &str) -> Option<i128> {
+    let mut nanos = 0i128;
+    let mut digits = 0usize;
+    for b in frac.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        if digits < 9 {
+            nanos = nanos.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+        }
+        digits += 1;
+    }
+    for _ in digits..9 {
+        nanos = nanos.checked_mul(10)?;
+    }
+    Some(nanos)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn format_unix_seconds_short(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as u32, day as u32)
 }
 
 #[derive(Debug)]
@@ -930,7 +1120,7 @@ impl App {
             let mut lines = vec![
                 Line::raw(format!(
                     "timestamp: {}",
-                    rec.timestamp.as_deref().unwrap_or("")
+                    short_ts(rec.timestamp.as_deref())
                 )),
                 Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                 Line::raw(format!(
@@ -1021,7 +1211,7 @@ impl App {
                     Line::raw(format!("-- hit {}/{} --", i + 1, total_matches)),
                     Line::raw(format!(
                         "timestamp: {}",
-                        rec.timestamp.as_deref().unwrap_or("")
+                        short_ts(rec.timestamp.as_deref())
                     )),
                     Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                     Line::raw(format!(
@@ -2357,6 +2547,24 @@ mod tests {
         assert_eq!(
             provider_label(SourceKind::ClaudeProjectJsonl, Some("abc")),
             "C abc"
+        );
+    }
+
+    #[test]
+    fn short_ts_formats_epoch_timestamps_for_display() {
+        assert_eq!(short_ts(Some("1704067200000")), "2024-01-01T00:00:00");
+        assert_eq!(short_ts(Some("2026-02-10T00:00:00Z")), "2026-02-10T00:00:00");
+    }
+
+    #[test]
+    fn ts_cmp_str_sorts_epoch_and_rfc3339_timestamps_by_actual_time() {
+        assert_eq!(
+            ts_cmp_str("1704067200000", "2023-12-31T23:59:59Z"),
+            cmp::Ordering::Greater
+        );
+        assert_eq!(
+            ts_cmp_str("1704067200", "2024-01-01T00:00:00Z"),
+            cmp::Ordering::Equal
         );
     }
 
