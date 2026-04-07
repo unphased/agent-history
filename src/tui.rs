@@ -712,21 +712,22 @@ fn handle_mouse(
 
 fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     let (results_area, preview_area) = app_panes(area);
-    let line_step = 3;
+    let preview_line_step = 3;
+    let results_line_step = 1;
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if point_in_rect(mouse.column, mouse.row, preview_area) {
-                app.scroll_preview_lines(-line_step);
+                app.scroll_preview_lines(-preview_line_step);
             } else if point_in_rect(mouse.column, mouse.row, results_area) {
-                app.move_selection(-line_step);
+                app.move_selection(-results_line_step);
             }
         }
         MouseEventKind::ScrollDown => {
             if point_in_rect(mouse.column, mouse.row, preview_area) {
-                app.scroll_preview_lines(line_step);
+                app.scroll_preview_lines(preview_line_step);
             } else if point_in_rect(mouse.column, mouse.row, results_area) {
-                app.move_selection(line_step);
+                app.move_selection(results_line_step);
             }
         }
         _ => {}
@@ -1946,7 +1947,7 @@ mod tests {
             },
         );
 
-        assert_eq!(app.selected, 3);
+        assert_eq!(app.selected, 1);
     }
 
     #[test]
