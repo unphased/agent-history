@@ -1151,6 +1151,24 @@ fn selected_bgcolor_target(app: &App) -> Option<&str> {
     session.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty())
 }
 
+const EVENTS_TERMINAL_BGCOLOR: &str = "#202020";
+
+fn emit_terminal_bgcolor_hex(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    hex: &str,
+) -> anyhow::Result<()> {
+    let osc11 = format!("\u{1b}]11;{hex}\u{1b}\\");
+    terminal
+        .backend_mut()
+        .write_all(osc11.as_bytes())
+        .context("failed to emit terminal background escape sequence")?;
+    terminal
+        .backend_mut()
+        .flush()
+        .context("failed to flush terminal background escape sequence")?;
+    Ok(())
+}
+
 fn emit_terminal_bgcolor_for_path(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     path: &str,
@@ -1184,13 +1202,22 @@ fn emit_terminal_bgcolor_for_path(
 }
 
 fn sync_terminal_bgcolor(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) {
-    let target = selected_bgcolor_target(app).map(str::to_owned);
+    let target = if app.show_telemetry {
+        Some(EVENTS_TERMINAL_BGCOLOR.to_string())
+    } else {
+        selected_bgcolor_target(app).map(str::to_owned)
+    };
     if target == app.last_bgcolor_target {
         return;
     }
 
-    if let Some(path) = target.as_deref() {
-        if let Err(err) = emit_terminal_bgcolor_for_path(terminal, path) {
+    if let Some(value) = target.as_deref() {
+        let result = if value.starts_with('#') {
+            emit_terminal_bgcolor_hex(terminal, value)
+        } else {
+            emit_terminal_bgcolor_for_path(terminal, value)
+        };
+        if let Err(err) = result {
             app.indexing.last_warn = Some(format!("bgcolor update failed: {err}"));
             return;
         }
@@ -1566,7 +1593,7 @@ impl App {
     fn build_telemetry_preview_doc(&self) -> PreviewDoc {
         let Some(path) = self.telemetry_log_path.as_ref() else {
             return PreviewDoc {
-                lines: vec![Line::raw("telemetry disabled")],
+                lines: vec![Line::raw("events disabled")],
                 first_match_line: 0,
             };
         };
@@ -1579,7 +1606,7 @@ impl App {
         let raw_lines = latest_lines(path, 400);
         if raw_lines.is_empty() {
             lines.push(Line::raw(""));
-            lines.push(Line::raw("(no telemetry events yet)"));
+            lines.push(Line::raw("(no events yet)"));
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
@@ -1802,7 +1829,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
         app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
         let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
-            .block(Block::default().borders(Borders::ALL).title("Telemetry"))
+            .block(Block::default().borders(Borders::ALL).title("Events"))
             .scroll((app.preview_scroll as u16, 0))
             .wrap(Wrap { trim: false });
         f.render_widget(telemetry, telemetry_area);
@@ -1823,7 +1850,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: telemetry  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
+            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
             app.query.trim()
         ))
         .style(Style::default().fg(Color::DarkGray));
@@ -1909,7 +1936,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(if app.show_telemetry {
-                    "Telemetry"
+                    "Events"
                 } else {
                     "Preview"
                 }),
@@ -1934,7 +1961,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: telemetry  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
         app.query.trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
