@@ -29,11 +29,11 @@ use std::{
     cmp,
     collections::HashMap,
     env, fs,
-    io::{self, Stdout, Write as _},
+    io::{self, Stdout},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -1082,14 +1082,7 @@ fn handle_key(
                                 eprintln!("{line}");
                             }
 
-                            // `status()` でブロックすると何も出せないので、`spawn()`して短時間だけ
-                            // "動いてる" ローディング表示を出す（その間に外部CLIが起動する想定）。
                             let mut child = cmd.spawn().context("プロセス起動に失敗しました")?;
-                            if let Some(st) =
-                                animate_resume_loader(&target.program, sid, &mut child)?
-                            {
-                                return Ok(st);
-                            }
                             child.wait().context("プロセス待機に失敗しました")
                         });
 
@@ -2049,24 +2042,13 @@ struct ResumeTarget {
     current_dir: Option<PathBuf>,
 }
 
+const AGENT_HISTORY_RETURN_HINT_TEXT: &str = "[exit to agent-history]";
+
 fn resume_command_string(target: &ResumeTarget) -> String {
     let mut parts = Vec::with_capacity(target.args.len() + 1);
     parts.push(shell_escape(&target.program));
     parts.extend(target.args.iter().map(|arg| shell_escape(arg)));
     parts.join(" ")
-}
-
-fn resume_shell_command(target: &ResumeTarget) -> String {
-    let cmd = resume_command_string(target);
-    if let Some(cwd) = target.current_dir.as_ref() {
-        format!(
-            "cd {} && exec {}",
-            shell_escape(&cwd.to_string_lossy()),
-            cmd
-        )
-    } else {
-        format!("exec {cmd}")
-    }
 }
 
 fn configured_resume_command(target: &ResumeTarget) -> Command {
@@ -2075,7 +2057,24 @@ fn configured_resume_command(target: &ResumeTarget) -> Command {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "/bin/zsh".to_string());
     let mut cmd = Command::new(shell);
-    cmd.arg("-ic").arg(resume_shell_command(target));
+    cmd.arg("-il");
+    if let Some(cwd) = target.current_dir.as_ref() {
+        cmd.current_dir(cwd);
+    }
+    cmd.env("AGENT_HISTORY_RETURN_HINT", "1");
+    cmd.env(
+        "AGENT_HISTORY_RETURN_HINT_TEXT",
+        AGENT_HISTORY_RETURN_HINT_TEXT,
+    );
+    cmd.env(
+        "AGENT_HISTORY_RESUME_COMMAND",
+        resume_command_string(target),
+    );
+    cmd.env(
+        "PROMPT",
+        format!("$PROMPT{} ", AGENT_HISTORY_RETURN_HINT_TEXT),
+    );
+    cmd.env("PS1", format!("$PS1{} ", AGENT_HISTORY_RETURN_HINT_TEXT));
     cmd
 }
 
@@ -2085,57 +2084,9 @@ fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> 
     if let Some(cwd) = target.current_dir.as_ref() {
         out.push(format!("cwd: {}", cwd.display()));
     }
-    out.push(format!("command: {}", resume_shell_command(target)));
+    out.push(format!("resume command: {}", resume_command_string(target)));
     out.push(String::new());
     out
-}
-
-fn animate_resume_loader(
-    program: &str,
-    session_id: &str,
-    child: &mut std::process::Child,
-) -> anyhow::Result<Option<std::process::ExitStatus>> {
-    const FRAME_MS: u64 = 60;
-    const MAX_ANIM_MS: u64 = 1500;
-
-    let frames: [char; 4] = ['|', '/', '-', '\\'];
-    let mut frame_idx: usize = 0;
-    let start = Instant::now();
-    let mut stderr = io::stderr();
-
-    // 画面上で目立つように、1行だけを上書きし続ける（後続の外部CLI表示で自然に消える）
-    while start.elapsed() < Duration::from_millis(MAX_ANIM_MS) {
-        if let Some(st) = child
-            .try_wait()
-            .context("プロセス状態の取得に失敗しました")?
-        {
-            write!(stderr, "\r\x1b[2K")?;
-            stderr.flush().ok();
-            return Ok(Some(st));
-        }
-
-        let ch = frames[frame_idx % frames.len()];
-        frame_idx = frame_idx.wrapping_add(1);
-
-        // 疑似プログレス（循環バー）
-        let bar_w = 24usize;
-        let pos = frame_idx % (bar_w + 1);
-        let mut bar = String::with_capacity(bar_w);
-        for i in 0..bar_w {
-            bar.push(if i == pos { '>' } else { ' ' });
-        }
-
-        write!(
-            stderr,
-            "\r\x1b[2K{ch} launching {program} ({session_id}) [{bar}]"
-        )?;
-        stderr.flush().ok();
-        std::thread::sleep(Duration::from_millis(FRAME_MS));
-    }
-
-    write!(stderr, "\r\x1b[2K")?;
-    stderr.flush().ok();
-    Ok(None)
 }
 
 fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarget> {
@@ -2216,13 +2167,25 @@ fn run_with_tui_suspended<R>(
     f: impl FnOnce() -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        cursor::Show,
+        DisableMouseCapture
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     let res = f();
 
     enable_raw_mode().ok();
-    execute!(terminal.backend_mut(), EnterAlternateScreen, cursor::Hide).ok();
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        cursor::Hide,
+        EnableMouseCapture
+    )
+    .ok();
     terminal.hide_cursor().ok();
     terminal.clear().ok();
 
@@ -2583,32 +2546,11 @@ mod tests {
         let lines = resume_loading_lines(&target, "sid");
         assert_eq!(lines[0], "resuming: codex sid");
         assert_eq!(lines[1], "cwd: /x");
-        assert_eq!(
-            lines[2],
-            "command: cd '/x' && exec 'codex' 'resume' '-C' '/x' 'sid'"
-        );
+        assert_eq!(lines[2], "resume command: 'codex' 'resume' '-C' '/x' 'sid'");
     }
 
     #[test]
-    fn resume_shell_command_uses_exec_without_cwd() {
-        let target = ResumeTarget {
-            program: "claude-account".to_string(),
-            args: vec![
-                "work".to_string(),
-                "--resume".to_string(),
-                "sid".to_string(),
-            ],
-            current_dir: None,
-        };
-
-        assert_eq!(
-            resume_shell_command(&target),
-            "exec 'claude-account' 'work' '--resume' 'sid'"
-        );
-    }
-
-    #[test]
-    fn configured_resume_command_uses_shell_with_interactive_command() {
+    fn configured_resume_command_uses_login_shell_with_current_dir() {
         let target = ResumeTarget {
             program: "codex".to_string(),
             args: vec!["resume".to_string(), "sid".to_string()],
@@ -2623,9 +2565,44 @@ mod tests {
             .collect();
 
         assert!(!program.is_empty());
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0], "-ic");
-        assert_eq!(args[1], "cd '/tmp/proj dir' && exec 'codex' 'resume' 'sid'");
+        assert_eq!(args, vec!["-il"]);
+        assert_eq!(
+            cmd.get_current_dir()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/proj dir".to_string())
+        );
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("AGENT_HISTORY_RETURN_HINT")
+                .and_then(|v| v.clone()),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            envs.get("AGENT_HISTORY_RETURN_HINT_TEXT")
+                .and_then(|v| v.clone()),
+            Some(AGENT_HISTORY_RETURN_HINT_TEXT.to_string())
+        );
+        assert_eq!(
+            envs.get("AGENT_HISTORY_RESUME_COMMAND")
+                .and_then(|v| v.clone()),
+            Some("'codex' 'resume' 'sid'".to_string())
+        );
+        assert_eq!(
+            envs.get("PROMPT").and_then(|v| v.clone()),
+            Some("$PROMPT[exit to agent-history] ".to_string())
+        );
+        assert_eq!(
+            envs.get("PS1").and_then(|v| v.clone()),
+            Some("$PS1[exit to agent-history] ".to_string())
+        );
     }
 
     fn mr(
