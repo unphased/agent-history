@@ -1,4 +1,7 @@
-use crate::{args::Args, cache, telemetry};
+use crate::{
+    args::{ExportArgs, RefreshArgs, RunArgs, ScanArgs},
+    cache, config, telemetry,
+};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serde::Serialize;
@@ -9,6 +12,7 @@ use std::{
     fs::{self, File},
     io::{BufRead as _, BufReader},
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Instant,
@@ -16,7 +20,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
     Assistant,
@@ -37,7 +41,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]
 pub enum SourceKind {
     CodexSessionJsonl,
@@ -63,7 +67,7 @@ pub enum ImageAttachmentKind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {
     pub timestamp: Option<String>,
     pub role: Role,
@@ -77,6 +81,10 @@ pub struct MessageRecord {
     pub cwd: Option<String>,
     pub phase: Option<String>,
     pub images: Vec<ImageAttachment>,
+    pub machine_id: String,
+    pub machine_name: String,
+    pub project_slug: Option<String>,
+    pub origin: String,
 
     pub source: SourceKind,
 }
@@ -129,21 +137,62 @@ enum AccountConfigKind {
     Claude,
 }
 
-pub fn spawn_indexer_from_args(args: Args) -> mpsc::Receiver<IndexerEvent> {
+pub fn spawn_indexer_from_args(args: RunArgs) -> mpsc::Receiver<IndexerEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if let Err(e) = run_indexer_from_args(args, &tx) {
+        if let Err(e) = run_indexer_from_args(args.clone(), &tx) {
             let _ = tx.send(IndexerEvent::Warn {
                 message: format!("インデックス作成中にエラー: {e:#}"),
             });
             let _ = tx.send(IndexerEvent::Done { records: vec![] });
+            return;
+        }
+
+        if !args.scan.no_cache {
+            let tx_remote = tx.clone();
+            thread::spawn(move || {
+                if let Err(err) = sync_remotes_from_args(&args, &tx_remote) {
+                    let _ = tx_remote.send(IndexerEvent::Warn {
+                        message: format!("remote sync failed: {err:#}"),
+                    });
+                }
+            });
         }
     });
     rx
 }
 
-fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+pub fn refresh_local_cache(args: RefreshArgs) -> anyhow::Result<()> {
+    let (tx, _rx) = mpsc::channel();
+    run_indexer_from_scan_args(&args.scan, &tx).map(|_| ())
+}
+
+pub fn export_local_cache(args: ExportArgs, out: &mut impl std::io::Write) -> anyhow::Result<()> {
+    if args.format != "ndjson" {
+        anyhow::bail!("unsupported export format: {}", args.format);
+    }
+    let cache_path = cache::default_db_path();
+    if !cache_path.exists() {
+        refresh_local_cache(RefreshArgs {
+            scan: args.scan.clone(),
+        })?;
+    }
+    let store = cache::CacheStore::open(&cache_path, false)?;
+    for rec in store.load_local_records()? {
+        serde_json::to_writer(&mut *out, &rec).context("export record encode failed")?;
+        out.write_all(b"\n").context("export newline write failed")?;
+    }
+    Ok(())
+}
+
+fn run_indexer_from_args(args: RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+    run_indexer_from_scan_args(&args.scan, tx)
+}
+
+fn run_indexer_from_scan_args(args: &ScanArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
     let home = env::var_os("HOME").map(PathBuf::from);
+    let app_config = config::load_config(args.config.as_deref())?;
+    let machine = app_config.machine_identity();
 
     let mut roots: Vec<JsonlInputRoot> = Vec::new();
     let mut extra_files: Vec<JsonlInputRoot> = Vec::new();
@@ -239,6 +288,7 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
                 tx,
                 None,
                 false,
+                machine.clone(),
                 (!args.no_telemetry).then(|| {
                     args.telemetry_log
                         .clone()
@@ -282,6 +332,7 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
         tx,
         (!args.no_cache).then(cache::default_db_path),
         args.rebuild_index,
+        machine,
         (!args.no_telemetry).then(|| {
             args.telemetry_log
                 .clone()
@@ -290,11 +341,154 @@ fn run_indexer_from_args(args: Args, tx: &mpsc::Sender<IndexerEvent>) -> anyhow:
     )
 }
 
+fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+    let cfg = config::load_config(args.scan.config.as_deref())?;
+    let remotes: Vec<config::RemoteConfig> = cfg
+        .remotes
+        .into_iter()
+        .filter(|remote| remote.enabled && remote.refresh_on_start)
+        .collect();
+    if remotes.is_empty() {
+        return Ok(());
+    }
+    let cache_path = cache::default_db_path();
+    let telemetry_path = (!args.scan.no_telemetry).then(|| {
+        args.scan
+            .telemetry_log
+            .clone()
+            .unwrap_or_else(telemetry::default_log_path)
+    });
+    let mut telemetry = telemetry_path
+        .as_ref()
+        .and_then(|path| telemetry::TelemetrySink::open(path).ok());
+    for remote in remotes {
+        let started = Instant::now();
+        if let Some(sink) = telemetry.as_mut() {
+            let _ = sink.emit(
+                "remote_sync_started",
+                json!({"remote_name": remote.name, "host": remote.host}),
+            );
+        }
+        match refresh_and_export_remote(&remote) {
+            Ok(mut records) => {
+                for rec in &mut records {
+                    rec.origin = remote.name.clone();
+                    if rec.project_slug.is_none() {
+                        rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd_owned);
+                    }
+                }
+                let machine_id = records.first().map(|rec| rec.machine_id.clone());
+                let machine_name = records.first().map(|rec| rec.machine_name.clone());
+                let mut store = cache::CacheStore::open(&cache_path, false)?;
+                store.replace_remote_snapshot(
+                    &remote.name,
+                    &remote.host,
+                    &records,
+                    machine_id.as_deref(),
+                    machine_name.as_deref(),
+                    started.elapsed().as_millis() as i64,
+                )?;
+                let all = store.load_all_records()?;
+                if let Some(sink) = telemetry.as_mut() {
+                    let _ = sink.emit(
+                        "remote_sync_finished",
+                        json!({
+                            "remote_name": remote.name,
+                            "host": remote.host,
+                            "duration_ms": started.elapsed().as_millis(),
+                            "records": records.len(),
+                            "sessions": count_sessions(&records),
+                            "machine_id": machine_id,
+                            "machine_name": machine_name,
+                        }),
+                    );
+                }
+                tx.send(IndexerEvent::Loaded { records: all }).ok();
+            }
+            Err(err) => {
+                let mut store = cache::CacheStore::open(&cache_path, false)?;
+                let err_string = format!("{err:#}");
+                store.mark_remote_sync_failed(
+                    &remote.name,
+                    &remote.host,
+                    &err_string,
+                    started.elapsed().as_millis() as i64,
+                )?;
+                if let Some(sink) = telemetry.as_mut() {
+                    let _ = sink.emit(
+                        "remote_sync_failed",
+                        json!({
+                            "remote_name": remote.name,
+                            "host": remote.host,
+                            "duration_ms": started.elapsed().as_millis(),
+                            "error": err_string,
+                        }),
+                    );
+                }
+                tx.send(IndexerEvent::Warn {
+                    message: format!("remote sync failed for {}: {err}", remote.name),
+                })
+                .ok();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_and_export_remote(remote: &config::RemoteConfig) -> anyhow::Result<Vec<MessageRecord>> {
+    let target = match remote.user.as_deref() {
+        Some(user) => format!("{user}@{}", remote.host),
+        None => remote.host.clone(),
+    };
+    let remote_cmd = remote
+        .command
+        .clone()
+        .unwrap_or_else(|| "agent-history".to_string());
+    let refresh = Command::new("ssh")
+        .arg(&target)
+        .arg(&remote_cmd)
+        .arg("refresh")
+        .output()
+        .with_context(|| format!("ssh refresh failed: {}", remote.name))?;
+    if !refresh.status.success() {
+        anyhow::bail!(
+            "remote refresh failed: {}",
+            String::from_utf8_lossy(&refresh.stderr).trim()
+        );
+    }
+    let export = Command::new("ssh")
+        .arg(&target)
+        .arg(&remote_cmd)
+        .arg("export")
+        .arg("--format")
+        .arg("ndjson")
+        .output()
+        .with_context(|| format!("ssh export failed: {}", remote.name))?;
+    if !export.status.success() {
+        anyhow::bail!(
+            "remote export failed: {}",
+            String::from_utf8_lossy(&export.stderr).trim()
+        );
+    }
+    let mut records = Vec::new();
+    for line in String::from_utf8_lossy(&export.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: MessageRecord =
+            serde_json::from_str(line).with_context(|| format!("remote decode failed: {}", remote.name))?;
+        records.push(rec);
+    }
+    Ok(records)
+}
+
 fn run_indexer(
     cfg: IndexerConfig,
     tx: &mpsc::Sender<IndexerEvent>,
     cache_path: Option<PathBuf>,
     rebuild_index: bool,
+    machine: config::MachineIdentity,
     telemetry_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let indexer_started = Instant::now();
@@ -345,6 +539,8 @@ fn run_indexer(
             "cache_path": cache_path_string,
             "rebuild_index": rebuild_index,
             "telemetry_path": telemetry_path_string,
+            "machine_id": machine.id,
+            "machine_name": machine.name,
         }),
     );
 
@@ -352,7 +548,7 @@ fn run_indexer(
 
     if cache_path.is_none() {
         let full_scan_started = Instant::now();
-        let out = run_full_scan(inputs, tx, total_files, &mut emit)?;
+        let out = run_full_scan(inputs, tx, total_files, &mut emit, &machine)?;
         emit(
             "full_scan_finished",
             json!({
@@ -412,7 +608,7 @@ fn run_indexer(
                     }
 
                     let cache_load_started = Instant::now();
-                    let cached_records = store.load_records(&unit_keys)?;
+                    let cached_records = store.load_all_records()?;
                     emit(
                         "cache_load_finished",
                         json!({
@@ -454,7 +650,7 @@ fn run_indexer(
     };
     if cache_store.is_none() {
         let full_scan_started = Instant::now();
-        let out = run_full_scan(inputs, tx, total_files, &mut emit)?;
+        let out = run_full_scan(inputs, tx, total_files, &mut emit, &machine)?;
         emit(
             "full_scan_finished",
             json!({
@@ -530,7 +726,8 @@ fn run_indexer(
         }
 
         match index_input_to_chunk(input) {
-            Ok(chunk) => {
+            Ok(mut chunk) => {
+                attach_machine_metadata(&mut chunk.records, &machine, "local");
                 let current = chunk.current.clone();
                 let records_added = chunk.records.len();
                 let sessions_added = chunk.sessions.len();
@@ -600,6 +797,8 @@ fn run_indexer(
                     let Some((unit_key, current, fingerprint)) = opencode_meta[index].take() else {
                         continue;
                     };
+                    let mut chunk = chunk;
+                    attach_machine_metadata(&mut chunk.records, &machine, "local");
                     let records_added = chunk.records.len();
                     let sessions_added = chunk.sessions.len();
                     let cache_write_started = Instant::now();
@@ -681,7 +880,7 @@ fn run_indexer(
 
     let final_cache_load_started = Instant::now();
     let final_records = match cache_store.as_ref() {
-        Some(store) => store.load_records(&unit_keys)?,
+        Some(store) => store.load_all_records()?,
         None => Vec::new(),
     };
     let final_sessions = count_sessions(&final_records);
@@ -725,17 +924,53 @@ fn run_indexer(
     Ok(())
 }
 
-fn count_sessions(records: &[MessageRecord]) -> usize {
+pub(crate) fn count_sessions(records: &[MessageRecord]) -> usize {
     records
         .iter()
         .filter_map(|record| {
-            record
-                .session_id
-                .as_ref()
-                .map(|session_id| (record.source, session_id.clone(), record.account.clone()))
+            record.session_id.as_ref().map(|session_id| {
+                (
+                    record.source,
+                    session_id.clone(),
+                    record.account.clone(),
+                    record.machine_id.clone(),
+                    record.origin.clone(),
+                )
+            })
         })
         .collect::<HashSet<_>>()
         .len()
+}
+
+fn attach_machine_metadata(
+    records: &mut [MessageRecord],
+    machine: &config::MachineIdentity,
+    origin: &str,
+) {
+    for rec in records {
+        rec.machine_id = machine.id.clone();
+        rec.machine_name = machine.name.clone();
+        rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd_owned);
+        rec.origin = origin.to_string();
+    }
+}
+
+fn blank_record_metadata() -> (String, String, Option<String>, String) {
+    (
+        String::new(),
+        String::new(),
+        None,
+        "local".to_string(),
+    )
+}
+
+fn dir_name_from_cwd_owned(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(cwd)
+        .to_string()
 }
 
 fn fingerprint_for_input(input: &IndexInput) -> anyhow::Result<String> {
@@ -789,6 +1024,7 @@ fn run_full_scan(
     tx: &mpsc::Sender<IndexerEvent>,
     total_files: usize,
     emit: &mut impl FnMut(&str, Value),
+    machine: &config::MachineIdentity,
 ) -> anyhow::Result<Vec<MessageRecord>> {
     let mut indexed_inputs: Vec<Option<IndexedInputChunk>> = Vec::with_capacity(total_files);
     indexed_inputs.resize_with(total_files, || None);
@@ -804,7 +1040,8 @@ fn run_full_scan(
         }
 
         match index_input_to_chunk(input) {
-            Ok(chunk) => {
+            Ok(mut chunk) => {
+                attach_machine_metadata(&mut chunk.records, machine, "local");
                 records = records.saturating_add(chunk.records.len());
                 sessions.extend(chunk.sessions.iter().cloned());
                 let current = chunk.current.clone();
@@ -864,6 +1101,8 @@ fn run_full_scan(
             };
             match result {
                 IndexedInputResult::Indexed { index, chunk } => {
+                    let mut chunk = chunk;
+                    attach_machine_metadata(&mut chunk.records, machine, "local");
                     records = records.saturating_add(chunk.records.len());
                     sessions.extend(chunk.sessions.iter().cloned());
                     let current = chunk.current.clone();
@@ -1374,6 +1613,7 @@ fn index_opencode_session_file(
             })
             .or_else(|| session_ts.clone());
         let phase = message.mode.clone().or(message.agent.clone());
+        let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
 
         out.push(MessageRecord {
             timestamp,
@@ -1386,6 +1626,10 @@ fn index_opencode_session_file(
             cwd,
             phase,
             images: Vec::new(),
+            machine_id,
+            machine_name,
+            project_slug,
+            origin,
             source: SourceKind::OpenCodeSession,
         });
         records_added = records_added.saturating_add(1);
@@ -1395,6 +1639,7 @@ fn index_opencode_session_file(
         && let Some(title) = fallback_title
     {
         telemetry.used_title_fallback = true;
+        let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
         out.push(MessageRecord {
             timestamp: session_ts,
             role: Role::User,
@@ -1406,6 +1651,10 @@ fn index_opencode_session_file(
             cwd: session_cwd,
             phase: Some("title".to_string()),
             images: Vec::new(),
+            machine_id,
+            machine_name,
+            project_slug,
+            origin,
             source: SourceKind::OpenCodeSession,
         });
         records_added = 1;
@@ -1753,6 +2002,7 @@ fn extract_codex_session_record(
 
     let text = extract_content_text(payload)?;
     let images = extract_codex_content_images(payload);
+    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
 
     Some(MessageRecord {
         timestamp,
@@ -1765,6 +2015,10 @@ fn extract_codex_session_record(
         cwd: ctx.cwd.clone(),
         phase,
         images,
+        machine_id,
+        machine_name,
+        project_slug,
+        origin,
         source: SourceKind::CodexSessionJsonl,
     })
 }
@@ -1801,6 +2055,7 @@ fn extract_claude_project_record(
     let cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
 
     let text = extract_claude_message_text(message)?;
+    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
 
     Some(MessageRecord {
         timestamp,
@@ -1813,6 +2068,10 @@ fn extract_claude_project_record(
         cwd,
         phase: None,
         images: Vec::new(),
+        machine_id,
+        machine_name,
+        project_slug,
+        origin,
         source: SourceKind::ClaudeProjectJsonl,
     })
 }
@@ -1887,6 +2146,7 @@ fn extract_codex_history_record(
     let ts = h.ts?;
     let session_id = h.session_id?;
     let text = h.text?;
+    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
 
     Some(MessageRecord {
         timestamp: Some(ts.to_string()),
@@ -1899,6 +2159,10 @@ fn extract_codex_history_record(
         cwd: None,
         phase: None,
         images: Vec::new(),
+        machine_id,
+        machine_name,
+        project_slug,
+        origin,
         source: SourceKind::CodexHistoryJsonl,
     })
 }
@@ -1925,6 +2189,13 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}-{}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             Self { path: dir }
+        }
+    }
+
+    fn test_machine() -> config::MachineIdentity {
+        config::MachineIdentity {
+            id: "local".to_string(),
+            name: "local".to_string(),
         }
     }
 
@@ -2272,7 +2543,8 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let first_events = recv_events(&rx1);
         assert!(
             first_events
@@ -2286,7 +2558,7 @@ mod tests {
         );
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, test_machine(), None).unwrap();
         let second_events = recv_events(&rx2);
         assert!(
             second_events.iter().any(
@@ -2318,7 +2590,15 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx, rx) = mpsc::channel();
-        run_indexer(cfg, &tx, Some(cache_db), false, Some(telemetry_log.clone())).unwrap();
+        run_indexer(
+            cfg,
+            &tx,
+            Some(cache_db),
+            false,
+            test_machine(),
+            Some(telemetry_log.clone()),
+        )
+        .unwrap();
         let _ = recv_events(&rx);
 
         let body = fs::read_to_string(&telemetry_log).unwrap();
@@ -2396,14 +2676,15 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let first_events = recv_events(&rx1);
         assert!(first_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
 
         fs::write(&part_file, "{not valid json").unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, test_machine(), None).unwrap();
         let second_events = recv_events(&rx2);
         assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Loaded { records } if records.iter().any(|record| record.text == "hello from cache"))));
         assert!(second_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
@@ -2427,11 +2708,12 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let _ = recv_events(&rx1);
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), true, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), true, test_machine(), None).unwrap();
         let events = recv_events(&rx2);
         assert!(
             !events
@@ -2463,7 +2745,7 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx, rx) = mpsc::channel();
-        run_indexer(cfg, &tx, Some(bad_cache_path), false, None).unwrap();
+        run_indexer(cfg, &tx, Some(bad_cache_path), false, test_machine(), None).unwrap();
         let events = recv_events(&rx);
 
         assert!(events.iter().any(
@@ -2491,7 +2773,8 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2505,7 +2788,7 @@ mod tests {
         .unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, test_machine(), None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(
@@ -2562,7 +2845,8 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2587,7 +2871,7 @@ mod tests {
         .unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, test_machine(), None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(
@@ -2615,13 +2899,14 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, None).unwrap();
+        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
+            .unwrap();
         let _ = recv_events(&rx1);
 
         fs::remove_file(&jsonl).unwrap();
 
         let (tx2, rx2) = mpsc::channel();
-        run_indexer(cfg, &tx2, Some(cache_db), false, None).unwrap();
+        run_indexer(cfg, &tx2, Some(cache_db), false, test_machine(), None).unwrap();
         let events = recv_events(&rx2);
 
         assert!(events.iter().any(

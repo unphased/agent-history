@@ -1,4 +1,4 @@
-use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind};
+use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind, count_sessions};
 use anyhow::Context as _;
 use rusqlite::{Connection, Transaction, params};
 use std::{
@@ -8,7 +8,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+
+#[derive(Debug, Clone)]
+pub struct RemoteSyncStatus {
+    pub remote_name: String,
+    pub host: String,
+    pub machine_id: Option<String>,
+    pub machine_name: Option<String>,
+    pub last_attempted_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    pub last_duration_ms: Option<i64>,
+    pub imported_records: i64,
+    pub imported_sessions: i64,
+    pub last_error: Option<String>,
+}
 
 pub struct CacheStore {
     conn: Connection,
@@ -46,6 +60,9 @@ impl CacheStore {
         let mut to_remove: Vec<String> = Vec::new();
         for row in rows {
             let (unit_key, path) = row?;
+            if path.starts_with("ssh://") {
+                continue;
+            }
             if Path::new(&path).exists() {
                 continue;
             }
@@ -98,7 +115,7 @@ impl CacheStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source \
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin \
                  FROM message_records WHERE unit_key IN ({placeholders}) ORDER BY unit_key, ord"
             );
             let mut stmt = self
@@ -119,11 +136,89 @@ impl CacheStore {
                     images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
                         .unwrap_or_default(),
                     source: source_from_db(row.get::<_, i64>(10)?),
+                    machine_id: row.get(11)?,
+                    machine_name: row.get(12)?,
+                    project_slug: row.get(13)?,
+                    origin: row.get(14)?,
                 })
             })?;
             for row in rows {
                 out.push(row?);
             }
+        }
+        Ok(out)
+    }
+
+    pub fn load_all_records(&self) -> anyhow::Result<Vec<MessageRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
+                 FROM message_records ORDER BY origin, unit_key, ord",
+            )
+            .context("cache all-record query failed")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MessageRecord {
+                timestamp: row.get(0)?,
+                role: role_from_db(row.get::<_, i64>(1)?),
+                text: row.get(2)?,
+                file: PathBuf::from(row.get::<_, String>(3)?),
+                line: row.get::<_, i64>(4)? as u32,
+                session_id: row.get(5)?,
+                account: row.get(6)?,
+                cwd: row.get(7)?,
+                phase: row.get(8)?,
+                images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
+                    .unwrap_or_default(),
+                source: source_from_db(row.get::<_, i64>(10)?),
+                machine_id: row.get(11)?,
+                machine_name: row.get(12)?,
+                project_slug: row.get(13)?,
+                origin: row.get(14)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn load_local_records(&self) -> anyhow::Result<Vec<MessageRecord>> {
+        self.load_records_for_origin("local")
+    }
+
+    pub fn load_records_for_origin(&self, origin: &str) -> anyhow::Result<Vec<MessageRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
+                 FROM message_records WHERE origin = ?1 ORDER BY unit_key, ord",
+            )
+            .context("cache origin record query failed")?;
+        let rows = stmt.query_map(params![origin], |row| {
+            Ok(MessageRecord {
+                timestamp: row.get(0)?,
+                role: role_from_db(row.get::<_, i64>(1)?),
+                text: row.get(2)?,
+                file: PathBuf::from(row.get::<_, String>(3)?),
+                line: row.get::<_, i64>(4)? as u32,
+                session_id: row.get(5)?,
+                account: row.get(6)?,
+                cwd: row.get(7)?,
+                phase: row.get(8)?,
+                images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
+                    .unwrap_or_default(),
+                source: source_from_db(row.get::<_, i64>(10)?),
+                machine_id: row.get(11)?,
+                machine_name: row.get(12)?,
+                project_slug: row.get(13)?,
+                origin: row.get(14)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
@@ -150,8 +245,8 @@ impl CacheStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO message_records (
-                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 )
                 .context("cache record statement failed")?;
 
@@ -170,6 +265,10 @@ impl CacheStore {
                     rec.phase,
                     serde_json::to_string(&rec.images).unwrap_or_else(|_| "[]".to_string()),
                     source_to_db(rec.source),
+                    rec.machine_id,
+                    rec.machine_name,
+                    rec.project_slug,
+                    rec.origin,
                 ])
                 .context("cache record insert failed")?;
             }
@@ -189,11 +288,139 @@ impl CacheStore {
         Ok(())
     }
 
+    pub fn replace_remote_snapshot(
+        &mut self,
+        remote_name: &str,
+        host: &str,
+        records: &[MessageRecord],
+        machine_id: Option<&str>,
+        machine_name: Option<&str>,
+        duration_ms: i64,
+    ) -> anyhow::Result<()> {
+        let unit_key = format!("remote::{remote_name}");
+        let tx = self
+            .conn
+            .transaction()
+            .context("remote snapshot transaction failed")?;
+        Self::delete_unit_tx(&tx, &unit_key)?;
+        tx.execute(
+            "INSERT INTO source_units (unit_key, path, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![unit_key, format!("ssh://{host}/{remote_name}"), unix_now().to_string(), unix_now()],
+        )
+        .context("remote source unit insert failed")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO message_records (
+                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                )
+                .context("remote record statement failed")?;
+            for (ord, rec) in records.iter().enumerate() {
+                stmt.execute(params![
+                    unit_key,
+                    ord as i64,
+                    rec.timestamp,
+                    role_to_db(rec.role),
+                    rec.text,
+                    rec.file.to_string_lossy().to_string(),
+                    i64::from(rec.line),
+                    rec.session_id,
+                    rec.account,
+                    rec.cwd,
+                    rec.phase,
+                    serde_json::to_string(&rec.images).unwrap_or_else(|_| "[]".to_string()),
+                    source_to_db(rec.source),
+                    rec.machine_id,
+                    rec.machine_name,
+                    rec.project_slug,
+                    rec.origin,
+                ])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO remote_sync_state (
+                remote_name, host, machine_id, machine_name, last_attempted_ms, last_success_ms, last_duration_ms, imported_records, imported_sessions, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, NULL)
+            ON CONFLICT(remote_name) DO UPDATE SET
+                host=excluded.host,
+                machine_id=excluded.machine_id,
+                machine_name=excluded.machine_name,
+                last_attempted_ms=excluded.last_attempted_ms,
+                last_success_ms=excluded.last_success_ms,
+                last_duration_ms=excluded.last_duration_ms,
+                imported_records=excluded.imported_records,
+                imported_sessions=excluded.imported_sessions,
+                last_error=NULL",
+            params![
+                remote_name,
+                host,
+                machine_id,
+                machine_name,
+                unix_now() as i64,
+                duration_ms,
+                records.len() as i64,
+                count_sessions(records) as i64,
+            ],
+        )
+        .context("remote sync status upsert failed")?;
+        tx.commit().context("remote snapshot commit failed")?;
+        Ok(())
+    }
+
+    pub fn mark_remote_sync_failed(
+        &mut self,
+        remote_name: &str,
+        host: &str,
+        error: &str,
+        duration_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO remote_sync_state (
+                remote_name, host, last_attempted_ms, last_duration_ms, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(remote_name) DO UPDATE SET
+                host=excluded.host,
+                last_attempted_ms=excluded.last_attempted_ms,
+                last_duration_ms=excluded.last_duration_ms,
+                last_error=excluded.last_error",
+            params![remote_name, host, unix_now() as i64, duration_ms, error],
+        ).context("remote sync failure upsert failed")?;
+        Ok(())
+    }
+
+    pub fn load_remote_sync_states(&self) -> anyhow::Result<Vec<RemoteSyncStatus>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT remote_name, host, machine_id, machine_name, last_attempted_ms, last_success_ms, last_duration_ms, imported_records, imported_sessions, last_error
+             FROM remote_sync_state ORDER BY remote_name"
+        ).context("remote sync state query failed")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RemoteSyncStatus {
+                remote_name: row.get(0)?,
+                host: row.get(1)?,
+                machine_id: row.get(2)?,
+                machine_name: row.get(3)?,
+                last_attempted_ms: row.get(4)?,
+                last_success_ms: row.get(5)?,
+                last_duration_ms: row.get(6)?,
+                imported_records: row.get(7)?,
+                imported_sessions: row.get(8)?,
+                last_error: row.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     fn clear(&mut self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(
                 "DELETE FROM message_records;
-                 DELETE FROM source_units;",
+                 DELETE FROM source_units;
+                 DELETE FROM remote_sync_state;",
             )
             .context("cache clear failed")?;
         Ok(())
@@ -240,11 +467,28 @@ impl CacheStore {
                     phase TEXT,
                     images_json TEXT NOT NULL DEFAULT '[]',
                     source INTEGER NOT NULL,
+                    machine_id TEXT NOT NULL DEFAULT '',
+                    machine_name TEXT NOT NULL DEFAULT '',
+                    project_slug TEXT,
+                    origin TEXT NOT NULL DEFAULT 'local',
                     PRIMARY KEY (unit_key, ord),
                     FOREIGN KEY (unit_key) REFERENCES source_units(unit_key) ON DELETE CASCADE
                  );
+                 CREATE TABLE IF NOT EXISTS remote_sync_state (
+                    remote_name TEXT PRIMARY KEY,
+                    host TEXT NOT NULL,
+                    machine_id TEXT,
+                    machine_name TEXT,
+                    last_attempted_ms INTEGER,
+                    last_success_ms INTEGER,
+                    last_duration_ms INTEGER,
+                    imported_records INTEGER NOT NULL DEFAULT 0,
+                    imported_sessions INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                 );
                  CREATE INDEX IF NOT EXISTS idx_message_records_session_id ON message_records(session_id);
-                 PRAGMA user_version = 2;",
+                 CREATE INDEX IF NOT EXISTS idx_message_records_origin ON message_records(origin);
+                 PRAGMA user_version = 4;",
             )
             .context("cache schema create failed")?;
 
@@ -360,6 +604,10 @@ mod tests {
             cwd: None,
             phase: None,
             images: Vec::new(),
+            machine_id: "local".to_string(),
+            machine_name: "local".to_string(),
+            project_slug: None,
+            origin: "local".to_string(),
             source: SourceKind::CodexSessionJsonl,
         };
         let key = unit_key(&source_path);

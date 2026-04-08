@@ -113,6 +113,17 @@ fn record_matches_token(rec: &MessageRecord, token: &Token) -> bool {
     {
         return true;
     }
+    if contains_token(&rec.machine_name, token) || contains_token(&rec.machine_id, token) {
+        return true;
+    }
+    if let Some(project_slug) = rec.project_slug.as_deref()
+        && contains_token(project_slug, token)
+    {
+        return true;
+    }
+    if contains_token(&rec.origin, token) {
+        return true;
+    }
     let path = rec.file.to_string_lossy();
     if contains_token(&path, token) {
         return true;
@@ -216,6 +227,10 @@ mod tests {
             cwd: Some("/home/tizze".to_string()),
             phase: None,
             images: Vec::new(),
+            machine_id: "local".to_string(),
+            machine_name: "local".to_string(),
+            project_slug: Some("tizze".to_string()),
+            origin: "local".to_string(),
             source: SourceKind::CodexSessionJsonl,
         }
     }

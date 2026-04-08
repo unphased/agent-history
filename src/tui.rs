@@ -1,5 +1,7 @@
 use crate::{
-    args::Args,
+    args::RunArgs,
+    cache,
+    config,
     indexer::{
         ImageAttachment, ImageAttachmentKind, IndexerEvent, MessageRecord, Role, SourceKind,
     },
@@ -51,6 +53,10 @@ struct SessionSummary {
     source: SourceKind,
     session_id: String,
     account: Option<String>,
+    machine_id: String,
+    machine_name: String,
+    origin: String,
+    project_slug: Option<String>,
     first_user_idx: usize,
     last_ts: Option<String>,
     cwd: Option<String>,
@@ -63,6 +69,10 @@ struct SessionAgg<'a> {
     record_indices: Vec<usize>,
     last_ts: Option<&'a str>,
     cwd: Option<&'a str>,
+    project_slug: Option<&'a str>,
+    machine_id: Option<&'a str>,
+    machine_name: Option<&'a str>,
+    origin: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +96,8 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
         source: SourceKind,
         session_id: &'a str,
         account: Option<&'a str>,
+        machine_id: &'a str,
+        origin: &'a str,
     }
 
     let mut by_session: HashMap<SessionKeyRef<'_>, SessionAgg<'_>> = HashMap::new();
@@ -131,6 +143,8 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 source: rec.source,
                 session_id,
                 account: rec.account.as_deref(),
+                machine_id: &rec.machine_id,
+                origin: &rec.origin,
             })
             .or_default();
 
@@ -150,6 +164,21 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
         {
             entry.cwd = Some(cwd);
         }
+        if entry.project_slug.is_none()
+            && let Some(project_slug) = rec.project_slug.as_deref()
+            && !project_slug.trim().is_empty()
+        {
+            entry.project_slug = Some(project_slug);
+        }
+        if entry.machine_id.is_none() && !rec.machine_id.trim().is_empty() {
+            entry.machine_id = Some(&rec.machine_id);
+        }
+        if entry.machine_name.is_none() && !rec.machine_name.trim().is_empty() {
+            entry.machine_name = Some(&rec.machine_name);
+        }
+        if entry.origin.is_none() && !rec.origin.trim().is_empty() {
+            entry.origin = Some(&rec.origin);
+        }
     }
 
     let mut items: Vec<(SessionSummary, Vec<usize>)> = Vec::new();
@@ -168,6 +197,13 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 source: key.source,
                 session_id: key.session_id.to_string(),
                 account: key.account.map(|s| s.to_string()),
+                machine_id: key.machine_id.to_string(),
+                machine_name: agg
+                    .machine_name
+                    .unwrap_or(key.machine_id)
+                    .to_string(),
+                origin: key.origin.to_string(),
+                project_slug: agg.project_slug.map(|s| s.to_string()),
                 first_user_idx,
                 last_ts: agg.last_ts.map(|s| s.to_string()),
                 cwd: agg.cwd.map(|s| s.to_string()),
@@ -196,6 +232,8 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
     items.sort_by(|(a, _), (b, _)| {
         ts_cmp_opt(a.last_ts.as_deref(), b.last_ts.as_deref())
             .reverse()
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+            .then_with(|| a.origin.cmp(&b.origin))
             .then_with(|| a.account.cmp(&b.account))
             .then_with(|| a.session_id.cmp(&b.session_id))
             .then_with(|| source_sort_key(a.source).cmp(&source_sort_key(b.source)))
@@ -521,15 +559,52 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn result_line(sess: &SessionSummary, matched: Option<&MessageRecord>, hit_count: usize) -> String {
+fn tag_style(bg: Color) -> Style {
+    Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)
+}
+
+fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if tags.show_provider {
+        spans.push(Span::styled(
+            format!(" {} ", provider_label(sess.source, sess.account.as_deref())),
+            tag_style(Color::Cyan),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if tags.show_account
+        && let Some(account) = sess.account.as_deref()
+        && !account.trim().is_empty()
+    {
+        spans.push(Span::styled(format!(" {account} "), tag_style(Color::Green)));
+        spans.push(Span::raw(" "));
+    }
+    if tags.show_host {
+        spans.push(Span::styled(
+            format!(" {} ", sess.machine_name),
+            tag_style(Color::Magenta),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if tags.show_project
+        && let Some(project) = sess.project_slug.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        spans.push(Span::styled(
+            format!(" {project} "),
+            tag_style(Color::Yellow),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn result_line_text(
+    sess: &SessionSummary,
+    matched: Option<&MessageRecord>,
+    hit_count: usize,
+) -> String {
     let ts = short_ts(sess.last_ts.as_deref());
-    let prefix = format!(
-        "{} {} [{}] {}",
-        ts,
-        provider_label(sess.source, sess.account.as_deref()),
-        sess.dir,
-        sess.first_line,
-    );
+    let prefix = format!("{ts} [{}] {}", sess.dir, sess.first_line);
 
     let Some(rec) = matched else {
         return prefix;
@@ -548,6 +623,26 @@ fn result_line(sess: &SessionSummary, matched: Option<&MessageRecord>, hit_count
     } else {
         format!("{prefix} :: {snippet}")
     }
+}
+
+fn result_line(
+    sess: &SessionSummary,
+    matched: Option<&MessageRecord>,
+    hit_count: usize,
+    query: &str,
+    ui_tags: &config::UiTagConfig,
+    base_style: Style,
+    match_style: Style,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = session_tag_spans(sess, ui_tags);
+    let text_line = highlighted_line(
+        &result_line_text(sess, matched, hit_count),
+        query,
+        base_style,
+        match_style,
+    );
+    spans.extend(text_line.spans);
+    Line::from(spans)
 }
 
 fn highlighted_line(
@@ -873,11 +968,14 @@ struct App {
     indexing: IndexingProgress,
     ready: bool,
     telemetry_log_path: Option<PathBuf>,
+    cache_path: Option<PathBuf>,
     show_telemetry: bool,
     last_bgcolor_target: Option<String>,
+    ui_tags: config::UiTagConfig,
+    remotes: HashMap<String, config::RemoteConfig>,
 }
 
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let rx = crate::indexer::spawn_indexer_from_args(args.clone());
 
     let mut stdout = io::stdout();
@@ -912,8 +1010,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     rx: mpsc::Receiver<IndexerEvent>,
-    args: Args,
+    args: RunArgs,
 ) -> anyhow::Result<()> {
+    let app_config = config::load_config(args.scan.config.as_deref()).unwrap_or_default();
+    let remotes = app_config
+        .remotes
+        .iter()
+        .cloned()
+        .map(|remote| (remote.name.clone(), remote))
+        .collect();
     let mut app = App {
         query: args.query.unwrap_or_default(),
         max_results: args.max_results,
@@ -929,13 +1034,16 @@ fn run_app(
         last_results: Vec::new(),
         indexing: IndexingProgress::default(),
         ready: false,
-        telemetry_log_path: (!args.no_telemetry).then(|| {
-            args.telemetry_log
+        telemetry_log_path: (!args.scan.no_telemetry).then(|| {
+            args.scan.telemetry_log
                 .clone()
                 .unwrap_or_else(telemetry::default_log_path)
         }),
+        cache_path: (!args.scan.no_cache).then(cache::default_db_path),
         show_telemetry: false,
         last_bgcolor_target: None,
+        ui_tags: app_config.ui.tags,
+        remotes,
     };
 
     loop {
@@ -1438,6 +1546,13 @@ impl App {
             let mut lines = vec![
                 Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
                 Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
+                Line::raw(format!("host: {}", rec.machine_name)),
+                Line::raw(format!("machine id: {}", rec.machine_id)),
+                Line::raw(format!("origin: {}", rec.origin)),
+                Line::raw(format!(
+                    "project: {}",
+                    rec.project_slug.as_deref().unwrap_or("")
+                )),
                 Line::raw(format!(
                     "role: {role}   phase: {}",
                     rec.phase.as_deref().unwrap_or("")
@@ -1495,6 +1610,13 @@ impl App {
             Line::raw(format!(
                 "account: {}",
                 sess.account.as_deref().unwrap_or("")
+            )),
+            Line::raw(format!("host: {}", sess.machine_name)),
+            Line::raw(format!("machine id: {}", sess.machine_id)),
+            Line::raw(format!("origin: {}", sess.origin)),
+            Line::raw(format!(
+                "project: {}",
+                sess.project_slug.as_deref().unwrap_or("")
             )),
             Line::raw(format!("source: {}", source_label(sess.source))),
             Line::raw(format!("session opener: {}", sess.first_line)),
@@ -1674,6 +1796,27 @@ impl App {
                 "total: {} ms",
                 telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
             )));
+        }
+        if let Some(cache_path) = self.cache_path.as_ref()
+            && let Ok(store) = cache::CacheStore::open(cache_path, false)
+            && let Ok(states) = store.load_remote_sync_states()
+            && !states.is_empty()
+        {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("remote sync:"));
+            for state in states {
+                lines.push(Line::raw(format!(
+                    "{}@{} attempted={} success={} records={} sessions={} duration={}ms error={}",
+                    state.remote_name,
+                    state.host,
+                    state.last_attempted_ms.unwrap_or(0),
+                    state.last_success_ms.unwrap_or(0),
+                    state.imported_records,
+                    state.imported_sessions,
+                    state.last_duration_ms.unwrap_or(0),
+                    state.last_error.unwrap_or_default(),
+                )));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(Line::raw("latest run events:"));
@@ -1904,9 +2047,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             continue;
         };
         let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
-        lines.push(highlighted_line(
-            &result_line(sess, matched, hit.hit_count),
+        lines.push(result_line(
+            sess,
+            matched,
+            hit.hit_count,
             query,
+            &app.ui_tags,
             Style::default(),
             result_match_style,
         ));
@@ -1997,9 +2143,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        let p = Paragraph::new(Text::from(vec![highlighted_line(
-            &result_line(sess, matched, hit.hit_count),
+        let p = Paragraph::new(Text::from(vec![result_line(
+            sess,
+            matched,
+            hit.hit_count,
             query,
+            &app.ui_tags,
             selected_base_style,
             selected_match_style,
         )]));
@@ -2148,6 +2297,7 @@ struct ResumeTarget {
     program: String,
     args: Vec<String>,
     current_dir: Option<PathBuf>,
+    remote: Option<config::RemoteConfig>,
 }
 
 #[derive(Debug)]
@@ -2280,7 +2430,40 @@ fn configured_resume_command_for_shell(
 }
 
 fn configured_resume_command(target: &ResumeTarget) -> anyhow::Result<ConfiguredResumeCommand> {
+    if let Some(remote) = target.remote.as_ref() {
+        return configured_remote_resume_command(target, remote);
+    }
     configured_resume_command_for_shell(target, &shell_program())
+}
+
+fn configured_remote_resume_command(
+    target: &ResumeTarget,
+    remote: &config::RemoteConfig,
+) -> anyhow::Result<ConfiguredResumeCommand> {
+    let ssh_target = match remote.user.as_deref() {
+        Some(user) => format!("{user}@{}", remote.host),
+        None => remote.host.clone(),
+    };
+    let mut script = format!(
+        "export AGENT_HISTORY_RETURN_HINT=1 AGENT_HISTORY_RETURN_HINT_TEXT={} AGENT_HISTORY_RESUME_COMMAND={}; ",
+        shell_escape(AGENT_HISTORY_RETURN_HINT_TEXT),
+        shell_escape(&resume_command_string(target)),
+    );
+    if let Some(cwd) = target.current_dir.as_ref() {
+        script.push_str(&format!("cd {} && ", shell_escape(&cwd.to_string_lossy())));
+    }
+    script.push_str("exec \"${SHELL:-/bin/zsh}\" -il");
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-t")
+        .arg(ssh_target)
+        .arg("/bin/sh")
+        .arg("-lc")
+        .arg(script);
+    Ok(ConfiguredResumeCommand {
+        command: cmd,
+        zdotdir_cleanup: None,
+    })
 }
 
 fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> {
@@ -2321,6 +2504,7 @@ fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarg
                 program,
                 args,
                 current_dir: cwd,
+                remote: remote_for_record(app, rec),
             })
         }
         SourceKind::ClaudeProjectJsonl => {
@@ -2337,14 +2521,23 @@ fn resume_target_for_record(app: &App, rec: &MessageRecord) -> Option<ResumeTarg
                 program,
                 args,
                 current_dir: cwd,
+                remote: remote_for_record(app, rec),
             })
         }
         SourceKind::OpenCodeSession => Some(ResumeTarget {
             program: "opencode".to_string(),
             args: vec!["--session".to_string(), sid.to_string()],
             current_dir: cwd,
+            remote: remote_for_record(app, rec),
         }),
     }
+}
+
+fn remote_for_record(app: &App, rec: &MessageRecord) -> Option<config::RemoteConfig> {
+    if rec.origin == "local" {
+        return None;
+    }
+    app.remotes.get(&rec.origin).cloned()
 }
 
 fn find_cwd_for_session_id<'a>(app: &'a App, session_id: &str) -> Option<&'a str> {
@@ -2444,9 +2637,38 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: false,
             telemetry_log_path: None,
+            cache_path: None,
             show_telemetry: false,
             last_bgcolor_target: None,
+            ui_tags: config::UiTagConfig::default(),
+            remotes: HashMap::new(),
         }
+    }
+
+    fn test_record(mut rec: MessageRecord) -> MessageRecord {
+        rec.machine_id = "local".to_string();
+        rec.machine_name = "local".to_string();
+        rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd);
+        rec.origin = "local".to_string();
+        rec
+    }
+
+    fn ready_app_with_data(
+        all: Vec<MessageRecord>,
+        sessions: Vec<SessionSummary>,
+        session_records: Vec<Vec<usize>>,
+    ) -> App {
+        let mut app = empty_app();
+        app.ready = true;
+        app.all = all;
+        app.sessions = sessions;
+        app.session_records = session_records;
+        app
+    }
+
+    fn ready_app_with_indexed_data(all: Vec<MessageRecord>) -> App {
+        let (sessions, session_records) = build_session_index(&all);
+        ready_app_with_data(all, sessions, session_records)
     }
 
     #[test]
@@ -2455,7 +2677,7 @@ mod tests {
         let cwd = tmp.path.join("proj");
         fs::create_dir_all(&cwd).unwrap();
 
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "x".to_string(),
@@ -2466,28 +2688,14 @@ mod tests {
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
+        });
 
-        let app = App {
-            query: String::new(),
-            max_results: 0,
-            all: vec![rec.clone()],
-            sessions: Vec::new(),
-            session_records: Vec::new(),
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let app = ready_app_with_data(vec![rec.clone()], Vec::new(), Vec::new());
 
         let target = resume_target_for_record(&app, &rec).unwrap();
         assert_eq!(target.program, "codex");
@@ -2505,7 +2713,7 @@ mod tests {
 
     #[test]
     fn handle_indexer_event_loaded_then_done_replaces_results() {
-        let cached = MessageRecord {
+        let cached = test_record(MessageRecord {
             timestamp: Some("2026-01-01T00:00:00.000Z".to_string()),
             role: Role::User,
             text: "cached text".to_string(),
@@ -2516,9 +2724,13 @@ mod tests {
             cwd: Some("/tmp/cached".to_string()),
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
-        let refreshed = MessageRecord {
+        });
+        let refreshed = test_record(MessageRecord {
             timestamp: Some("2026-01-02T00:00:00.000Z".to_string()),
             role: Role::User,
             text: "refreshed text".to_string(),
@@ -2529,8 +2741,12 @@ mod tests {
             cwd: Some("/tmp/refreshed".to_string()),
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
+        });
 
         let mut app = empty_app();
         handle_indexer_event(
@@ -2564,7 +2780,7 @@ mod tests {
         let cwd = tmp.path.join("proj");
         fs::create_dir_all(&cwd).unwrap();
 
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "x".to_string(),
@@ -2575,28 +2791,14 @@ mod tests {
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::ClaudeProjectJsonl,
-        };
+        });
 
-        let app = App {
-            query: String::new(),
-            max_results: 0,
-            all: vec![rec.clone()],
-            sessions: Vec::new(),
-            session_records: Vec::new(),
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let app = ready_app_with_data(vec![rec.clone()], Vec::new(), Vec::new());
 
         let target = resume_target_for_record(&app, &rec).unwrap();
         assert_eq!(target.program, "claude");
@@ -2612,7 +2814,7 @@ mod tests {
 
     #[test]
     fn resume_target_for_account_scoped_codex_uses_wrapper() {
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "x".to_string(),
@@ -2623,28 +2825,14 @@ mod tests {
             cwd: None,
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
+        });
 
-        let app = App {
-            query: String::new(),
-            max_results: 0,
-            all: vec![rec.clone()],
-            sessions: Vec::new(),
-            session_records: Vec::new(),
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let app = ready_app_with_data(vec![rec.clone()], Vec::new(), Vec::new());
 
         let target = resume_target_for_record(&app, &rec).unwrap();
         assert_eq!(target.program, "codex-account");
@@ -2653,7 +2841,7 @@ mod tests {
 
     #[test]
     fn resume_target_for_account_scoped_claude_uses_wrapper() {
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "x".to_string(),
@@ -2664,28 +2852,14 @@ mod tests {
             cwd: None,
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::ClaudeProjectJsonl,
-        };
+        });
 
-        let app = App {
-            query: String::new(),
-            max_results: 0,
-            all: vec![rec.clone()],
-            sessions: Vec::new(),
-            session_records: Vec::new(),
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let app = ready_app_with_data(vec![rec.clone()], Vec::new(), Vec::new());
 
         let target = resume_target_for_record(&app, &rec).unwrap();
         assert_eq!(target.program, "claude-account");
@@ -2698,7 +2872,7 @@ mod tests {
         let cwd = tmp.path.join("proj");
         fs::create_dir_all(&cwd).unwrap();
 
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "x".to_string(),
@@ -2709,28 +2883,14 @@ mod tests {
             cwd: Some(cwd.to_string_lossy().to_string()),
             phase: Some("orchestrator".to_string()),
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::OpenCodeSession,
-        };
+        });
 
-        let app = App {
-            query: String::new(),
-            max_results: 0,
-            all: vec![rec.clone()],
-            sessions: Vec::new(),
-            session_records: Vec::new(),
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let app = ready_app_with_data(vec![rec.clone()], Vec::new(), Vec::new());
 
         let target = resume_target_for_record(&app, &rec).unwrap();
         assert_eq!(target.program, "opencode");
@@ -2752,6 +2912,7 @@ mod tests {
                 "sid".to_string(),
             ],
             current_dir: Some(PathBuf::from("/x")),
+            remote: None,
         };
 
         let lines = resume_loading_lines(&target, "sid");
@@ -2766,6 +2927,7 @@ mod tests {
             program: "codex".to_string(),
             args: vec!["resume".to_string(), "sid".to_string()],
             current_dir: Some(PathBuf::from("/tmp/proj dir")),
+            remote: None,
         };
 
         let configured = configured_resume_command_for_shell(&target, "/bin/zsh").unwrap();
@@ -2834,6 +2996,7 @@ mod tests {
             program: "codex".to_string(),
             args: vec!["resume".to_string(), "sid".to_string()],
             current_dir: None,
+            remote: None,
         };
 
         let configured = configured_resume_command_for_shell(&target, "/bin/bash").unwrap();
@@ -2866,7 +3029,7 @@ mod tests {
         session_id: &str,
         source: SourceKind,
     ) -> MessageRecord {
-        MessageRecord {
+        test_record(MessageRecord {
             timestamp: ts.map(|s| s.to_string()),
             role,
             text: text.to_string(),
@@ -2877,8 +3040,12 @@ mod tests {
             cwd: None,
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source,
-        }
+        })
     }
 
     #[test]
@@ -3013,26 +3180,8 @@ mod tests {
                 SourceKind::ClaudeProjectJsonl,
             ),
         ];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: "needle".to_string(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "needle".to_string();
 
         app.update_results();
         assert_eq!(app.filtered.len(), 1);
@@ -3086,8 +3235,11 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            cache_path: None,
             show_telemetry: false,
             last_bgcolor_target: None,
+            ui_tags: config::UiTagConfig::default(),
+            remotes: HashMap::new(),
         };
 
         app.update_results();
@@ -3105,31 +3257,13 @@ mod tests {
             "a",
             SourceKind::CodexSessionJsonl,
         )];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: "needle".to_string(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "needle".to_string();
 
         app.update_results();
         let doc = app.build_preview_doc();
-        assert_eq!(doc.first_match_line, 8);
-        assert_eq!(app.preview_scroll, 6);
+        assert_eq!(doc.first_match_line, 12);
+        assert_eq!(app.preview_scroll, 10);
     }
 
     #[test]
@@ -3167,8 +3301,11 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            cache_path: None,
             show_telemetry: false,
             last_bgcolor_target: None,
+            ui_tags: config::UiTagConfig::default(),
+            remotes: HashMap::new(),
         };
 
         app.update_results();
@@ -3241,7 +3378,7 @@ mod tests {
     #[test]
     fn build_opencode_session_pager_text_includes_whole_session() {
         let all = vec![
-            MessageRecord {
+            test_record(MessageRecord {
                 timestamp: Some("2026-02-10T00:00:01Z".to_string()),
                 role: Role::User,
                 text: "session opener".to_string(),
@@ -3252,9 +3389,13 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 phase: Some("title".to_string()),
                 images: Vec::new(),
+                machine_id: String::new(),
+                machine_name: String::new(),
+                project_slug: None,
+                origin: String::new(),
                 source: SourceKind::OpenCodeSession,
-            },
-            MessageRecord {
+            }),
+            test_record(MessageRecord {
                 timestamp: Some("2026-02-10T00:00:02Z".to_string()),
                 role: Role::Assistant,
                 text: "assistant reply".to_string(),
@@ -3265,8 +3406,12 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 phase: Some("orchestrator".to_string()),
                 images: Vec::new(),
+                machine_id: String::new(),
+                machine_name: String::new(),
+                project_slug: None,
+                origin: String::new(),
                 source: SourceKind::OpenCodeSession,
-            },
+            }),
         ];
         let (sessions, session_records) = build_session_index(&all);
         let mut app = empty_app();
@@ -3298,7 +3443,7 @@ mod tests {
 
     #[test]
     fn materialize_record_images_returns_file_urls() {
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::User,
             text: "image".to_string(),
@@ -3315,8 +3460,12 @@ mod tests {
                 },
                 label: Some("inline".to_string()),
             }],
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
+        });
 
         let rendered = materialize_record_images(&rec);
         assert_eq!(rendered.len(), 1);
@@ -3344,26 +3493,8 @@ mod tests {
             "a",
             SourceKind::CodexSessionJsonl,
         )];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: String::new(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 1,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.preview_scroll = 1;
 
         app.scroll_preview_lines(-10);
         assert_eq!(app.preview_scroll, 0);
@@ -3378,30 +3509,12 @@ mod tests {
             "a",
             SourceKind::CodexSessionJsonl,
         )];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: String::new(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![SessionHit {
-                session_idx: 0,
-                matched_record_idx: None,
-                hit_count: 0,
-            }],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.filtered = vec![SessionHit {
+            session_idx: 0,
+            matched_record_idx: None,
+            hit_count: 0,
+        }];
 
         route_mouse(
             &mut app,
@@ -3450,47 +3563,29 @@ mod tests {
                 SourceKind::CodexSessionJsonl,
             ),
         ];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: String::new(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![
-                SessionHit {
-                    session_idx: 0,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-                SessionHit {
-                    session_idx: 1,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-                SessionHit {
-                    session_idx: 2,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-                SessionHit {
-                    session_idx: 3,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-            ],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: false,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.filtered = vec![
+            SessionHit {
+                session_idx: 0,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+            SessionHit {
+                session_idx: 1,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+            SessionHit {
+                session_idx: 2,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+            SessionHit {
+                session_idx: 3,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+        ];
 
         route_mouse(
             &mut app,
@@ -3524,37 +3619,20 @@ mod tests {
                 SourceKind::CodexSessionJsonl,
             ),
         ];
-        let (sessions, session_records) = build_session_index(&all);
-        let mut app = App {
-            query: String::new(),
-            max_results: 0,
-            all,
-            sessions,
-            session_records,
-            filtered: vec![
-                SessionHit {
-                    session_idx: 0,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-                SessionHit {
-                    session_idx: 1,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                },
-            ],
-            selected: 0,
-            offset: 0,
-            preview_scroll: 0,
-            preview_scroll_reset_pending: false,
-            last_query: String::new(),
-            last_results: vec![],
-            indexing: IndexingProgress::default(),
-            ready: true,
-            telemetry_log_path: None,
-            show_telemetry: true,
-            last_bgcolor_target: None,
-        };
+        let mut app = ready_app_with_indexed_data(all);
+        app.filtered = vec![
+            SessionHit {
+                session_idx: 0,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+            SessionHit {
+                session_idx: 1,
+                matched_record_idx: None,
+                hit_count: 0,
+            },
+        ];
+        app.show_telemetry = true;
 
         route_mouse(
             &mut app,
@@ -3582,8 +3660,12 @@ mod tests {
             cwd: Some("/tmp/proj".to_string()),
             dir: "proj".to_string(),
             first_line: "session opener".to_string(),
+            machine_id: "local".to_string(),
+            machine_name: "local".to_string(),
+            origin: "local".to_string(),
+            project_slug: Some("proj".to_string()),
         };
-        let rec = MessageRecord {
+        let rec = test_record(MessageRecord {
             timestamp: None,
             role: Role::Assistant,
             text: "this contains the matching context".to_string(),
@@ -3594,13 +3676,30 @@ mod tests {
             cwd: None,
             phase: None,
             images: Vec::new(),
+            machine_id: String::new(),
+            machine_name: String::new(),
+            project_slug: None,
+            origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
-        };
+        });
 
-        let line = result_line(&sess, Some(&rec), 3);
-        assert!(line.contains("session opener"));
-        assert!(line.contains("matching context"));
-        assert!(line.contains("[3 hits]"));
+        let line = result_line(
+            &sess,
+            Some(&rec),
+            3,
+            "",
+            &config::UiTagConfig::default(),
+            Style::default(),
+            Style::default(),
+        );
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("session opener"));
+        assert!(rendered.contains("matching context"));
+        assert!(rendered.contains("[3 hits]"));
     }
 
     #[test]
@@ -3652,8 +3751,11 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            cache_path: None,
             show_telemetry: false,
             last_bgcolor_target: None,
+            ui_tags: config::UiTagConfig::default(),
+            remotes: HashMap::new(),
         };
 
         assert_eq!(selected_bgcolor_target(&app), Some("/tmp/project-a"));

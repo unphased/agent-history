@@ -1,47 +1,87 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "agent-history")]
 #[command(
-    about = "Codex/Claude/OpenCode の会話履歴を検索するTUI",
+    about = "Search Codex/Claude/OpenCode history locally and across imported remote caches",
     long_about = None
 )]
 #[command(version)]
-pub struct Args {
-    /// 追加の検索ルート（再帰）。複数指定可。
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    Refresh(RefreshArgs),
+    Export(ExportArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ScanArgs {
+    /// Additional search roots (recursive). Can be repeated.
     #[arg(long = "root", value_name = "PATH")]
     pub roots: Vec<PathBuf>,
 
-    /// デフォルト検索ルート（~/.codex, ~/.codex-*, ~/.claude, ~/.claude-* など）を無効化
+    /// Disable default search roots such as ~/.codex and ~/.claude
     #[arg(long)]
     pub no_default_roots: bool,
 
-    /// 追加で ~/.codex/history.jsonl も取り込む（簡易フォーマット）
+    /// Include ~/.codex/history.jsonl as well
     #[arg(long = "history")]
     pub include_history: bool,
 
-    /// 起動時クエリ
-    #[arg(long, short = 'q', value_name = "QUERY")]
-    pub query: Option<String>,
-
-    /// 結果表示の上限（0で無制限）
-    #[arg(long, default_value_t = 5000)]
-    pub max_results: usize,
-
-    /// 永続キャッシュを使わず毎回フルスキャンする
+    /// Ignore the persistent cache and do a full scan
     #[arg(long)]
     pub no_cache: bool,
 
-    /// 永続キャッシュを破棄して再構築する
+    /// Rebuild the persistent cache from scratch
     #[arg(long)]
     pub rebuild_index: bool,
 
-    /// イベント/メトリクスのJSONLログ出力先
+    /// JSONL log output path for events/metrics
     #[arg(long, value_name = "PATH")]
     pub telemetry_log: Option<PathBuf>,
 
-    /// イベント/メトリクスのJSONLログを無効化する
+    /// Disable the events/metrics log
     #[arg(long)]
     pub no_telemetry: bool,
+
+    /// Optional config path
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub scan: ScanArgs,
+
+    /// Query to run on startup
+    #[arg(long, short = 'q', value_name = "QUERY")]
+    pub query: Option<String>,
+
+    /// Max number of results shown (0 = unlimited)
+    #[arg(long, default_value_t = 5000)]
+    pub max_results: usize,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RefreshArgs {
+    #[command(flatten)]
+    pub scan: ScanArgs,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ExportArgs {
+    #[command(flatten)]
+    pub scan: ScanArgs,
+
+    #[arg(long, default_value = "ndjson", value_parser = ["ndjson"])]
+    pub format: String,
 }
