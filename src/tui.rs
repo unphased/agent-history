@@ -29,7 +29,7 @@ use std::{
     cmp,
     collections::HashMap,
     env, fs,
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -53,6 +53,7 @@ struct SessionSummary {
     account: Option<String>,
     first_user_idx: usize,
     last_ts: Option<String>,
+    cwd: Option<String>,
     dir: String,
     first_line: String,
 }
@@ -169,6 +170,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 account: key.account.map(|s| s.to_string()),
                 first_user_idx,
                 last_ts: agg.last_ts.map(|s| s.to_string()),
+                cwd: agg.cwd.map(|s| s.to_string()),
                 dir: dir_name_from_cwd(
                     agg.cwd
                         .or_else(|| all[first_user_idx].cwd.as_deref())
@@ -872,6 +874,7 @@ struct App {
     ready: bool,
     telemetry_log_path: Option<PathBuf>,
     show_telemetry: bool,
+    last_bgcolor_target: Option<String>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -932,12 +935,15 @@ fn run_app(
                 .unwrap_or_else(telemetry::default_log_path)
         }),
         show_telemetry: false,
+        last_bgcolor_target: None,
     };
 
     loop {
         while let Ok(ev) = rx.try_recv() {
             handle_indexer_event(&mut app, ev);
         }
+
+        sync_terminal_bgcolor(terminal, &mut app);
 
         terminal.draw(|f| ui(f, &mut app)).context("描画に失敗")?;
 
@@ -1016,7 +1022,7 @@ fn handle_key(
         return Ok(true);
     }
 
-    // インデックス作成中でもクエリ入力だけは先に受け付ける
+    // Accept query input even while indexing is still in progress.
     match key.code {
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.scroll_preview_lines(-1);
@@ -1121,6 +1127,60 @@ fn handle_key(
     }
 
     Ok(false)
+}
+
+fn selected_bgcolor_target(app: &App) -> Option<&str> {
+    let hit = app.selected_hit()?;
+    let session = app.sessions.get(hit.session_idx)?;
+    session.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty())
+}
+
+fn emit_terminal_bgcolor_for_path(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let Some(home) = env::var_os("HOME") else {
+        return Ok(());
+    };
+    let script = PathBuf::from(home).join("util/bgcolor.sh");
+    if !script.is_file() {
+        return Ok(());
+    }
+
+    let output = Command::new(script)
+        .arg("--format=osc11")
+        .arg(path)
+        .output()
+        .context("failed to resolve terminal background color")?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(());
+    }
+
+    terminal
+        .backend_mut()
+        .write_all(&output.stdout)
+        .context("failed to emit terminal background escape sequence")?;
+    terminal
+        .backend_mut()
+        .flush()
+        .context("failed to flush terminal background escape sequence")?;
+    Ok(())
+}
+
+fn sync_terminal_bgcolor(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) {
+    let target = selected_bgcolor_target(app).map(str::to_owned);
+    if target == app.last_bgcolor_target {
+        return;
+    }
+
+    if let Some(path) = target.as_deref() {
+        if let Err(err) = emit_terminal_bgcolor_for_path(terminal, path) {
+            app.indexing.last_warn = Some(format!("bgcolor update failed: {err}"));
+            return;
+        }
+    }
+
+    app.last_bgcolor_target = target;
 }
 
 fn app_panes(area: Rect) -> (Rect, Rect) {
@@ -1864,7 +1924,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(keys, footer[1]);
 
-    // 選択行の強調（簡易：結果ペインを上書き）
+    // Highlight the selected row by overdrawing it in the results pane.
     if total > 0 && inner_height > 0 && app.selected >= visible_start && app.selected < visible_end
     {
         let y = (app.selected - visible_start) as u16;
@@ -2240,6 +2300,7 @@ mod tests {
             ready: false,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         }
     }
 
@@ -2280,6 +2341,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2388,6 +2450,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2435,6 +2498,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2475,6 +2539,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2519,6 +2584,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         let target = resume_target_for_record(&app, &rec).unwrap();
@@ -2671,14 +2737,14 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(records.len(), 2);
 
-        // 最新の会話が先頭
+        // The most recent session comes first.
         assert_eq!(sessions[0].session_id, "b");
         assert_eq!(sessions[0].source, SourceKind::ClaudeProjectJsonl);
         assert_eq!(all[sessions[0].first_user_idx].role, Role::User);
         assert_eq!(all[sessions[0].first_user_idx].text, "yo");
         assert_eq!(records[0].len(), 2);
 
-        // 2つ目の会話
+        // The second session follows.
         assert_eq!(sessions[1].session_id, "a");
         assert_eq!(sessions[1].source, SourceKind::CodexSessionJsonl);
         assert_eq!(all[sessions[1].first_user_idx].role, Role::User);
@@ -2777,6 +2843,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         app.update_results();
@@ -2832,6 +2899,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         app.update_results();
@@ -2867,6 +2935,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         app.update_results();
@@ -2911,6 +2980,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         app.update_results();
@@ -3104,6 +3174,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         app.scroll_preview_lines(-10);
@@ -3141,6 +3212,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         route_mouse(
@@ -3229,6 +3301,7 @@ mod tests {
             ready: true,
             telemetry_log_path: None,
             show_telemetry: false,
+            last_bgcolor_target: None,
         };
 
         route_mouse(
@@ -3253,6 +3326,7 @@ mod tests {
             account: None,
             first_user_idx: 0,
             last_ts: Some("2026-02-10T00:00:00Z".to_string()),
+            cwd: Some("/tmp/proj".to_string()),
             dir: "proj".to_string(),
             first_line: "session opener".to_string(),
         };
@@ -3274,6 +3348,62 @@ mod tests {
         assert!(line.contains("session opener"));
         assert!(line.contains("matching context"));
         assert!(line.contains("[3 hits]"));
+    }
+
+    #[test]
+    fn selected_bgcolor_target_uses_selected_session_cwd() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::User,
+                "second",
+                "b",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let (mut sessions, session_records) = build_session_index(&all);
+        sessions[0].cwd = Some("/tmp/project-b".to_string());
+        sessions[1].cwd = Some("/tmp/project-a".to_string());
+
+        let app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![
+                SessionHit {
+                    session_idx: 0,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+                SessionHit {
+                    session_idx: 1,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+            ],
+            selected: 1,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            telemetry_log_path: None,
+            show_telemetry: false,
+            last_bgcolor_target: None,
+        };
+
+        assert_eq!(selected_bgcolor_target(&app), Some("/tmp/project-a"));
     }
 
     #[test]
