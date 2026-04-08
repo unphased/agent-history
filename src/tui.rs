@@ -1270,19 +1270,24 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     let (results_area, preview_area) = app_panes(area);
     let preview_line_step = 3;
     let results_line_step = 1;
+    let preview_hit_area = if app.show_telemetry {
+        area
+    } else {
+        preview_area
+    };
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if point_in_rect(mouse.column, mouse.row, preview_area) {
+            if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(-preview_line_step);
-            } else if point_in_rect(mouse.column, mouse.row, results_area) {
+            } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(-results_line_step);
             }
         }
         MouseEventKind::ScrollDown => {
-            if point_in_rect(mouse.column, mouse.row, preview_area) {
+            if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(preview_line_step);
-            } else if point_in_rect(mouse.column, mouse.row, results_area) {
+            } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(results_line_step);
             }
         }
@@ -3499,6 +3504,71 @@ mod tests {
         );
 
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn mouse_wheel_over_left_side_does_not_move_selection_in_events_view() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::User,
+                "second",
+                "b",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let (sessions, session_records) = build_session_index(&all);
+        let mut app = App {
+            query: String::new(),
+            max_results: 0,
+            all,
+            sessions,
+            session_records,
+            filtered: vec![
+                SessionHit {
+                    session_idx: 0,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+                SessionHit {
+                    session_idx: 1,
+                    matched_record_idx: None,
+                    hit_count: 0,
+                },
+            ],
+            selected: 0,
+            offset: 0,
+            preview_scroll: 0,
+            preview_scroll_reset_pending: false,
+            last_query: String::new(),
+            last_results: vec![],
+            indexing: IndexingProgress::default(),
+            ready: true,
+            telemetry_log_path: None,
+            show_telemetry: true,
+            last_bgcolor_target: None,
+        };
+
+        route_mouse(
+            &mut app,
+            Rect::new(0, 0, 100, 30),
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.preview_scroll, 3);
     }
 
     #[test]
