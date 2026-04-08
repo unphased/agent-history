@@ -1082,14 +1082,30 @@ fn handle_key(
                     Some(target) => {
                         let sid = rec.session_id.as_deref().unwrap_or("");
                         let status = run_with_tui_suspended(terminal, || {
-                            let mut cmd = configured_resume_command(&target);
+                            let configured = configured_resume_command(&target)?;
+                            let cleanup_dir = configured.zdotdir_cleanup.clone();
+                            let mut cmd = configured.command;
 
                             for line in resume_loading_lines(&target, sid) {
                                 eprintln!("{line}");
                             }
 
-                            let mut child = cmd.spawn().context("プロセス起動に失敗しました")?;
-                            child.wait().context("プロセス待機に失敗しました")
+                            let mut child = match cmd.spawn() {
+                                Ok(child) => child,
+                                Err(err) => {
+                                    if let Some(dir) = cleanup_dir {
+                                        let _ = fs::remove_dir_all(dir);
+                                    }
+                                    return Err(err).context("failed to start resume shell");
+                                }
+                            };
+                            let status = child
+                                .wait()
+                                .context("failed while waiting for resume shell")?;
+                            if let Some(dir) = cleanup_dir {
+                                let _ = fs::remove_dir_all(dir);
+                            }
+                            Ok(status)
                         });
 
                         match status {
@@ -2102,6 +2118,12 @@ struct ResumeTarget {
     current_dir: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct ConfiguredResumeCommand {
+    command: Command,
+    zdotdir_cleanup: Option<PathBuf>,
+}
+
 const AGENT_HISTORY_RETURN_HINT_TEXT: &str = "[exit to agent-history]";
 
 fn resume_command_string(target: &ResumeTarget) -> String {
@@ -2111,11 +2133,84 @@ fn resume_command_string(target: &ResumeTarget) -> String {
     parts.join(" ")
 }
 
-fn configured_resume_command(target: &ResumeTarget) -> Command {
-    let shell = env::var("SHELL")
+fn shell_program() -> String {
+    env::var("SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "/bin/zsh".to_string());
+        .unwrap_or_else(|| "/bin/zsh".to_string())
+}
+
+fn shell_uses_zsh(shell: &str) -> bool {
+    Path::new(shell).file_name().and_then(|name| name.to_str()) == Some("zsh")
+}
+
+fn write_agent_history_zsh_bootstrap(dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create zsh bootstrap dir: {}", dir.display()))?;
+
+    fs::write(
+        dir.join(".zshenv"),
+        "if [[ -r \"$HOME/.zshenv\" ]]; then\n  source \"$HOME/.zshenv\"\nfi\n",
+    )
+    .with_context(|| format!("failed to write {}", dir.join(".zshenv").display()))?;
+    fs::write(
+        dir.join(".zprofile"),
+        "if [[ -r \"$HOME/.zprofile\" ]]; then\n  source \"$HOME/.zprofile\"\nfi\n",
+    )
+    .with_context(|| format!("failed to write {}", dir.join(".zprofile").display()))?;
+    fs::write(
+        dir.join(".zlogin"),
+        "if [[ -r \"$HOME/.zlogin\" ]]; then\n  source \"$HOME/.zlogin\"\nfi\n",
+    )
+    .with_context(|| format!("failed to write {}", dir.join(".zlogin").display()))?;
+
+    let zshrc = r#"if [[ -r "$HOME/.zshrc" ]]; then
+  source "$HOME/.zshrc"
+fi
+
+if [[ -n "${AGENT_HISTORY_RETURN_HINT_TEXT:-}" ]]; then
+  autoload -Uz add-zsh-hook 2>/dev/null || true
+  _agent_history_prompt_precmd() {
+    emulate -L zsh
+    local hint="${AGENT_HISTORY_RETURN_HINT_TEXT:-}"
+    [[ -n "$hint" ]] || return 0
+    case "${PROMPT:-}" in
+      *"$hint"*) ;;
+      *) PROMPT="${PROMPT:-}${hint} " ;;
+    esac
+    case "${PS1:-}" in
+      *"$hint"*) ;;
+      *) PS1="${PS1:-}${hint} " ;;
+    esac
+  }
+  add-zsh-hook precmd _agent_history_prompt_precmd 2>/dev/null || true
+fi
+
+if [[ -n "${AGENT_HISTORY_PREFILL_ONCE:-}" ]]; then
+  autoload -Uz add-zle-hook-widget 2>/dev/null || true
+  _agent_history_prefill_line() {
+    emulate -L zsh
+    if [[ -n "${AGENT_HISTORY_PREFILL_ONCE:-}" ]]; then
+      BUFFER="${AGENT_HISTORY_PREFILL_ONCE}"
+      CURSOR=${#BUFFER}
+      unset AGENT_HISTORY_PREFILL_ONCE
+    fi
+    add-zle-hook-widget -d line-init _agent_history_prefill_line 2>/dev/null || true
+  }
+  add-zle-hook-widget line-init _agent_history_prefill_line 2>/dev/null || true
+fi
+"#;
+
+    fs::write(dir.join(".zshrc"), zshrc)
+        .with_context(|| format!("failed to write {}", dir.join(".zshrc").display()))?;
+
+    Ok(())
+}
+
+fn configured_resume_command_for_shell(
+    target: &ResumeTarget,
+    shell: &str,
+) -> anyhow::Result<ConfiguredResumeCommand> {
     let mut cmd = Command::new(shell);
     cmd.arg("-il");
     if let Some(cwd) = target.current_dir.as_ref() {
@@ -2130,12 +2225,30 @@ fn configured_resume_command(target: &ResumeTarget) -> Command {
         "AGENT_HISTORY_RESUME_COMMAND",
         resume_command_string(target),
     );
-    cmd.env(
-        "PROMPT",
-        format!("$PROMPT{} ", AGENT_HISTORY_RETURN_HINT_TEXT),
-    );
-    cmd.env("PS1", format!("$PS1{} ", AGENT_HISTORY_RETURN_HINT_TEXT));
-    cmd
+    cmd.env("AGENT_HISTORY_PREFILL_ONCE", resume_command_string(target));
+
+    let zdotdir_cleanup = if shell_uses_zsh(shell) {
+        let dir = std::env::temp_dir().join(format!("agent-history-zsh-boot-{}", unix_now_nanos()));
+        write_agent_history_zsh_bootstrap(&dir)?;
+        cmd.env("ZDOTDIR", &dir);
+        Some(dir)
+    } else {
+        cmd.env(
+            "PROMPT",
+            format!("$PROMPT{} ", AGENT_HISTORY_RETURN_HINT_TEXT),
+        );
+        cmd.env("PS1", format!("$PS1{} ", AGENT_HISTORY_RETURN_HINT_TEXT));
+        None
+    };
+
+    Ok(ConfiguredResumeCommand {
+        command: cmd,
+        zdotdir_cleanup,
+    })
+}
+
+fn configured_resume_command(target: &ResumeTarget) -> anyhow::Result<ConfiguredResumeCommand> {
+    configured_resume_command_for_shell(target, &shell_program())
 }
 
 fn resume_loading_lines(target: &ResumeTarget, session_id: &str) -> Vec<String> {
@@ -2623,7 +2736,8 @@ mod tests {
             current_dir: Some(PathBuf::from("/tmp/proj dir")),
         };
 
-        let cmd = configured_resume_command(&target);
+        let configured = configured_resume_command_for_shell(&target, "/bin/zsh").unwrap();
+        let cmd = &configured.command;
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
             .get_args()
@@ -2657,10 +2771,52 @@ mod tests {
             Some(AGENT_HISTORY_RETURN_HINT_TEXT.to_string())
         );
         assert_eq!(
+            envs.get("AGENT_HISTORY_PREFILL_ONCE")
+                .and_then(|v| v.clone()),
+            Some("'codex' 'resume' 'sid'".to_string())
+        );
+        assert_eq!(
             envs.get("AGENT_HISTORY_RESUME_COMMAND")
                 .and_then(|v| v.clone()),
             Some("'codex' 'resume' 'sid'".to_string())
         );
+        let zdotdir = envs
+            .get("ZDOTDIR")
+            .and_then(|v| v.clone())
+            .expect("zsh launch should set ZDOTDIR");
+        let bootstrap = PathBuf::from(&zdotdir);
+        assert!(bootstrap.join(".zshenv").is_file());
+        assert!(bootstrap.join(".zprofile").is_file());
+        assert!(bootstrap.join(".zshrc").is_file());
+        assert!(bootstrap.join(".zlogin").is_file());
+        let zshrc = fs::read_to_string(bootstrap.join(".zshrc")).unwrap();
+        assert!(zshrc.contains("AGENT_HISTORY_RETURN_HINT_TEXT"));
+        assert!(zshrc.contains("AGENT_HISTORY_PREFILL_ONCE"));
+        assert!(zshrc.contains("add-zle-hook-widget line-init _agent_history_prefill_line"));
+        fs::remove_dir_all(bootstrap).unwrap();
+    }
+
+    #[test]
+    fn configured_resume_command_non_zsh_falls_back_to_prompt_envs() {
+        let target = ResumeTarget {
+            program: "codex".to_string(),
+            args: vec!["resume".to_string(), "sid".to_string()],
+            current_dir: None,
+        };
+
+        let configured = configured_resume_command_for_shell(&target, "/bin/bash").unwrap();
+        let envs: std::collections::HashMap<String, Option<String>> = configured
+            .command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(envs.get("ZDOTDIR").and_then(|v| v.clone()), None);
         assert_eq!(
             envs.get("PROMPT").and_then(|v| v.clone()),
             Some("$PROMPT[exit to agent-history] ".to_string())
