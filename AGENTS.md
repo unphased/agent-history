@@ -1,5 +1,6 @@
 # AGENTS.md
-Always respond in English.
+Always respond in English. Any time we edit stuff, translate surrounding comments into english. I am an english speaker
+who forked this project written by a Japanese author.
 Disregard cost and time, and always strive to create the simplest and best possible solution.
 Aim for the simplest possible specification that fulfills the request.
 
