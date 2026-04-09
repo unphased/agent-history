@@ -75,4 +75,3 @@ pub struct RefreshArgs {
     #[command(flatten)]
     pub scan: ScanArgs,
 }
-
