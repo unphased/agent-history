@@ -1,6 +1,6 @@
 use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind};
 use anyhow::Context as _;
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, Row, Transaction, params};
 use std::{
     collections::HashMap,
     env, fs,
@@ -156,11 +156,11 @@ impl CacheStore {
         Ok(out)
     }
 
-    pub fn load_local_records(&self) -> anyhow::Result<Vec<MessageRecord>> {
-        self.load_records_for_origin("local")
-    }
-
-    pub fn load_records_for_origin(&self, origin: &str) -> anyhow::Result<Vec<MessageRecord>> {
+    fn stream_records_for_origin(
+        &self,
+        origin: &str,
+        mut visit: impl FnMut(MessageRecord) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let mut stmt = self
             .conn
             .prepare(
@@ -168,31 +168,13 @@ impl CacheStore {
                  FROM message_records WHERE origin = ?1 ORDER BY unit_key, ord",
             )
             .context("cache origin record query failed")?;
-        let rows = stmt.query_map(params![origin], |row| {
-            Ok(MessageRecord {
-                timestamp: row.get(0)?,
-                role: role_from_db(row.get::<_, i64>(1)?),
-                text: row.get(2)?,
-                file: PathBuf::from(row.get::<_, String>(3)?),
-                line: row.get::<_, i64>(4)? as u32,
-                session_id: row.get(5)?,
-                account: row.get(6)?,
-                cwd: row.get(7)?,
-                phase: row.get(8)?,
-                images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
-                    .unwrap_or_default(),
-                source: source_from_db(row.get::<_, i64>(10)?),
-                machine_id: row.get(11)?,
-                machine_name: row.get(12)?,
-                project_slug: row.get(13)?,
-                origin: row.get(14)?,
-            })
-        })?;
-        let mut out = Vec::new();
+        let rows = stmt
+            .query_map(params![origin], |row| decode_message_record_row(row, None))
+            .context("cache origin record query failed")?;
         for row in rows {
-            out.push(row?);
+            visit(row?)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn replace_unit(
@@ -489,26 +471,7 @@ pub fn load_records_from_remote_db(
              FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord",
         )
         .context("remote cache record query failed")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(MessageRecord {
-            timestamp: row.get(0)?,
-            role: role_from_db(row.get::<_, i64>(1)?),
-            text: row.get(2)?,
-            file: PathBuf::from(row.get::<_, String>(3)?),
-            line: row.get::<_, i64>(4)? as u32,
-            session_id: row.get(5)?,
-            account: row.get(6)?,
-            cwd: row.get(7)?,
-            phase: row.get(8)?,
-            images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
-                .unwrap_or_default(),
-            source: source_from_db(row.get::<_, i64>(10)?),
-            machine_id: row.get(11)?,
-            machine_name: row.get(12)?,
-            project_slug: row.get(13)?,
-            origin: origin.to_string(),
-        })
-    })?;
+    let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -516,24 +479,83 @@ pub fn load_records_from_remote_db(
     Ok(out)
 }
 
+pub fn stream_all_with_remotes(
+    store: &CacheStore,
+    mut visit: impl FnMut(MessageRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    store.stream_records_for_origin("local", &mut visit)?;
+
+    let dir = store.remotes_db_dir();
+    if !dir.is_dir() {
+        return Ok(());
+    }
+
+    let mut remote_entries: Vec<_> = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    remote_entries.sort();
+
+    for remote_dir in remote_entries {
+        let db_path = remote_dir.join("index.sqlite");
+        if !db_path.exists() {
+            continue;
+        }
+        let origin = remote_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        stream_records_from_remote_db(&db_path, &origin, &mut visit)?;
+    }
+    Ok(())
+}
+
+pub fn stream_records_from_remote_db(
+    db_path: &Path,
+    origin: &str,
+    mut visit: impl FnMut(MessageRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("remote cache open failed: {}", db_path.display()))?;
+
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap_or(0);
+    if version != SCHEMA_VERSION {
+        anyhow::bail!(
+            "remote cache schema mismatch: expected {SCHEMA_VERSION}, got {version} ({})",
+            db_path.display()
+        );
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug
+             FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord",
+        )
+        .context("remote cache record query failed")?;
+    let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
+    for row in rows {
+        visit(row?)?;
+    }
+    Ok(())
+}
+
 /// Load all local records from the main cache plus records from all remote DBs in the remotes dir.
 pub fn load_all_with_remotes(store: &CacheStore) -> anyhow::Result<Vec<MessageRecord>> {
-    let mut all = store.load_local_records()?;
-    let dir = store.remotes_db_dir();
-    if dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let db_path = entry.path().join("index.sqlite");
-                if db_path.exists() {
-                    let origin = entry.file_name().to_string_lossy().to_string();
-                    match load_records_from_remote_db(&db_path, &origin) {
-                        Ok(records) => all.extend(records),
-                        Err(_) => {} // silently skip broken remote DBs
-                    }
-                }
-            }
-        }
-    }
+    let mut all = Vec::new();
+    stream_all_with_remotes(store, |record| {
+        all.push(record);
+        Ok(())
+    })?;
     Ok(all)
 }
 
@@ -595,6 +617,30 @@ fn source_from_db(value: i64) -> SourceKind {
         2 => SourceKind::ClaudeProjectJsonl,
         _ => SourceKind::OpenCodeSession,
     }
+}
+
+fn decode_message_record_row(row: &Row<'_>, origin_override: Option<&str>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        timestamp: row.get(0)?,
+        role: role_from_db(row.get::<_, i64>(1)?),
+        text: row.get(2)?,
+        file: PathBuf::from(row.get::<_, String>(3)?),
+        line: row.get::<_, i64>(4)? as u32,
+        session_id: row.get(5)?,
+        account: row.get(6)?,
+        cwd: row.get(7)?,
+        phase: row.get(8)?,
+        images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
+            .unwrap_or_default(),
+        source: source_from_db(row.get::<_, i64>(10)?),
+        machine_id: row.get(11)?,
+        machine_name: row.get(12)?,
+        project_slug: row.get(13)?,
+        origin: match origin_override {
+            Some(origin) => origin.to_string(),
+            None => row.get(14)?,
+        },
+    })
 }
 
 #[cfg(test)]

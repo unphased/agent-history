@@ -10,7 +10,7 @@ use std::{
     collections::{HashSet, VecDeque},
     env,
     fs::{self, File},
-    io::{self, BufRead as _, BufReader},
+    io::{self, BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
@@ -181,22 +181,31 @@ pub fn export_records(args: ExportArgs) -> anyhow::Result<()> {
     sync_remotes_from_args_with_cache_path(&sync_args, &tx, &cache_plan.db_path)?;
 
     let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
-    let mut records = cache::load_all_with_remotes(&store)?;
-    if let Some(query) = args
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    let compiled_query = args
         .query
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        let compiled = search::CompiledQuery::new(query);
-        records.retain(|record| compiled.matches_record(record));
-    }
-
-    let stdout = io::stdout();
-    let mut lock = stdout.lock();
+        .map(search::CompiledQuery::new);
+    let mut rows_written = 0usize;
     match args.format {
-        ExportFormat::Tsv => write_records_as_tsv(&mut lock, &records)?,
+        ExportFormat::Tsv => cache::stream_all_with_remotes(&store, |record| {
+            if let Some(compiled) = compiled_query.as_ref()
+                && !compiled.matches_record(&record)
+            {
+                return Ok(());
+            }
+            write_record_as_tsv(&mut lock, &record)?;
+            rows_written = rows_written.saturating_add(1);
+            if rows_written == 1 || rows_written.is_multiple_of(128) {
+                lock.flush()?;
+            }
+            Ok(())
+        })?,
     }
+    lock.flush()?;
     Ok(())
 }
 
@@ -575,27 +584,33 @@ impl Drop for ExportCachePlan {
     }
 }
 
+#[cfg(test)]
 fn write_records_as_tsv(mut out: impl io::Write, records: &[MessageRecord]) -> anyhow::Result<()> {
     for record in records {
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            tsv_field(record.timestamp.as_deref().unwrap_or("")),
-            source_name(record.source),
-            tsv_field(record.account.as_deref().unwrap_or("")),
-            tsv_field(record.origin.as_str()),
-            tsv_field(record.machine_name.as_str()),
-            tsv_field(record.machine_id.as_str()),
-            tsv_field(record.project_slug.as_deref().unwrap_or("")),
-            tsv_field(record.session_id.as_deref().unwrap_or("")),
-            role_name(record.role),
-            tsv_field(record.phase.as_deref().unwrap_or("")),
-            tsv_field(record.cwd.as_deref().unwrap_or("")),
-            tsv_field(&record.file.to_string_lossy()),
-            record.line,
-            tsv_field(record.text.as_str()),
-        )?;
+        write_record_as_tsv(&mut out, record)?;
     }
+    Ok(())
+}
+
+fn write_record_as_tsv(mut out: impl io::Write, record: &MessageRecord) -> anyhow::Result<()> {
+    writeln!(
+        out,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        tsv_field(record.timestamp.as_deref().unwrap_or("")),
+        source_name(record.source),
+        tsv_field(record.account.as_deref().unwrap_or("")),
+        tsv_field(record.origin.as_str()),
+        tsv_field(record.machine_name.as_str()),
+        tsv_field(record.machine_id.as_str()),
+        tsv_field(record.project_slug.as_deref().unwrap_or("")),
+        tsv_field(record.session_id.as_deref().unwrap_or("")),
+        role_name(record.role),
+        tsv_field(record.phase.as_deref().unwrap_or("")),
+        tsv_field(record.cwd.as_deref().unwrap_or("")),
+        tsv_field(&record.file.to_string_lossy()),
+        record.line,
+        tsv_field(record.text.as_str()),
+    )?;
     Ok(())
 }
 
