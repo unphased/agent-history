@@ -78,9 +78,7 @@ impl AppConfig {
 }
 
 pub fn load_config(path: Option<&Path>) -> anyhow::Result<AppConfig> {
-    let path = path
-        .map(PathBuf::from)
-        .unwrap_or_else(default_config_path);
+    let path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
     if !path.exists() {
         return Ok(AppConfig::default());
     }

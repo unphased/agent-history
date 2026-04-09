@@ -334,8 +334,9 @@ impl CacheStore {
         error: &str,
         duration_ms: i64,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO remote_sync_state (
+        self.conn
+            .execute(
+                "INSERT INTO remote_sync_state (
                 remote_name, host, last_attempted_ms, last_duration_ms, last_error
             ) VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(remote_name) DO UPDATE SET
@@ -343,8 +344,9 @@ impl CacheStore {
                 last_attempted_ms=excluded.last_attempted_ms,
                 last_duration_ms=excluded.last_duration_ms,
                 last_error=excluded.last_error",
-            params![remote_name, host, unix_now() as i64, duration_ms, error],
-        ).context("remote sync failure upsert failed")?;
+                params![remote_name, host, unix_now() as i64, duration_ms, error],
+            )
+            .context("remote sync failure upsert failed")?;
         Ok(())
     }
 
@@ -551,10 +553,7 @@ pub fn load_all_with_remotes(store: &CacheStore) -> anyhow::Result<Vec<MessageRe
             for entry in entries.flatten() {
                 let db_path = entry.path().join("index.sqlite");
                 if db_path.exists() {
-                    let origin = entry
-                        .file_name()
-                        .to_string_lossy()
-                        .to_string();
+                    let origin = entry.file_name().to_string_lossy().to_string();
                     match load_records_from_remote_db(&db_path, &origin) {
                         Ok(records) => all.extend(records),
                         Err(_) => {} // silently skip broken remote DBs

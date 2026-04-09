@@ -1,6 +1,6 @@
 mod args;
-mod config;
 mod cache;
+mod config;
 mod indexer;
 mod search;
 mod telemetry;

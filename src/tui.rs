@@ -1,7 +1,6 @@
 use crate::{
     args::RunArgs,
-    cache,
-    config,
+    cache, config,
     indexer::{
         ImageAttachment, ImageAttachmentKind, IndexerEvent, MessageRecord, Role, SourceKind,
     },
@@ -198,10 +197,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 session_id: key.session_id.to_string(),
                 account: key.account.map(|s| s.to_string()),
                 machine_id: key.machine_id.to_string(),
-                machine_name: agg
-                    .machine_name
-                    .unwrap_or(key.machine_id)
-                    .to_string(),
+                machine_name: agg.machine_name.unwrap_or(key.machine_id).to_string(),
                 origin: key.origin.to_string(),
                 project_slug: agg.project_slug.map(|s| s.to_string()),
                 first_user_idx,
@@ -560,7 +556,10 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
 }
 
 fn tag_style(bg: Color) -> Style {
-    Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Black)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
@@ -584,7 +583,10 @@ fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
         spans.push(Span::raw(" "));
     }
     if tags.show_project
-        && let Some(project) = sess.project_slug.as_deref().filter(|s| !s.trim().is_empty())
+        && let Some(project) = sess
+            .project_slug
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
     {
         spans.push(Span::styled(
             format!(" {project} "),
@@ -631,14 +633,23 @@ fn result_line(
     base_style: Style,
     match_style: Style,
 ) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = session_tag_spans(sess, ui_tags);
-    let text_line = highlighted_line(
-        &result_line_text(sess, matched, hit_count),
-        query,
-        base_style,
-        match_style,
-    );
-    spans.extend(text_line.spans);
+    let full_text = result_line_text(sess, matched, hit_count);
+    let ts = short_ts(sess.last_ts.as_deref());
+    let rest = full_text
+        .strip_prefix(&ts)
+        .unwrap_or(&full_text)
+        .trim_start();
+    let tag_spans = session_tag_spans(sess, ui_tags);
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(ts, base_style)];
+    if !rest.is_empty() || !tag_spans.is_empty() {
+        spans.push(Span::styled(" ".to_string(), base_style));
+    }
+    spans.extend(tag_spans);
+    if !rest.is_empty() {
+        let text_line = highlighted_line(rest, query, base_style, match_style);
+        spans.extend(text_line.spans);
+    }
     Line::from(spans)
 }
 
@@ -1020,12 +1031,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("raw modeの有効化に失敗")?;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )
-    .context("画面切替に失敗")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("画面切替に失敗")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal初期化に失敗")?;
@@ -1077,7 +1083,8 @@ fn run_app(
         indexing: IndexingProgress::default(),
         ready: false,
         telemetry_log_path: (!args.scan.no_telemetry).then(|| {
-            args.scan.telemetry_log
+            args.scan
+                .telemetry_log
                 .clone()
                 .unwrap_or_else(telemetry::default_log_path)
         }),
@@ -2003,19 +2010,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let status_height: u16 = if app.show_telemetry { 6 } else { 3 };
         let main = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(
-                if app.show_telemetry {
-                    vec![
-                        Constraint::Length(status_height),
-                        Constraint::Min(1),
-                    ]
-                } else {
-                    vec![
-                        Constraint::Length(3),
-                        Constraint::Min(1),
-                    ]
-                },
-            )
+            .constraints(if app.show_telemetry {
+                vec![Constraint::Length(status_height), Constraint::Min(1)]
+            } else {
+                vec![Constraint::Length(3), Constraint::Min(1)]
+            })
             .split(root[1]);
 
         let pct = if app.indexing.total_files == 0 {
@@ -2050,8 +2049,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             if let Some(w) = app.indexing.last_warn.as_deref() {
                 status_lines.push(Line::raw(format!("warn: {w}")));
             }
-            let status_p = Paragraph::new(Text::from(status_lines))
-                .wrap(Wrap { trim: false });
+            let status_p = Paragraph::new(Text::from(status_lines)).wrap(Wrap { trim: false });
             f.render_widget(status_p, status_split[1]);
 
             // Events view fills remaining space
@@ -3877,6 +3875,44 @@ mod tests {
         assert!(rendered.contains("session opener"));
         assert!(rendered.contains("matching context"));
         assert!(rendered.contains("[3 hits]"));
+    }
+
+    #[test]
+    fn result_line_starts_with_timestamp_before_tags() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: Some("work".to_string()),
+            first_user_idx: 0,
+            last_ts: Some("2026-02-10T00:00:00Z".to_string()),
+            cwd: Some("/tmp/proj".to_string()),
+            dir: "proj".to_string(),
+            first_line: "session opener".to_string(),
+            machine_id: "mini".to_string(),
+            machine_name: "Mini".to_string(),
+            origin: "remote".to_string(),
+            project_slug: Some("proj".to_string()),
+        };
+
+        let line = result_line(
+            &sess,
+            None,
+            0,
+            "",
+            &config::UiTagConfig::default(),
+            Style::default(),
+            Style::default(),
+        );
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.starts_with("2026-02-10T00:00:00 "));
+        assert!(rendered.contains(" O work "));
+        assert!(rendered.contains(" Mini "));
+        assert!(rendered.contains(" proj "));
     }
 
     #[test]

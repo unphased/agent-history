@@ -167,12 +167,14 @@ pub fn refresh_local_cache(args: RefreshArgs) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, &tx).map(|_| ())
 }
 
-
 fn run_indexer_from_args(args: RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, tx)
 }
 
-fn run_indexer_from_scan_args(args: &ScanArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+fn run_indexer_from_scan_args(
+    args: &ScanArgs,
+    tx: &mpsc::Sender<IndexerEvent>,
+) -> anyhow::Result<()> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let app_config = config::load_config(args.config.as_deref())?;
     let machine = app_config.machine_identity();
@@ -354,8 +356,8 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
         }
         match refresh_and_rsync_remote(&remote) {
             Ok(local_db) => {
-                let records = cache::load_records_from_remote_db(&local_db, &remote.name)
-                    .unwrap_or_default();
+                let records =
+                    cache::load_records_from_remote_db(&local_db, &remote.name).unwrap_or_default();
                 let machine_id = records.first().map(|rec| rec.machine_id.clone());
                 let machine_name = records.first().map(|rec| rec.machine_name.clone());
                 let mut store = cache::CacheStore::open(&cache_path, false)?;
@@ -939,12 +941,7 @@ fn attach_machine_metadata(
 }
 
 fn blank_record_metadata() -> (String, String, Option<String>, String) {
-    (
-        String::new(),
-        String::new(),
-        None,
-        "local".to_string(),
-    )
+    (String::new(), String::new(), None, "local".to_string())
 }
 
 fn dir_name_from_cwd_owned(cwd: &str) -> String {
@@ -2555,8 +2552,15 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let first_events = recv_events(&rx1);
         assert!(
             first_events
@@ -2688,8 +2692,15 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let first_events = recv_events(&rx1);
         assert!(first_events.iter().any(|event| matches!(event, IndexerEvent::Done { records } if records.iter().any(|record| record.text == "hello from cache"))));
 
@@ -2720,8 +2731,15 @@ mod tests {
         let cfg = basic_cfg_for_jsonl(&jsonl);
 
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let _ = recv_events(&rx1);
 
         let (tx2, rx2) = mpsc::channel();
@@ -2785,8 +2803,15 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2857,8 +2882,15 @@ mod tests {
 
         let cfg = basic_cfg_for_opencode(&storage);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let _ = recv_events(&rx1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2911,8 +2943,15 @@ mod tests {
 
         let cfg = basic_cfg_for_jsonl(&jsonl);
         let (tx1, rx1) = mpsc::channel();
-        run_indexer(cfg.clone(), &tx1, Some(cache_db.clone()), false, test_machine(), None)
-            .unwrap();
+        run_indexer(
+            cfg.clone(),
+            &tx1,
+            Some(cache_db.clone()),
+            false,
+            test_machine(),
+            None,
+        )
+        .unwrap();
         let _ = recv_events(&rx1);
 
         fs::remove_file(&jsonl).unwrap();
