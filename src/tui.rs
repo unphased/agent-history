@@ -2003,9 +2003,22 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.set_cursor_position((cursor_x, cursor_y));
 
     if !app.ready {
+        let status_height: u16 = if app.show_telemetry { 6 } else { 3 };
         let main = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
+            .constraints(
+                if app.show_telemetry {
+                    vec![
+                        Constraint::Length(status_height),
+                        Constraint::Min(1),
+                    ]
+                } else {
+                    vec![
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                    ]
+                },
+            )
             .split(root[1]);
 
         let pct = if app.indexing.total_files == 0 {
@@ -2014,29 +2027,84 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             ((app.indexing.processed_files.saturating_mul(100)) / app.indexing.total_files) as u16
         };
 
-        let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Indexing"))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .percent(pct);
-        f.render_widget(gauge, main[0]);
+        if app.show_telemetry {
+            // Compact status area: gauge + status text in a fixed block
+            let status_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
+                .split(main[0]);
 
-        let mut lines = vec![Line::raw(format!(
-            "files: {}/{}   records: {}   sessions: {}",
-            app.indexing.processed_files,
-            app.indexing.total_files,
-            app.indexing.records,
-            app.indexing.sessions
-        ))];
-        if let Some(cur) = app.indexing.current.as_ref() {
-            lines.push(Line::raw(format!("current: {}", cur.display())));
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title("Indexing"))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .percent(pct);
+            f.render_widget(gauge, status_split[0]);
+
+            let mut status_lines = vec![Line::raw(format!(
+                "files: {}/{}   records: {}   sessions: {}",
+                app.indexing.processed_files,
+                app.indexing.total_files,
+                app.indexing.records,
+                app.indexing.sessions
+            ))];
+            if let Some(cur) = app.indexing.current.as_ref() {
+                status_lines.push(Line::raw(format!("current: {}", cur.display())));
+            }
+            if let Some(w) = app.indexing.last_warn.as_deref() {
+                status_lines.push(Line::raw(format!("warn: {w}")));
+            }
+            let status_p = Paragraph::new(Text::from(status_lines))
+                .wrap(Wrap { trim: false });
+            f.render_widget(status_p, status_split[1]);
+
+            // Events view fills remaining space
+            let telemetry_area = main[1];
+            let telemetry_inner_height = telemetry_area.height.saturating_sub(2) as usize;
+            let telemetry_inner_width = telemetry_area.width.saturating_sub(2) as usize;
+            let telemetry_doc = app.build_telemetry_preview_doc();
+            if app.preview_scroll_reset_pending {
+                let first_match_visual_line = preview_visual_line_offset(
+                    &telemetry_doc.lines,
+                    telemetry_doc.first_match_line,
+                    telemetry_inner_width,
+                );
+                app.preview_scroll = first_match_visual_line.saturating_sub(2);
+                app.preview_scroll_reset_pending = false;
+            }
+            let telemetry_total_lines =
+                preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
+            let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
+            app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+            let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
+                .block(Block::default().borders(Borders::ALL).title("Events"))
+                .scroll((app.preview_scroll as u16, 0))
+                .wrap(Wrap { trim: false });
+            f.render_widget(telemetry, telemetry_area);
+        } else {
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title("Indexing"))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .percent(pct);
+            f.render_widget(gauge, main[0]);
+
+            let mut lines = vec![Line::raw(format!(
+                "files: {}/{}   records: {}   sessions: {}",
+                app.indexing.processed_files,
+                app.indexing.total_files,
+                app.indexing.records,
+                app.indexing.sessions
+            ))];
+            if let Some(cur) = app.indexing.current.as_ref() {
+                lines.push(Line::raw(format!("current: {}", cur.display())));
+            }
+            if let Some(w) = app.indexing.last_warn.as_deref() {
+                lines.push(Line::raw(format!("warn: {w}")));
+            }
+            let p = Paragraph::new(Text::from(lines))
+                .block(Block::default().borders(Borders::ALL).title("Status"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(p, main[1]);
         }
-        if let Some(w) = app.indexing.last_warn.as_deref() {
-            lines.push(Line::raw(format!("warn: {w}")));
-        }
-        let p = Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title("Status"))
-            .wrap(Wrap { trim: false });
-        f.render_widget(p, main[1]);
 
         let footer = Layout::default()
             .direction(Direction::Vertical)
@@ -2053,7 +2121,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .style(Style::default().fg(Color::Yellow));
         f.render_widget(status, footer[0]);
 
-        let keys = Paragraph::new("Esc/Ctrl+c: quit").style(Style::default().fg(Color::DarkGray));
+        let keys = Paragraph::new(
+            if app.show_telemetry {
+                format!(
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
+                    app.query.trim()
+                )
+            } else {
+                "Esc/Ctrl+c: quit  Ctrl+t: events".to_string()
+            }
+        ).style(Style::default().fg(Color::DarkGray));
         f.render_widget(keys, footer[1]);
         return;
     }
