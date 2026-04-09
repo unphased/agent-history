@@ -1184,6 +1184,8 @@ struct OpenCodeIndexTelemetry {
     text_parts: usize,
     part_parse_failures: usize,
     used_title_fallback: bool,
+    largest_message_bytes: u64,
+    message_parse_ms: u128,
 }
 
 fn unit_reindexed_payload(

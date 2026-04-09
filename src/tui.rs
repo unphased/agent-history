@@ -563,6 +563,14 @@ fn tag_style(bg: Color) -> Style {
     Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)
 }
 
+fn provider_tag_includes_account(tags: &config::UiTagConfig, account: Option<&str>) -> bool {
+    tags.show_provider && account.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
+    tags.show_host && sess.origin != "local" && !sess.machine_name.trim().is_empty()
+}
+
 fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if tags.show_provider {
@@ -573,13 +581,14 @@ fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
         spans.push(Span::raw(" "));
     }
     if tags.show_account
+        && !provider_tag_includes_account(tags, sess.account.as_deref())
         && let Some(account) = sess.account.as_deref()
         && !account.trim().is_empty()
     {
         spans.push(Span::styled(format!(" {account} "), tag_style(Color::Green)));
         spans.push(Span::raw(" "));
     }
-    if tags.show_host {
+    if should_show_host_tag(sess, tags) {
         spans.push(Span::styled(
             format!(" {} ", sess.machine_name),
             tag_style(Color::Magenta),
@@ -3967,6 +3976,110 @@ mod tests {
             provider_label(SourceKind::ClaudeProjectJsonl, Some("abc")),
             "C abc"
         );
+    }
+
+    #[test]
+    fn session_tag_spans_do_not_duplicate_account_when_provider_tag_is_visible() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: Some("work".to_string()),
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: None,
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "local".to_string(),
+            machine_name: "MBP".to_string(),
+            origin: "local".to_string(),
+            project_slug: None,
+        };
+
+        let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert_eq!(rendered.matches("work").count(), 1);
+    }
+
+    #[test]
+    fn session_tag_spans_show_account_when_provider_tag_is_hidden() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: Some("work".to_string()),
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: None,
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "local".to_string(),
+            machine_name: "MBP".to_string(),
+            origin: "local".to_string(),
+            project_slug: None,
+        };
+        let tags = config::UiTagConfig {
+            show_provider: false,
+            ..config::UiTagConfig::default()
+        };
+
+        let rendered = session_tag_spans(&sess, &tags)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(rendered.contains("work"));
+    }
+
+    #[test]
+    fn session_tag_spans_hide_local_host_tag() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: None,
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: None,
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "local".to_string(),
+            machine_name: "MBP M1 Max".to_string(),
+            origin: "local".to_string(),
+            project_slug: None,
+        };
+
+        let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(!rendered.contains("MBP M1 Max"));
+    }
+
+    #[test]
+    fn session_tag_spans_show_remote_host_tag() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: None,
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: None,
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "mini".to_string(),
+            machine_name: "Mini".to_string(),
+            origin: "workstation".to_string(),
+            project_slug: None,
+        };
+
+        let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(rendered.contains("Mini"));
     }
 
     #[test]
