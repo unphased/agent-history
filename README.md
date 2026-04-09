@@ -163,11 +163,14 @@ agent-history --no-cache
 # Drop and rebuild the persistent cache
 agent-history --rebuild-index
 
+# Nuke the cache entirely (useful for perf testing a cold start)
+rm ~/.local/state/agent-history/index.sqlite
+
+# Time a full cold rebuild
+rm ~/.local/state/agent-history/index.sqlite && time agent-history refresh
+
 # Refresh the local cache without launching the TUI
 agent-history refresh
-
-# Export normalized local records as NDJSON
-agent-history export --format ndjson
 
 # Write telemetry JSONL to a custom path
 agent-history --telemetry-log /tmp/agent-history-events.jsonl

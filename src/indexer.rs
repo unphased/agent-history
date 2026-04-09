@@ -986,7 +986,7 @@ fn fingerprint_for_opencode_session(path: &Path) -> anyhow::Result<String> {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let session: OpenCodeSession = serde_json::from_reader(File::open(path)?)
+    let session: OpenCodeSession = serde_json::from_reader(BufReader::new(File::open(path)?))
         .with_context(|| format!("session fingerprint parse failed: {}", path.display()))?;
     let updated = session
         .time
@@ -1186,6 +1186,8 @@ struct OpenCodeIndexTelemetry {
     used_title_fallback: bool,
     largest_message_bytes: u64,
     message_parse_ms: u128,
+    part_read_ms: u128,
+    total_bytes_read: u64,
 }
 
 fn unit_reindexed_payload(
@@ -1211,6 +1213,10 @@ fn unit_reindexed_payload(
         payload["text_parts"] = json!(opencode.text_parts);
         payload["part_parse_failures"] = json!(opencode.part_parse_failures);
         payload["used_title_fallback"] = json!(opencode.used_title_fallback);
+        payload["largest_message_bytes"] = json!(opencode.largest_message_bytes);
+        payload["message_parse_ms"] = json!(opencode.message_parse_ms);
+        payload["part_read_ms"] = json!(opencode.part_read_ms);
+        payload["total_bytes_read"] = json!(opencode.total_bytes_read);
     }
 
     payload
@@ -1538,7 +1544,7 @@ fn index_opencode_session_file(
     sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<OpenCodeIndexTelemetry> {
     let mut telemetry = OpenCodeIndexTelemetry::default();
-    let session: OpenCodeSession = serde_json::from_reader(File::open(session_file)?)?;
+    let session: OpenCodeSession = serde_json::from_reader(BufReader::new(File::open(session_file)?))?;
     let message_dir = storage_root.join("message").join(&session.id);
     if !message_dir.is_dir() {
         return Ok(telemetry);
@@ -1566,10 +1572,25 @@ fn index_opencode_session_file(
 
     let mut records_added = 0usize;
 
-    for message_file in message_files {
-        let message: OpenCodeMessage = serde_json::from_reader(File::open(&message_file)?)?;
+    for message_file in &message_files {
+        let msg_meta = fs::metadata(message_file)?;
+        telemetry.total_bytes_read = telemetry.total_bytes_read.saturating_add(msg_meta.len());
+        telemetry.largest_message_bytes =
+            telemetry.largest_message_bytes.max(msg_meta.len());
+        let msg_parse_start = Instant::now();
+        let message: OpenCodeMessage = serde_json::from_reader(BufReader::new(File::open(message_file)?))?;
+        telemetry.message_parse_ms = telemetry
+            .message_parse_ms
+            .saturating_add(msg_parse_start.elapsed().as_millis());
         let part_dir = storage_root.join("part").join(&message.id);
+        let part_read_start = Instant::now();
         let part_result = extract_opencode_message_text(&part_dir)?;
+        telemetry.part_read_ms = telemetry
+            .part_read_ms
+            .saturating_add(part_read_start.elapsed().as_millis());
+        telemetry.total_bytes_read = telemetry
+            .total_bytes_read
+            .saturating_add(part_result.bytes_read);
         telemetry.part_files = telemetry.part_files.saturating_add(part_result.part_files);
         telemetry.text_parts = telemetry.text_parts.saturating_add(part_result.text_parts);
         telemetry.part_parse_failures = telemetry
@@ -1657,6 +1678,7 @@ struct OpenCodeMessageTextResult {
     part_files: usize,
     text_parts: usize,
     part_parse_failures: usize,
+    bytes_read: u64,
 }
 
 fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMessageTextResult> {
@@ -1666,6 +1688,7 @@ fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMess
             part_files: 0,
             text_parts: 0,
             part_parse_failures: 0,
+            bytes_read: 0,
         });
     }
 
@@ -1682,9 +1705,11 @@ fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMess
     let mut last_ts: Option<i64> = None;
     let mut text_parts = 0usize;
     let mut part_parse_failures = 0usize;
+    let mut bytes_read = 0u64;
 
-    for part_file in part_files {
-        let part: OpenCodePart = match serde_json::from_reader(File::open(&part_file)?) {
+    for part_file in &part_files {
+        bytes_read = bytes_read.saturating_add(fs::metadata(part_file).map(|m| m.len()).unwrap_or(0));
+        let part: OpenCodePart = match serde_json::from_reader(BufReader::new(File::open(part_file)?)) {
             Ok(part) => part,
             Err(_) => {
                 part_parse_failures = part_parse_failures.saturating_add(1);
@@ -1721,6 +1746,7 @@ fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMess
             part_files: part_file_count,
             text_parts,
             part_parse_failures,
+            bytes_read,
         });
     }
 
@@ -1733,6 +1759,7 @@ fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMess
         part_files: part_file_count,
         text_parts,
         part_parse_failures,
+        bytes_read,
     })
 }
 
