@@ -1541,7 +1541,8 @@ fn index_opencode_session_file(
     sessions: &mut HashSet<(SourceKind, String, Option<String>)>,
 ) -> anyhow::Result<OpenCodeIndexTelemetry> {
     let mut telemetry = OpenCodeIndexTelemetry::default();
-    let session: OpenCodeSession = serde_json::from_reader(BufReader::new(File::open(session_file)?))?;
+    let session: OpenCodeSession =
+        serde_json::from_reader(BufReader::new(File::open(session_file)?))?;
     let message_dir = storage_root.join("message").join(&session.id);
     if !message_dir.is_dir() {
         return Ok(telemetry);
@@ -1572,10 +1573,10 @@ fn index_opencode_session_file(
     for message_file in &message_files {
         let msg_meta = fs::metadata(message_file)?;
         telemetry.total_bytes_read = telemetry.total_bytes_read.saturating_add(msg_meta.len());
-        telemetry.largest_message_bytes =
-            telemetry.largest_message_bytes.max(msg_meta.len());
+        telemetry.largest_message_bytes = telemetry.largest_message_bytes.max(msg_meta.len());
         let msg_parse_start = Instant::now();
-        let message: OpenCodeMessage = serde_json::from_reader(BufReader::new(File::open(message_file)?))?;
+        let message: OpenCodeMessage =
+            serde_json::from_reader(BufReader::new(File::open(message_file)?))?;
         telemetry.message_parse_ms = telemetry
             .message_parse_ms
             .saturating_add(msg_parse_start.elapsed().as_millis());
@@ -1705,14 +1706,16 @@ fn extract_opencode_message_text(part_dir: &Path) -> anyhow::Result<OpenCodeMess
     let mut bytes_read = 0u64;
 
     for part_file in &part_files {
-        bytes_read = bytes_read.saturating_add(fs::metadata(part_file).map(|m| m.len()).unwrap_or(0));
-        let part: OpenCodePart = match serde_json::from_reader(BufReader::new(File::open(part_file)?)) {
-            Ok(part) => part,
-            Err(_) => {
-                part_parse_failures = part_parse_failures.saturating_add(1);
-                continue;
-            }
-        };
+        bytes_read =
+            bytes_read.saturating_add(fs::metadata(part_file).map(|m| m.len()).unwrap_or(0));
+        let part: OpenCodePart =
+            match serde_json::from_reader(BufReader::new(File::open(part_file)?)) {
+                Ok(part) => part,
+                Err(_) => {
+                    part_parse_failures = part_parse_failures.saturating_add(1);
+                    continue;
+                }
+            };
 
         if part.part_type != "text" {
             continue;
