@@ -26,6 +26,7 @@ pub struct RemoteSyncStatus {
 
 pub struct CacheStore {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 impl CacheStore {
@@ -38,12 +39,19 @@ impl CacheStore {
 
         let conn = Connection::open(path)
             .with_context(|| format!("cache open failed: {}", path.display()))?;
-        let mut store = Self { conn };
+        let mut store = Self {
+            conn,
+            db_path: path.to_path_buf(),
+        };
         store.init_schema()?;
         if rebuild {
             store.clear()?;
         }
         Ok(store)
+    }
+
+    fn remotes_db_dir(&self) -> PathBuf {
+        remotes_db_dir_for(&self.db_path)
     }
 
     pub fn prune_missing_units(&mut self) -> anyhow::Result<usize> {
@@ -471,15 +479,17 @@ impl CacheStore {
     }
 }
 
-pub fn remotes_db_dir() -> PathBuf {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/state/agent-history/remotes")
+pub fn remotes_db_dir_for(cache_db_path: &Path) -> PathBuf {
+    cache_db_path
+        .parent()
+        .map(|parent| parent.join("remotes"))
+        .unwrap_or_else(|| PathBuf::from("remotes"))
 }
 
-pub fn remote_db_path(remote_name: &str) -> PathBuf {
-    remotes_db_dir().join(remote_name).join("index.sqlite")
+pub fn remote_db_path_for(cache_db_path: &Path, remote_name: &str) -> PathBuf {
+    remotes_db_dir_for(cache_db_path)
+        .join(remote_name)
+        .join("index.sqlite")
 }
 
 /// Default path to the cache DB on a remote machine (used in rsync source).
@@ -547,7 +557,7 @@ pub fn load_records_from_remote_db(
 /// Load all local records from the main cache plus records from all remote DBs in the remotes dir.
 pub fn load_all_with_remotes(store: &CacheStore) -> anyhow::Result<Vec<MessageRecord>> {
     let mut all = store.load_local_records()?;
-    let dir = remotes_db_dir();
+    let dir = store.remotes_db_dir();
     if dir.is_dir() {
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -637,6 +647,15 @@ mod tests {
     #[test]
     fn unit_key_uses_path_string() {
         assert_eq!(unit_key(Path::new("/tmp/demo")), "/tmp/demo");
+    }
+
+    #[test]
+    fn remote_db_path_for_uses_cache_db_parent() {
+        let cache_db = PathBuf::from("/tmp/custom-cache/index.sqlite");
+        assert_eq!(
+            remote_db_path_for(&cache_db, "mini"),
+            PathBuf::from("/tmp/custom-cache/remotes/mini/index.sqlite")
+        );
     }
 
     #[test]
