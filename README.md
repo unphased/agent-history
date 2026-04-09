@@ -86,7 +86,6 @@ name = "MacBook Pro"
 
 [ui.tags]
 show_provider = true
-show_account = true
 show_host = true
 show_project = true
 

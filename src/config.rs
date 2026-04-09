@@ -32,8 +32,6 @@ pub struct UiTagConfig {
     #[serde(default = "default_true")]
     pub show_provider: bool,
     #[serde(default = "default_true")]
-    pub show_account: bool,
-    #[serde(default = "default_true")]
     pub show_host: bool,
     #[serde(default = "default_true")]
     pub show_project: bool,
@@ -43,7 +41,6 @@ impl Default for UiTagConfig {
     fn default() -> Self {
         Self {
             show_provider: true,
-            show_account: true,
             show_host: true,
             show_project: true,
         }

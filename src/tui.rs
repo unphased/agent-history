@@ -563,10 +563,6 @@ fn tag_style(bg: Color) -> Style {
     Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)
 }
 
-fn provider_tag_includes_account(tags: &config::UiTagConfig, account: Option<&str>) -> bool {
-    tags.show_provider && account.is_some_and(|value| !value.trim().is_empty())
-}
-
 fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
     tags.show_host && sess.origin != "local" && !sess.machine_name.trim().is_empty()
 }
@@ -578,14 +574,6 @@ fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
             format!(" {} ", provider_label(sess.source, sess.account.as_deref())),
             tag_style(Color::Cyan),
         ));
-        spans.push(Span::raw(" "));
-    }
-    if tags.show_account
-        && !provider_tag_includes_account(tags, sess.account.as_deref())
-        && let Some(account) = sess.account.as_deref()
-        && !account.trim().is_empty()
-    {
-        spans.push(Span::styled(format!(" {account} "), tag_style(Color::Green)));
         spans.push(Span::raw(" "));
     }
     if should_show_host_tag(sess, tags) {
@@ -4004,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn session_tag_spans_show_account_when_provider_tag_is_hidden() {
+    fn session_tag_spans_do_not_render_standalone_account_tag() {
         let sess = SessionSummary {
             source: SourceKind::CodexSessionJsonl,
             session_id: "s1".to_string(),
@@ -4029,7 +4017,7 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
 
-        assert!(rendered.contains("work"));
+        assert!(!rendered.contains("work"));
     }
 
     #[test]
