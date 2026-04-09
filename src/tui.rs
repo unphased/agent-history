@@ -705,6 +705,48 @@ fn extract_user_prompt_line_from_codex_title_task(text: &str) -> Option<String> 
     last.map(|s| s.to_string())
 }
 
+fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+fn prev_word_boundary(s: &str, char_pos: usize) -> usize {
+    if char_pos == 0 {
+        return 0;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut pos = char_pos - 1;
+    // skip whitespace
+    while pos > 0 && chars[pos].is_whitespace() {
+        pos -= 1;
+    }
+    // skip word chars
+    while pos > 0 && !chars[pos - 1].is_whitespace() {
+        pos -= 1;
+    }
+    pos
+}
+
+fn next_word_boundary(s: &str, char_pos: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    if char_pos >= len {
+        return len;
+    }
+    let mut pos = char_pos;
+    // skip current word chars
+    while pos < len && !chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    // skip whitespace
+    while pos < len && chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
 fn dir_name_from_cwd(cwd: &str) -> String {
     let s = cwd.trim();
     let s = s.trim_end_matches('/');
@@ -951,6 +993,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[derive(Debug)]
 struct App {
     query: String,
+    cursor_pos: usize,
     max_results: usize,
 
     all: Vec<MessageRecord>,
@@ -983,7 +1026,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        cursor::Hide,
         EnableMouseCapture
     )
     .context("画面切替に失敗")?;
@@ -1019,8 +1061,11 @@ fn run_app(
         .cloned()
         .map(|remote| (remote.name.clone(), remote))
         .collect();
+    let initial_query = args.query.unwrap_or_default();
+    let initial_cursor = initial_query.len();
     let mut app = App {
-        query: args.query.unwrap_or_default(),
+        query: initial_query,
+        cursor_pos: initial_cursor,
         max_results: args.max_results,
         all: Vec::new(),
         sessions: Vec::new(),
@@ -1153,20 +1198,71 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Backspace => {
-            app.query.pop();
+            if app.cursor_pos > 0 {
+                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                let prev_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos - 1);
+                app.query.replace_range(prev_byte_pos..byte_pos, "");
+                app.cursor_pos -= 1;
+            }
+            app.update_results();
+            return Ok(false);
+        }
+        KeyCode::Delete => {
+            let char_count = app.query.chars().count();
+            if app.cursor_pos < char_count {
+                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                let next_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos + 1);
+                app.query.replace_range(byte_pos..next_byte_pos, "");
+            }
             app.update_results();
             return Ok(false);
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.query.clear();
+            app.cursor_pos = 0;
             app.update_results();
+            return Ok(false);
+        }
+        KeyCode::Left => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.cursor_pos = prev_word_boundary(&app.query, app.cursor_pos);
+            } else {
+                app.cursor_pos = app.cursor_pos.saturating_sub(1);
+            }
+            return Ok(false);
+        }
+        KeyCode::Right => {
+            let char_count = app.query.chars().count();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.cursor_pos = next_word_boundary(&app.query, app.cursor_pos);
+            } else if app.cursor_pos < char_count {
+                app.cursor_pos += 1;
+            }
+            return Ok(false);
+        }
+        KeyCode::Home => {
+            app.cursor_pos = 0;
+            return Ok(false);
+        }
+        KeyCode::End => {
+            app.cursor_pos = app.query.chars().count();
+            return Ok(false);
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cursor_pos = 0;
+            return Ok(false);
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cursor_pos = app.query.chars().count();
             return Ok(false);
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
-                app.query.push(c);
+                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                app.query.insert(byte_pos, c);
+                app.cursor_pos += 1;
                 app.update_results();
                 return Ok(false);
             }
@@ -1901,6 +1997,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title("Query"))
         .style(Style::default().fg(Color::White));
     f.render_widget(query, root[0]);
+    // Place the terminal cursor in the query bar (border + "> " prefix = 3 chars offset)
+    let cursor_x = root[0].x + 1 + 2 + app.cursor_pos as u16;
+    let cursor_y = root[0].y + 1;
+    f.set_cursor_position((cursor_x, cursor_y));
 
     if !app.ready {
         let main = Layout::default()
@@ -2623,6 +2723,7 @@ mod tests {
     fn empty_app() -> App {
         App {
             query: String::new(),
+            cursor_pos: 0,
             max_results: 0,
             all: Vec::new(),
             sessions: Vec::new(),
@@ -3221,6 +3322,7 @@ mod tests {
         let (sessions, session_records) = build_session_index(&all);
         let mut app = App {
             query: String::new(),
+            cursor_pos: 0,
             max_results: 0,
             all,
             sessions,
@@ -3287,6 +3389,7 @@ mod tests {
         let (sessions, session_records) = build_session_index(&all);
         let mut app = App {
             query: "needle".to_string(),
+            cursor_pos: 6,
             max_results: 0,
             all,
             sessions,
@@ -3726,6 +3829,7 @@ mod tests {
 
         let app = App {
             query: String::new(),
+            cursor_pos: 0,
             max_results: 0,
             all,
             sessions,

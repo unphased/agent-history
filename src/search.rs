@@ -20,9 +20,9 @@ impl CompiledQuery {
             return Self { tokens: vec![] };
         }
 
+        let parts = parse_query_parts(query);
         let mut tokens: Vec<Token> = Vec::new();
-        for t in query.split_whitespace() {
-            let t = t.trim();
+        for t in &parts {
             if t.is_empty() {
                 continue;
             }
@@ -184,6 +184,45 @@ fn contains_ascii_case_insensitive_bytes(haystack: &[u8], needle_lower: &[u8]) -
     false
 }
 
+/// Parse a query string into parts, respecting double-quoted phrases.
+/// `"hello world" foo` → ["hello world", "foo"]
+fn parse_query_parts(query: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut chars = query.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            chars.next(); // consume opening quote
+            let mut phrase = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') | None => break,
+                    Some(c) => phrase.push(c),
+                }
+            }
+            if !phrase.is_empty() {
+                parts.push(phrase);
+            }
+        } else {
+            let mut word = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                word.push(c);
+                chars.next();
+            }
+            if !word.is_empty() {
+                parts.push(word);
+            }
+        }
+    }
+    parts
+}
+
 fn find_ascii_case_insensitive_ranges(haystack: &[u8], needle_lower: &[u8]) -> Vec<(usize, usize)> {
     let n = needle_lower;
     if n.is_empty() || n.len() > haystack.len() {
@@ -272,5 +311,43 @@ mod tests {
     #[test]
     fn find_match_ranges_merges_overlapping_matches() {
         assert_eq!(find_match_ranges("ell llo", "Hello"), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn quoted_phrase_matches_exact_sequence() {
+        let r = rec("abc def ghi");
+        assert!(CompiledQuery::new("\"abc def\"").matches_record(&r));
+        assert!(!CompiledQuery::new("\"abc ghi\"").matches_record(&r));
+    }
+
+    #[test]
+    fn quoted_phrase_with_other_tokens() {
+        let r = rec("abc def ghi");
+        assert!(CompiledQuery::new("\"abc def\" ghi").matches_record(&r));
+        assert!(!CompiledQuery::new("\"abc def\" xyz").matches_record(&r));
+    }
+
+    #[test]
+    fn quoted_phrase_highlight_ranges() {
+        assert_eq!(
+            find_match_ranges("\"hello world\"", "say hello world now"),
+            vec![(4, 15)]
+        );
+    }
+
+    #[test]
+    fn parse_query_parts_handles_mixed_input() {
+        assert_eq!(
+            parse_query_parts("foo \"hello world\" bar"),
+            vec!["foo", "hello world", "bar"]
+        );
+    }
+
+    #[test]
+    fn parse_query_parts_unclosed_quote() {
+        assert_eq!(
+            parse_query_parts("\"unclosed phrase"),
+            vec!["unclosed phrase"]
+        );
     }
 }
