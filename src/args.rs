@@ -19,7 +19,6 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     Refresh(RefreshArgs),
-    Export(ExportArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -77,11 +76,3 @@ pub struct RefreshArgs {
     pub scan: ScanArgs,
 }
 
-#[derive(Parser, Debug, Clone)]
-pub struct ExportArgs {
-    #[command(flatten)]
-    pub scan: ScanArgs,
-
-    #[arg(long, default_value = "ndjson", value_parser = ["ndjson"])]
-    pub format: String,
-}

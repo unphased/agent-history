@@ -1,5 +1,5 @@
 use crate::{
-    args::{ExportArgs, RefreshArgs, RunArgs, ScanArgs},
+    args::{RefreshArgs, RunArgs, ScanArgs},
     cache, config, telemetry,
 };
 use anyhow::Context as _;
@@ -167,23 +167,6 @@ pub fn refresh_local_cache(args: RefreshArgs) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, &tx).map(|_| ())
 }
 
-pub fn export_local_cache(args: ExportArgs, out: &mut impl std::io::Write) -> anyhow::Result<()> {
-    if args.format != "ndjson" {
-        anyhow::bail!("unsupported export format: {}", args.format);
-    }
-    let cache_path = cache::default_db_path();
-    if !cache_path.exists() {
-        refresh_local_cache(RefreshArgs {
-            scan: args.scan.clone(),
-        })?;
-    }
-    let store = cache::CacheStore::open(&cache_path, false)?;
-    for rec in store.load_local_records()? {
-        serde_json::to_writer(&mut *out, &rec).context("export record encode failed")?;
-        out.write_all(b"\n").context("export newline write failed")?;
-    }
-    Ok(())
-}
 
 fn run_indexer_from_args(args: RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, tx)
@@ -369,26 +352,23 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
                 json!({"remote_name": remote.name, "host": remote.host}),
             );
         }
-        match refresh_and_export_remote(&remote) {
-            Ok(mut records) => {
-                for rec in &mut records {
-                    rec.origin = remote.name.clone();
-                    if rec.project_slug.is_none() {
-                        rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd_owned);
-                    }
-                }
+        match refresh_and_rsync_remote(&remote) {
+            Ok(local_db) => {
+                let records = cache::load_records_from_remote_db(&local_db, &remote.name)
+                    .unwrap_or_default();
                 let machine_id = records.first().map(|rec| rec.machine_id.clone());
                 let machine_name = records.first().map(|rec| rec.machine_name.clone());
                 let mut store = cache::CacheStore::open(&cache_path, false)?;
-                store.replace_remote_snapshot(
+                store.mark_remote_sync_success(
                     &remote.name,
                     &remote.host,
-                    &records,
                     machine_id.as_deref(),
                     machine_name.as_deref(),
                     started.elapsed().as_millis() as i64,
+                    records.len() as i64,
+                    count_sessions(&records) as i64,
                 )?;
-                let all = store.load_all_records()?;
+                let all = cache::load_all_with_remotes(&store)?;
                 if let Some(sink) = telemetry.as_mut() {
                     let _ = sink.emit(
                         "remote_sync_finished",
@@ -435,7 +415,7 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
     Ok(())
 }
 
-fn refresh_and_export_remote(remote: &config::RemoteConfig) -> anyhow::Result<Vec<MessageRecord>> {
+fn refresh_and_rsync_remote(remote: &config::RemoteConfig) -> anyhow::Result<PathBuf> {
     let target = match remote.user.as_deref() {
         Some(user) => format!("{user}@{}", remote.host),
         None => remote.host.clone(),
@@ -444,6 +424,8 @@ fn refresh_and_export_remote(remote: &config::RemoteConfig) -> anyhow::Result<Ve
         .command
         .clone()
         .unwrap_or_else(|| "agent-history".to_string());
+
+    // Step 1: refresh the remote's local cache
     let refresh = Command::new("ssh")
         .arg(&target)
         .arg(&remote_cmd)
@@ -456,31 +438,32 @@ fn refresh_and_export_remote(remote: &config::RemoteConfig) -> anyhow::Result<Ve
             String::from_utf8_lossy(&refresh.stderr).trim()
         );
     }
-    let export = Command::new("ssh")
-        .arg(&target)
-        .arg(&remote_cmd)
-        .arg("export")
-        .arg("--format")
-        .arg("ndjson")
+
+    // Step 2: rsync the remote's cache DB
+    let local_db = cache::remote_db_path(&remote.name);
+    if let Some(parent) = local_db.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("remote cache dir creation failed: {}", parent.display()))?;
+    }
+    let remote_cache_path = remote
+        .cache_path
+        .as_deref()
+        .unwrap_or(cache::default_remote_cache_path());
+    let rsync_src = format!("{target}:{remote_cache_path}");
+    let rsync = Command::new("rsync")
+        .arg("-az")
+        .arg(&rsync_src)
+        .arg(local_db.to_string_lossy().as_ref())
         .output()
-        .with_context(|| format!("ssh export failed: {}", remote.name))?;
-    if !export.status.success() {
+        .with_context(|| format!("rsync failed: {}", remote.name))?;
+    if !rsync.status.success() {
         anyhow::bail!(
-            "remote export failed: {}",
-            String::from_utf8_lossy(&export.stderr).trim()
+            "remote rsync failed: {}",
+            String::from_utf8_lossy(&rsync.stderr).trim()
         );
     }
-    let mut records = Vec::new();
-    for line in String::from_utf8_lossy(&export.stdout).lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let rec: MessageRecord =
-            serde_json::from_str(line).with_context(|| format!("remote decode failed: {}", remote.name))?;
-        records.push(rec);
-    }
-    Ok(records)
+
+    Ok(local_db)
 }
 
 fn run_indexer(
@@ -608,7 +591,7 @@ fn run_indexer(
                     }
 
                     let cache_load_started = Instant::now();
-                    let cached_records = store.load_all_records()?;
+                    let cached_records = cache::load_all_with_remotes(&store)?;
                     emit(
                         "cache_load_finished",
                         json!({
@@ -880,7 +863,7 @@ fn run_indexer(
 
     let final_cache_load_started = Instant::now();
     let final_records = match cache_store.as_ref() {
-        Some(store) => store.load_all_records()?,
+        Some(store) => cache::load_all_with_remotes(store)?,
         None => Vec::new(),
     };
     let final_sessions = count_sessions(&final_records);

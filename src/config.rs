@@ -56,6 +56,8 @@ pub struct RemoteConfig {
     pub host: String,
     pub user: Option<String>,
     pub command: Option<String>,
+    /// Path to the cache DB on the remote machine (default: ~/.local/state/agent-history/index.sqlite)
+    pub cache_path: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]

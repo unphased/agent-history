@@ -1,4 +1,4 @@
-use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind, count_sessions};
+use crate::indexer::{ImageAttachment, MessageRecord, Role, SourceKind};
 use anyhow::Context as _;
 use rusqlite::{Connection, Transaction, params};
 use std::{
@@ -288,57 +288,17 @@ impl CacheStore {
         Ok(())
     }
 
-    pub fn replace_remote_snapshot(
+    pub fn mark_remote_sync_success(
         &mut self,
         remote_name: &str,
         host: &str,
-        records: &[MessageRecord],
         machine_id: Option<&str>,
         machine_name: Option<&str>,
         duration_ms: i64,
+        imported_records: i64,
+        imported_sessions: i64,
     ) -> anyhow::Result<()> {
-        let unit_key = format!("remote::{remote_name}");
-        let tx = self
-            .conn
-            .transaction()
-            .context("remote snapshot transaction failed")?;
-        Self::delete_unit_tx(&tx, &unit_key)?;
-        tx.execute(
-            "INSERT INTO source_units (unit_key, path, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![unit_key, format!("ssh://{host}/{remote_name}"), unix_now().to_string(), unix_now()],
-        )
-        .context("remote source unit insert failed")?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO message_records (
-                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                )
-                .context("remote record statement failed")?;
-            for (ord, rec) in records.iter().enumerate() {
-                stmt.execute(params![
-                    unit_key,
-                    ord as i64,
-                    rec.timestamp,
-                    role_to_db(rec.role),
-                    rec.text,
-                    rec.file.to_string_lossy().to_string(),
-                    i64::from(rec.line),
-                    rec.session_id,
-                    rec.account,
-                    rec.cwd,
-                    rec.phase,
-                    serde_json::to_string(&rec.images).unwrap_or_else(|_| "[]".to_string()),
-                    source_to_db(rec.source),
-                    rec.machine_id,
-                    rec.machine_name,
-                    rec.project_slug,
-                    rec.origin,
-                ])?;
-            }
-        }
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO remote_sync_state (
                 remote_name, host, machine_id, machine_name, last_attempted_ms, last_success_ms, last_duration_ms, imported_records, imported_sessions, last_error
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, NULL)
@@ -359,12 +319,11 @@ impl CacheStore {
                 machine_name,
                 unix_now() as i64,
                 duration_ms,
-                records.len() as i64,
-                count_sessions(records) as i64,
+                imported_records,
+                imported_sessions,
             ],
         )
         .context("remote sync status upsert failed")?;
-        tx.commit().context("remote snapshot commit failed")?;
         Ok(())
     }
 
@@ -508,6 +467,103 @@ impl CacheStore {
         .context("cache source unit delete failed")?;
         Ok(())
     }
+}
+
+pub fn remotes_db_dir() -> PathBuf {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/state/agent-history/remotes")
+}
+
+pub fn remote_db_path(remote_name: &str) -> PathBuf {
+    remotes_db_dir().join(remote_name).join("index.sqlite")
+}
+
+/// Default path to the cache DB on a remote machine (used in rsync source).
+pub fn default_remote_cache_path() -> &'static str {
+    ".local/state/agent-history/index.sqlite"
+}
+
+/// Load records from a remote's synced SQLite DB, overriding origin.
+pub fn load_records_from_remote_db(
+    db_path: &Path,
+    origin: &str,
+) -> anyhow::Result<Vec<MessageRecord>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("remote cache open failed: {}", db_path.display()))?;
+
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap_or(0);
+    if version != SCHEMA_VERSION {
+        anyhow::bail!(
+            "remote cache schema mismatch: expected {SCHEMA_VERSION}, got {version} ({})",
+            db_path.display()
+        );
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug
+             FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord",
+        )
+        .context("remote cache record query failed")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(MessageRecord {
+            timestamp: row.get(0)?,
+            role: role_from_db(row.get::<_, i64>(1)?),
+            text: row.get(2)?,
+            file: PathBuf::from(row.get::<_, String>(3)?),
+            line: row.get::<_, i64>(4)? as u32,
+            session_id: row.get(5)?,
+            account: row.get(6)?,
+            cwd: row.get(7)?,
+            phase: row.get(8)?,
+            images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
+                .unwrap_or_default(),
+            source: source_from_db(row.get::<_, i64>(10)?),
+            machine_id: row.get(11)?,
+            machine_name: row.get(12)?,
+            project_slug: row.get(13)?,
+            origin: origin.to_string(),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Load all local records from the main cache plus records from all remote DBs in the remotes dir.
+pub fn load_all_with_remotes(store: &CacheStore) -> anyhow::Result<Vec<MessageRecord>> {
+    let mut all = store.load_local_records()?;
+    let dir = remotes_db_dir();
+    if dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let db_path = entry.path().join("index.sqlite");
+                if db_path.exists() {
+                    let origin = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string();
+                    match load_records_from_remote_db(&db_path, &origin) {
+                        Ok(records) => all.extend(records),
+                        Err(_) => {} // silently skip broken remote DBs
+                    }
+                }
+            }
+        }
+    }
+    Ok(all)
 }
 
 pub fn default_db_path() -> PathBuf {

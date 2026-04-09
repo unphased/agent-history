@@ -16,6 +16,7 @@ now no longer updated, of improvments I've (slu) added to the project.
 - Added a persistent SQLite index cache with incremental refresh, stale-source pruning, and fingerprint-based reuse instead of rescanning everything every launch.
 - Added explicit cache controls: `--no-cache` for always-on full scans and `--rebuild-index` to discard and rebuild the persistent cache.
 - Added JSONL telemetry for indexing/cache lifecycle metrics, with opt-out and custom log-path flags.
+- Added a config file and federated remote-cache sync over SSH so one terminal can search imported history from multiple machines.
 - Added Codex image attachment extraction so image references are preserved in indexed records and shown in previews.
 
 In short: this is no longer just the original upstream search UI. It now behaves more like a serious local history browser for multiple agent ecosystems and multiple local accounts.
@@ -48,11 +49,13 @@ No external fuzzy finder (e.g. `fzf`) is required.
 ## Architecture Notes
 - The default persistent cache is SQLite at `~/.local/state/agent-history/index.sqlite`.
 - The default telemetry log is JSONL at `~/.local/state/agent-history/events.jsonl`.
+- The default config path is `~/.config/agent-history/config.toml`.
 - `AGENT_HISTORY_CACHE_DB` overrides the cache database path.
 - `AGENT_HISTORY_TELEMETRY_LOG` overrides the telemetry log path.
 - Cached source units are fingerprinted so unchanged files/sessions are reused.
 - Deleted sources are pruned from the cache automatically.
 - OpenCode sessions are refreshed in parallel.
+- Imported remote snapshots are stored in the same local cache and searched together with local records.
 - Codex image attachments are surfaced in previews; embedded image data is materialized under the system temp directory on demand.
 
 ## Usage
@@ -66,6 +69,66 @@ For development:
 ```bash
 cargo run --release
 ```
+
+For headless refresh/export:
+```bash
+agent-history refresh
+agent-history export --format ndjson
+```
+
+## Multi-Machine Config
+Create `~/.config/agent-history/config.toml`:
+
+```toml
+[machine]
+id = "mbp"
+name = "MacBook Pro"
+
+[ui.tags]
+show_provider = true
+show_account = true
+show_host = true
+show_project = true
+
+[[remotes]]
+name = "mini"
+host = "mini.tailnet.ts.net"
+user = "slu"
+command = "agent-history"
+enabled = true
+refresh_on_start = true
+
+[[remotes]]
+name = "workstation"
+host = "workstation.tailnet.ts.net"
+user = "slu"
+command = "agent-history"
+enabled = true
+refresh_on_start = true
+```
+
+Field notes:
+- `machine.id`: stable id stored on exported records
+- `machine.name`: display label in the UI; falls back to hostname if omitted
+- `remotes[].name`: local alias for the remote, also used as the imported record origin
+- `remotes[].host`: SSH host
+- `remotes[].user`: SSH user
+- `remotes[].command`: remote executable name/path, usually just `agent-history`
+- `remotes[].enabled`: whether the remote participates in background sync
+- `remotes[].refresh_on_start`: whether startup should try to refresh/import that remote
+
+When remotes are configured, startup does this:
+1. Load the local cache.
+2. Load any previously imported remote snapshots.
+3. Bring up the UI immediately.
+4. In the background, for each enabled remote, run:
+
+```bash
+ssh user@host agent-history refresh
+ssh user@host agent-history export --format ndjson
+```
+
+The returned NDJSON is imported into the local SQLite cache, so search stays local and snappy even if a remote is temporarily offline. The log view shows remote sync freshness, counts, durations, and failures.
 
 ## List Format
 Each result row is:
@@ -101,6 +164,12 @@ agent-history --no-cache
 # Drop and rebuild the persistent cache
 agent-history --rebuild-index
 
+# Refresh the local cache without launching the TUI
+agent-history refresh
+
+# Export normalized local records as NDJSON
+agent-history export --format ndjson
+
 # Write telemetry JSONL to a custom path
 agent-history --telemetry-log /tmp/agent-history-events.jsonl
 
@@ -123,12 +192,13 @@ agent-history --query "GitHub Actions"
 - `Ctrl+u`: clear query
 - `↑/↓`: move selection
 - `PageUp/PageDown`: move by page
-- `Enter`: resume in `codex resume` / `claude --resume` / `opencode --session`, or via `codex-account <name>` / `claude-account <name>` for account-scoped sessions
+- `Enter`: open a login-shell handoff for the selected session; local sessions resume locally, remote sessions SSH to the owning host
 - `Ctrl+o`: open raw JSONL around the selected item in `$PAGER` (defaults to `less -R`)
+- `Ctrl+t`: toggle the log/events view
 - `Esc` / `Ctrl+c`: quit
 
 ## Privacy
-This tool reads local log files and does not send your data over the network.
+This tool reads local log files. If you configure remotes, it will also use SSH to refresh/export remote caches and import those snapshots into the local cache.
 
 ## Security
 See `SECURITY.md`.
