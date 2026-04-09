@@ -10,6 +10,7 @@ now no longer updated, of improvments I've (slu) added to the project.
 - Changed search from a vague session-only summary view to hit-aware session results: matching sessions now show matched snippets, matched-message previews, and pager jumps around the actual hit.
 - Added query highlighting in both the result list and preview pane.
 - Added a much richer preview pane: keyboard scrolling, mouse-wheel scrolling, pane-aware wheel routing, wrap-aware scroll bounds, and multi-hit session previews instead of just the first matched message.
+- Added markdown-aware preview rendering with richer styling for headings, lists, quotes, links, and fenced code blocks, including tagged syntax highlighting with search hits kept visually dominant.
 - Expanded preview diagnostics so large sessions can show many matching messages plus total query-occurrence counts, instead of hiding the scale of the match.
 - Improved result-list formatting and provider labeling so sessions are easier to scan quickly.
 - Added account-scoped Codex and Claude profile discovery for directories like `~/.codex-work` and `~/.claude-work`, keeps those histories in separate namespaces, and resumes them via `codex-account <name>` / `claude-account <name>`.

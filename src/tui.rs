@@ -31,6 +31,7 @@ use std::{
     collections::HashMap,
     env, fs,
     io::{self, Stdout, Write},
+    mem,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -659,26 +660,1007 @@ fn highlighted_line(
     base_style: Style,
     match_style: Style,
 ) -> Line<'static> {
-    let ranges = search::find_match_ranges(query, text);
-    if ranges.is_empty() {
-        return Line::from(vec![Span::styled(text.to_string(), base_style)]);
-    }
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut last = 0usize;
-    for (start, end) in ranges {
-        if start > last {
-            spans.push(Span::styled(text[last..start].to_string(), base_style));
-        }
-        spans.push(Span::styled(text[start..end].to_string(), match_style));
-        last = end;
-    }
-    if last < text.len() {
-        spans.push(Span::styled(text[last..].to_string(), base_style));
-    }
-
-    Line::from(spans)
+    Line::from(highlight_spans(
+        vec![Span::styled(text.to_string(), base_style)],
+        query,
+        match_style,
+    ))
 }
+
+#[derive(Clone, Copy)]
+struct MarkdownTheme {
+    heading_markers: Style,
+    headings: [Style; 6],
+    quote_markers: Style,
+    quote_text: Style,
+    list_markers: Style,
+    rule: Style,
+    inline_code: Style,
+    markdown_markers: Style,
+    link_text: Style,
+    link_url: Style,
+    table_pipes: Style,
+    table_rule: Style,
+    code_fence: Style,
+    code_text: Style,
+    code_keyword: Style,
+    code_string: Style,
+    code_comment: Style,
+    code_number: Style,
+    code_symbol: Style,
+    code_variable: Style,
+    code_key: Style,
+    emphasis: Style,
+    strong: Style,
+    strike: Style,
+}
+
+impl MarkdownTheme {
+    fn new(base_style: Style) -> Self {
+        Self {
+            heading_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            headings: [
+                base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                base_style.fg(Color::Green).add_modifier(Modifier::BOLD),
+                base_style.fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                base_style.fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+                base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ],
+            quote_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            quote_text: base_style.fg(Color::Gray).add_modifier(Modifier::ITALIC),
+            list_markers: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            rule: base_style.fg(Color::DarkGray),
+            inline_code: base_style
+                .fg(Color::Yellow)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            markdown_markers: base_style.fg(Color::DarkGray),
+            link_text: base_style
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED),
+            link_url: base_style.fg(Color::Cyan),
+            table_pipes: base_style.fg(Color::DarkGray),
+            table_rule: base_style.fg(Color::DarkGray),
+            code_fence: base_style.fg(Color::DarkGray),
+            code_text: base_style.fg(Color::LightYellow),
+            code_keyword: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            code_string: base_style.fg(Color::Green),
+            code_comment: base_style
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+            code_number: base_style.fg(Color::Magenta),
+            code_symbol: base_style.fg(Color::Yellow),
+            code_variable: base_style.fg(Color::LightBlue),
+            code_key: base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            emphasis: base_style.add_modifier(Modifier::ITALIC),
+            strong: base_style.add_modifier(Modifier::BOLD),
+            strike: base_style.add_modifier(Modifier::CROSSED_OUT),
+        }
+    }
+
+    fn heading_style(&self, level: usize) -> Style {
+        self.headings[level.saturating_sub(1).min(self.headings.len() - 1)]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodeFence {
+    delimiter: char,
+    marker_len: usize,
+    language: Option<CodeLanguage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Json,
+    Shell,
+}
+
+fn highlight_spans(
+    spans: Vec<Span<'static>>,
+    query: &str,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return spans;
+    }
+
+    let full_text = spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let ranges = search::find_match_ranges(query, &full_text);
+    if ranges.is_empty() {
+        return spans;
+    }
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut absolute = 0usize;
+    let mut range_idx = 0usize;
+
+    for span in spans {
+        let style = span.style;
+        let content = span.content.into_owned();
+        let span_start = absolute;
+        let span_end = span_start + content.len();
+        let mut local = 0usize;
+
+        while range_idx < ranges.len() && ranges[range_idx].1 <= span_start {
+            range_idx += 1;
+        }
+
+        let mut cur = range_idx;
+        while cur < ranges.len() && ranges[cur].0 < span_end {
+            let start = ranges[cur].0.max(span_start) - span_start;
+            let end = ranges[cur].1.min(span_end) - span_start;
+
+            if start > local {
+                push_styled_text(&mut out, content[local..start].to_string(), style);
+            }
+            if end > start {
+                push_styled_text(
+                    &mut out,
+                    content[start..end].to_string(),
+                    style.patch(match_style),
+                );
+            }
+            local = end;
+
+            if ranges[cur].1 <= span_end {
+                cur += 1;
+            } else {
+                break;
+            }
+        }
+
+        if local < content.len() {
+            push_styled_text(&mut out, content[local..].to_string(), style);
+        }
+
+        absolute = span_end;
+        range_idx = cur;
+    }
+
+    out
+}
+
+fn render_preview_message_lines(
+    text: &str,
+    query: &str,
+    base_style: Style,
+    match_style: Style,
+) -> Vec<Line<'static>> {
+    let theme = MarkdownTheme::new(base_style);
+    let mut lines = Vec::new();
+    let mut code_fence: Option<CodeFence> = None;
+
+    for raw_line in text.lines() {
+        let spans = if let Some(fence) = code_fence.as_ref() {
+            if let Some((delimiter, marker_len, _)) = parse_fence(raw_line)
+                && delimiter == fence.delimiter
+                && marker_len >= fence.marker_len
+                && raw_line.trim_start()[marker_len..].trim().is_empty()
+            {
+                let spans = render_fence_line(raw_line, &theme);
+                code_fence = None;
+                spans
+            } else {
+                render_code_line(raw_line, fence.language, &theme)
+            }
+        } else if let Some((delimiter, marker_len, info)) = parse_fence(raw_line) {
+            code_fence = Some(CodeFence {
+                delimiter,
+                marker_len,
+                language: parse_code_language(info),
+            });
+            render_fence_line(raw_line, &theme)
+        } else {
+            render_markdown_line(raw_line, &theme)
+        };
+
+        lines.push(Line::from(highlight_spans(spans, query, match_style)));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+
+    lines
+}
+
+fn render_markdown_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>> {
+    if line.is_empty() {
+        return vec![Span::raw("")];
+    }
+
+    if is_thematic_break(line) {
+        return vec![Span::styled(line.to_string(), theme.rule)];
+    }
+
+    if let Some((indent, level, content)) = parse_heading(line) {
+        let mut spans = Vec::new();
+        push_styled_text(&mut spans, indent.to_string(), Style::default());
+        push_styled_text(&mut spans, "#".repeat(level), theme.heading_markers);
+        if line.trim_start().len() > level {
+            push_styled_text(&mut spans, " ".to_string(), theme.heading_markers);
+        }
+        spans.extend(render_inline_markdown(
+            content,
+            theme.heading_style(level),
+            theme,
+        ));
+        return spans;
+    }
+
+    if let Some((prefix, content)) = parse_blockquote(line) {
+        let mut spans = Vec::new();
+        push_styled_text(&mut spans, prefix.to_string(), theme.quote_markers);
+        spans.extend(render_inline_markdown(content, theme.quote_text, theme));
+        return spans;
+    }
+
+    if let Some((indent, marker, content)) = parse_list_marker(line) {
+        let mut spans = Vec::new();
+        push_styled_text(&mut spans, indent.to_string(), Style::default());
+        push_styled_text(&mut spans, marker.to_string(), theme.list_markers);
+        spans.extend(render_inline_markdown(content, Style::default(), theme));
+        return spans;
+    }
+
+    if is_table_rule(line) {
+        return render_table_line(line, theme, theme.table_rule);
+    }
+
+    if line.contains('|') {
+        return render_table_line(line, theme, Style::default());
+    }
+
+    render_inline_markdown(line, Style::default(), theme)
+}
+
+fn render_table_line(line: &str, theme: &MarkdownTheme, text_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in line.char_indices() {
+        if ch != '|' {
+            continue;
+        }
+        if start < idx {
+            spans.extend(render_inline_markdown(&line[start..idx], text_style, theme));
+        }
+        push_styled_text(&mut spans, "|".to_string(), theme.table_pipes);
+        start = idx + ch.len_utf8();
+    }
+    if start < line.len() {
+        spans.extend(render_inline_markdown(&line[start..], text_style, theme));
+    }
+    spans
+}
+
+fn render_fence_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>> {
+    let Some((_, marker_len, info)) = parse_fence(line) else {
+        return vec![Span::styled(line.to_string(), theme.code_fence)];
+    };
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let marker = &trimmed[..marker_len];
+    let rest = &trimmed[marker_len..];
+
+    let mut spans = Vec::new();
+    push_styled_text(&mut spans, indent.to_string(), Style::default());
+    push_styled_text(&mut spans, marker.to_string(), theme.code_fence);
+    if !rest.is_empty() {
+        let info_padding_len = rest.len().saturating_sub(rest.trim_start().len());
+        if info_padding_len > 0 {
+            push_styled_text(
+                &mut spans,
+                rest[..info_padding_len].to_string(),
+                theme.code_fence,
+            );
+        }
+        let info_text = rest[info_padding_len..].trim_end();
+        if !info_text.is_empty() {
+            push_styled_text(&mut spans, info_text.to_string(), theme.code_keyword);
+        }
+        let trailing_len = rest
+            .len()
+            .saturating_sub(info_padding_len + info_text.len());
+        if trailing_len > 0 {
+            push_styled_text(
+                &mut spans,
+                rest[rest.len() - trailing_len..].to_string(),
+                theme.code_fence,
+            );
+        }
+    }
+    let _ = info;
+    spans
+}
+
+fn render_code_line(
+    line: &str,
+    language: Option<CodeLanguage>,
+    theme: &MarkdownTheme,
+) -> Vec<Span<'static>> {
+    match language {
+        Some(CodeLanguage::Rust) => render_clike_code_line(line, theme, &RUST_KEYWORDS, true),
+        Some(CodeLanguage::JavaScript) => {
+            render_clike_code_line(line, theme, &JAVASCRIPT_KEYWORDS, true)
+        }
+        Some(CodeLanguage::TypeScript) => {
+            render_clike_code_line(line, theme, &TYPESCRIPT_KEYWORDS, true)
+        }
+        Some(CodeLanguage::Python) => render_python_code_line(line, theme),
+        Some(CodeLanguage::Json) => render_json_code_line(line, theme),
+        Some(CodeLanguage::Shell) => render_shell_code_line(line, theme),
+        None => vec![Span::styled(line.to_string(), theme.code_text)],
+    }
+}
+
+fn render_clike_code_line(
+    line: &str,
+    theme: &MarkdownTheme,
+    keywords: &[&str],
+    backtick_strings: bool,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < line.len() {
+        let rest = &line[idx..];
+        if rest.starts_with("//") {
+            push_styled_text(&mut spans, rest.to_string(), theme.code_comment);
+            break;
+        }
+
+        let ch = rest.chars().next().unwrap_or_default();
+        if ch == '"' || ch == '\'' || (backtick_strings && ch == '`') {
+            let end = consume_quoted(line, idx, ch);
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_string);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_number(line, idx) {
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_number);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_identifier(line, idx) {
+            let ident = &line[idx..end];
+            let style = if keywords.contains(&ident) {
+                theme.code_keyword
+            } else {
+                theme.code_text
+            };
+            push_styled_text(&mut spans, ident.to_string(), style);
+            idx = end;
+            continue;
+        }
+
+        let end = idx + ch.len_utf8();
+        let style = if is_code_symbol(ch) {
+            theme.code_symbol
+        } else {
+            theme.code_text
+        };
+        push_styled_text(&mut spans, line[idx..end].to_string(), style);
+        idx = end;
+    }
+
+    spans
+}
+
+fn render_python_code_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < line.len() {
+        let rest = &line[idx..];
+        if rest.starts_with('#') {
+            push_styled_text(&mut spans, rest.to_string(), theme.code_comment);
+            break;
+        }
+
+        let ch = rest.chars().next().unwrap_or_default();
+        if ch == '"' || ch == '\'' {
+            let end = consume_quoted(line, idx, ch);
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_string);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_number(line, idx) {
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_number);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_identifier(line, idx) {
+            let ident = &line[idx..end];
+            let style = if PYTHON_KEYWORDS.contains(&ident) {
+                theme.code_keyword
+            } else {
+                theme.code_text
+            };
+            push_styled_text(&mut spans, ident.to_string(), style);
+            idx = end;
+            continue;
+        }
+
+        let end = idx + ch.len_utf8();
+        let style = if is_code_symbol(ch) {
+            theme.code_symbol
+        } else {
+            theme.code_text
+        };
+        push_styled_text(&mut spans, line[idx..end].to_string(), style);
+        idx = end;
+    }
+
+    spans
+}
+
+fn render_json_code_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < line.len() {
+        let rest = &line[idx..];
+        let ch = rest.chars().next().unwrap_or_default();
+
+        if ch == '"' {
+            let end = consume_quoted(line, idx, ch);
+            let style = if next_non_whitespace_char(line, end) == Some(':') {
+                theme.code_key
+            } else {
+                theme.code_string
+            };
+            push_styled_text(&mut spans, line[idx..end].to_string(), style);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_number(line, idx) {
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_number);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_identifier(line, idx) {
+            let ident = &line[idx..end];
+            let style = if ["true", "false", "null"].contains(&ident) {
+                theme.code_keyword
+            } else {
+                theme.code_text
+            };
+            push_styled_text(&mut spans, ident.to_string(), style);
+            idx = end;
+            continue;
+        }
+
+        let end = idx + ch.len_utf8();
+        let style = if is_code_symbol(ch) {
+            theme.code_symbol
+        } else {
+            theme.code_text
+        };
+        push_styled_text(&mut spans, line[idx..end].to_string(), style);
+        idx = end;
+    }
+
+    spans
+}
+
+fn render_shell_code_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < line.len() {
+        let rest = &line[idx..];
+        if rest.starts_with('#') {
+            push_styled_text(&mut spans, rest.to_string(), theme.code_comment);
+            break;
+        }
+
+        if rest.starts_with("${") {
+            let end = rest
+                .find('}')
+                .map(|end| idx + end + 1)
+                .unwrap_or(line.len());
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_variable);
+            idx = end;
+            continue;
+        }
+
+        let ch = rest.chars().next().unwrap_or_default();
+        if ch == '$' {
+            let end = consume_shell_variable(line, idx);
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_variable);
+            idx = end;
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' || ch == '`' {
+            let end = consume_quoted(line, idx, ch);
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_string);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_number(line, idx) {
+            push_styled_text(&mut spans, line[idx..end].to_string(), theme.code_number);
+            idx = end;
+            continue;
+        }
+
+        if let Some(end) = consume_identifier(line, idx) {
+            let ident = &line[idx..end];
+            let style = if SHELL_KEYWORDS.contains(&ident) {
+                theme.code_keyword
+            } else {
+                theme.code_text
+            };
+            push_styled_text(&mut spans, ident.to_string(), style);
+            idx = end;
+            continue;
+        }
+
+        let end = idx + ch.len_utf8();
+        let style = if is_code_symbol(ch) {
+            theme.code_symbol
+        } else {
+            theme.code_text
+        };
+        push_styled_text(&mut spans, line[idx..end].to_string(), style);
+        idx = end;
+    }
+
+    spans
+}
+
+fn render_inline_markdown(
+    text: &str,
+    base_style: Style,
+    theme: &MarkdownTheme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut idx = 0usize;
+
+    while idx < text.len() {
+        let rest = &text[idx..];
+
+        if let Some((consumed, code)) = parse_inline_code(rest) {
+            flush_plain_text(&mut spans, &mut plain, base_style);
+            let marker_len = inline_code_marker_len(rest);
+            push_styled_text(
+                &mut spans,
+                rest[..marker_len].to_string(),
+                theme.markdown_markers,
+            );
+            push_styled_text(&mut spans, code.to_string(), theme.inline_code);
+            push_styled_text(
+                &mut spans,
+                rest[consumed - marker_len..consumed].to_string(),
+                theme.markdown_markers,
+            );
+            idx += consumed;
+            continue;
+        }
+
+        if let Some((consumed, label, url)) = parse_inline_link(rest) {
+            flush_plain_text(&mut spans, &mut plain, base_style);
+            push_styled_text(&mut spans, "[".to_string(), theme.markdown_markers);
+            spans.extend(render_inline_markdown(label, theme.link_text, theme));
+            push_styled_text(&mut spans, "](".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, url.to_string(), theme.link_url);
+            push_styled_text(&mut spans, ")".to_string(), theme.markdown_markers);
+            idx += consumed;
+            continue;
+        }
+
+        if let Some((consumed, inner)) = parse_wrapped_segment(rest, "~~") {
+            flush_plain_text(&mut spans, &mut plain, base_style);
+            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
+            spans.extend(render_inline_markdown(
+                inner,
+                base_style.patch(theme.strike),
+                theme,
+            ));
+            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
+            idx += consumed;
+            continue;
+        }
+
+        if let Some((consumed, inner)) = parse_wrapped_segment(rest, "**") {
+            flush_plain_text(&mut spans, &mut plain, base_style);
+            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
+            spans.extend(render_inline_markdown(
+                inner,
+                base_style.patch(theme.strong),
+                theme,
+            ));
+            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
+            idx += consumed;
+            continue;
+        }
+
+        if let Some((consumed, inner)) = parse_wrapped_segment(rest, "*") {
+            flush_plain_text(&mut spans, &mut plain, base_style);
+            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
+            spans.extend(render_inline_markdown(
+                inner,
+                base_style.patch(theme.emphasis),
+                theme,
+            ));
+            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
+            idx += consumed;
+            continue;
+        }
+
+        if let Some(ch) = rest.chars().next() {
+            plain.push(ch);
+            idx += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    flush_plain_text(&mut spans, &mut plain, base_style);
+    spans
+}
+
+fn flush_plain_text(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
+    if plain.is_empty() {
+        return;
+    }
+    push_styled_text(spans, mem::take(plain), style);
+}
+
+fn push_styled_text(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(&text);
+        return;
+    }
+
+    spans.push(Span::styled(text, style));
+}
+
+fn parse_heading(line: &str) -> Option<(&str, usize, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent_len = line.len() - trimmed.len();
+    if indent_len > 3 {
+        return None;
+    }
+
+    let marker_len = trimmed.chars().take_while(|&ch| ch == '#').count();
+    if !(1..=6).contains(&marker_len) {
+        return None;
+    }
+    let rest = &trimmed[marker_len..];
+    let content = rest.strip_prefix(' ')?;
+    Some((&line[..indent_len], marker_len, content))
+}
+
+fn parse_blockquote(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent_len = line.len() - trimmed.len();
+    if indent_len > 3 || !trimmed.starts_with('>') {
+        return None;
+    }
+
+    let mut idx = indent_len;
+    let bytes = line.as_bytes();
+    while idx < line.len() && bytes[idx] == b'>' {
+        idx += 1;
+        if idx < line.len() && bytes[idx] == b' ' {
+            idx += 1;
+        }
+    }
+
+    Some((&line[..idx], &line[idx..]))
+}
+
+fn parse_list_marker(line: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(content) = trimmed.strip_prefix(marker) {
+            let marker_start = indent_len;
+            let marker_end = marker_start + marker.len();
+            return Some((indent, &line[marker_start..marker_end], content));
+        }
+    }
+
+    let digit_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_len == 0 {
+        return None;
+    }
+    let rest = &trimmed[digit_len..];
+    if !(rest.starts_with(". ") || rest.starts_with(") ")) {
+        return None;
+    }
+
+    let marker_start = indent_len;
+    let marker_end = marker_start + digit_len + 2;
+    Some((
+        indent,
+        &line[marker_start..marker_end],
+        &trimmed[digit_len + 2..],
+    ))
+}
+
+fn is_thematic_break(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let marker = trimmed.chars().find(|ch| !ch.is_whitespace());
+    let Some(marker) = marker else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+
+    let marker_count = trimmed.chars().filter(|&ch| ch == marker).count();
+    marker_count >= 3 && trimmed.chars().all(|ch| ch == marker || ch.is_whitespace())
+}
+
+fn is_table_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.contains('|') {
+        return false;
+    }
+
+    trimmed
+        .split('|')
+        .filter(|part| !part.trim().is_empty())
+        .all(|part| {
+            let part = part.trim();
+            let core = part.trim_start_matches(':').trim_end_matches(':');
+            !core.is_empty() && core.chars().all(|ch| ch == '-')
+        })
+}
+
+fn parse_fence(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent_len = line.len() - trimmed.len();
+    if indent_len > 3 {
+        return None;
+    }
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let marker_len = trimmed.chars().take_while(|&ch| ch == first).count();
+    if marker_len < 3 {
+        return None;
+    }
+    Some((first, marker_len, trimmed[marker_len..].trim()))
+}
+
+fn parse_code_language(info: &str) -> Option<CodeLanguage> {
+    let language = info
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .to_ascii_lowercase();
+
+    match language.as_str() {
+        "rust" | "rs" => Some(CodeLanguage::Rust),
+        "python" | "py" => Some(CodeLanguage::Python),
+        "javascript" | "js" | "jsx" => Some(CodeLanguage::JavaScript),
+        "typescript" | "ts" | "tsx" => Some(CodeLanguage::TypeScript),
+        "json" => Some(CodeLanguage::Json),
+        "bash" | "sh" | "zsh" | "shell" => Some(CodeLanguage::Shell),
+        _ => None,
+    }
+}
+
+fn parse_inline_code(text: &str) -> Option<(usize, &str)> {
+    let marker_len = inline_code_marker_len(text);
+    if marker_len == 0 {
+        return None;
+    }
+    let marker = &text[..marker_len];
+    let rest = &text[marker_len..];
+    let close = rest.find(marker)?;
+    Some((marker_len + close + marker_len, &rest[..close]))
+}
+
+fn inline_code_marker_len(text: &str) -> usize {
+    text.chars().take_while(|&ch| ch == '`').count()
+}
+
+fn parse_inline_link(text: &str) -> Option<(usize, &str, &str)> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let label_end = text.find("](")?;
+    let url_start = label_end + 2;
+    let url_end = text[url_start..].find(')')? + url_start;
+    Some((url_end + 1, &text[1..label_end], &text[url_start..url_end]))
+}
+
+fn parse_wrapped_segment<'a>(text: &'a str, delimiter: &str) -> Option<(usize, &'a str)> {
+    if !text.starts_with(delimiter) {
+        return None;
+    }
+    let rest = &text[delimiter.len()..];
+    let close = rest.find(delimiter)?;
+    if close == 0 {
+        return None;
+    }
+    Some((delimiter.len() + close + delimiter.len(), &rest[..close]))
+}
+
+fn consume_quoted(line: &str, start: usize, quote: char) -> usize {
+    let mut escaped = false;
+    for (offset, ch) in line[start + quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return start + quote.len_utf8() + offset + ch.len_utf8();
+        }
+    }
+    line.len()
+}
+
+fn consume_identifier(line: &str, start: usize) -> Option<usize> {
+    let mut chars = line[start..].char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    let mut end = start + first.len_utf8();
+    for (offset, ch) in chars {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            end = start + offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+fn consume_number(line: &str, start: usize) -> Option<usize> {
+    let first = line[start..].chars().next()?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+
+    let mut end = start + first.len_utf8();
+    for (offset, ch) in line[start + first.len_utf8()..].char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '+' | '-') {
+            end = start + first.len_utf8() + offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+fn next_non_whitespace_char(line: &str, start: usize) -> Option<char> {
+    line[start..].chars().find(|ch| !ch.is_whitespace())
+}
+
+fn consume_shell_variable(line: &str, start: usize) -> usize {
+    let mut end = start + 1;
+    for (offset, ch) in line[end..].char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            end = start + 1 + offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end.max(start + 1)
+}
+
+fn is_code_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '{' | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | ':'
+            | ';'
+            | ','
+            | '.'
+            | '='
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '!'
+            | '<'
+            | '>'
+            | '|'
+            | '&'
+    )
+}
+
+const RUST_KEYWORDS: [&str; 30] = [
+    "as", "async", "await", "break", "const", "continue", "crate", "else", "enum", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "return",
+    "self", "Self", "struct", "trait", "true", "use", "while",
+];
+
+const JAVASCRIPT_KEYWORDS: [&str; 25] = [
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "else",
+    "export", "false", "finally", "for", "function", "if", "import", "let", "new", "null",
+    "return", "switch", "throw", "true", "var",
+];
+
+const TYPESCRIPT_KEYWORDS: [&str; 31] = [
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "return",
+    "throw",
+    "true",
+    "type",
+    "var",
+    "void",
+];
+
+const PYTHON_KEYWORDS: [&str; 25] = [
+    "and", "as", "async", "await", "class", "def", "elif", "else", "False", "for", "from", "if",
+    "import", "in", "is", "lambda", "None", "not", "or", "pass", "return", "self", "True", "while",
+    "yield",
+];
+
+const SHELL_KEYWORDS: [&str; 15] = [
+    "case", "do", "done", "echo", "elif", "else", "esac", "export", "fi", "for", "function", "if",
+    "in", "then", "while",
+];
 
 fn record_match_occurrence_count(query: &str, rec: &MessageRecord) -> usize {
     rec.text
@@ -1669,14 +2651,12 @@ impl App {
                 }
                 lines.push(Line::raw(""));
             }
-            lines.extend(
-                rec.text
-                    .lines()
-                    .map(|l| highlighted_line(l, query, base_style, match_style)),
-            );
-            if rec.text.lines().count() == 0 {
-                lines.push(Line::raw(""));
-            }
+            lines.extend(render_preview_message_lines(
+                &rec.text,
+                query,
+                base_style,
+                match_style,
+            ));
 
             return PreviewDoc {
                 lines,
@@ -1776,14 +2756,12 @@ impl App {
                     }
                     section.push(Line::raw(""));
                 }
-                section.extend(
-                    rec.text
-                        .lines()
-                        .map(|l| highlighted_line(l, query, base_style, match_style)),
-                );
-                if rec.text.lines().count() == 0 {
-                    section.push(Line::raw(""));
-                }
+                section.extend(render_preview_message_lines(
+                    &rec.text,
+                    query,
+                    base_style,
+                    match_style,
+                ));
                 section.push(Line::raw(""));
                 section
             };
@@ -3991,6 +4969,119 @@ mod tests {
     }
 
     #[test]
+    fn preview_markdown_renders_headings_and_inline_code() {
+        let lines = render_preview_message_lines(
+            "# Heading with `code`",
+            "",
+            Style::default(),
+            Style::default().bg(Color::Yellow),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "# Heading with `code`");
+        assert_eq!(lines[0].spans[0].style, theme.heading_markers);
+        assert_eq!(lines[0].spans[1].style, theme.heading_style(1));
+        assert_eq!(lines[0].spans[3].style, theme.inline_code);
+    }
+
+    #[test]
+    fn preview_markdown_renders_links_without_losing_raw_text() {
+        let lines = render_preview_message_lines(
+            "[docs](https://example.com)",
+            "",
+            Style::default(),
+            Style::default().bg(Color::Yellow),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(line_text(&lines[0]), "[docs](https://example.com)");
+        assert_eq!(lines[0].spans[1].style, theme.link_text);
+        assert_eq!(lines[0].spans[3].style, theme.link_url);
+    }
+
+    #[test]
+    fn preview_markdown_highlights_tagged_rust_fences() {
+        let lines = render_preview_message_lines(
+            "```rust\nlet answer = 42;\n```",
+            "",
+            Style::default(),
+            Style::default().bg(Color::Yellow),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(line_text(&lines[1]), "let answer = 42;");
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "let" && span.style == theme.code_keyword)
+        );
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "42" && span.style == theme.code_number)
+        );
+    }
+
+    #[test]
+    fn preview_markdown_uses_generic_style_for_untagged_fences() {
+        let lines = render_preview_message_lines(
+            "```\nplain text\n```",
+            "",
+            Style::default(),
+            Style::default().bg(Color::Yellow),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].spans.len(), 1);
+        assert_eq!(line_text(&lines[1]), "plain text");
+        assert_eq!(lines[1].spans[0].style, theme.code_text);
+    }
+
+    #[test]
+    fn preview_markdown_query_highlight_overrides_code_style() {
+        let match_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let lines = render_preview_message_lines(
+            "```rust\nlet value = 42;\n```",
+            "42",
+            Style::default(),
+            match_style,
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        let highlight = lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "42")
+            .unwrap();
+        assert_eq!(highlight.style, theme.code_number.patch(match_style));
+    }
+
+    #[test]
+    fn preview_markdown_renders_blockquotes_and_lists() {
+        let lines = render_preview_message_lines(
+            "> quoted\n- item",
+            "",
+            Style::default(),
+            Style::default().bg(Color::Yellow),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(line_text(&lines[0]), "> quoted");
+        assert_eq!(line_text(&lines[1]), "- item");
+        assert_eq!(lines[0].spans[0].style, theme.quote_markers);
+        assert_eq!(lines[0].spans[1].style, theme.quote_text);
+        assert_eq!(lines[1].spans[0].style, theme.list_markers);
+    }
+
+    #[test]
     fn provider_label_distinguishes_supported_providers() {
         assert_eq!(provider_label(SourceKind::ClaudeProjectJsonl, None), "C");
         assert_eq!(provider_label(SourceKind::CodexSessionJsonl, None), "O");
@@ -4000,6 +5091,13 @@ mod tests {
             provider_label(SourceKind::ClaudeProjectJsonl, Some("abc")),
             "C abc"
         );
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     #[test]
