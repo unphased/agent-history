@@ -355,9 +355,25 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
             );
         }
         match refresh_and_rsync_remote(&remote) {
-            Ok(local_db) => {
-                let records =
-                    cache::load_records_from_remote_db(&local_db, &remote.name).unwrap_or_default();
+            Ok(fetch) => {
+                if let Some(warning) = fetch.warning.as_deref() {
+                    tx.send(IndexerEvent::Warn {
+                        message: warning.to_string(),
+                    })
+                    .ok();
+                    if let Some(sink) = telemetry.as_mut() {
+                        let _ = sink.emit(
+                            "remote_sync_warning",
+                            json!({
+                                "remote_name": remote.name,
+                                "host": remote.host,
+                                "warning": warning,
+                            }),
+                        );
+                    }
+                }
+                let records = cache::load_records_from_remote_db(&fetch.local_db, &remote.name)
+                    .unwrap_or_default();
                 let machine_id = records.first().map(|rec| rec.machine_id.clone());
                 let machine_name = records.first().map(|rec| rec.machine_name.clone());
                 let mut store = cache::CacheStore::open(&cache_path, false)?;
@@ -417,7 +433,12 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
     Ok(())
 }
 
-fn refresh_and_rsync_remote(remote: &config::RemoteConfig) -> anyhow::Result<PathBuf> {
+struct RemoteSyncFetch {
+    local_db: PathBuf,
+    warning: Option<String>,
+}
+
+fn refresh_and_rsync_remote(remote: &config::RemoteConfig) -> anyhow::Result<RemoteSyncFetch> {
     let target = match remote.user.as_deref() {
         Some(user) => format!("{user}@{}", remote.host),
         None => remote.host.clone(),
@@ -434,11 +455,17 @@ fn refresh_and_rsync_remote(remote: &config::RemoteConfig) -> anyhow::Result<Pat
         .arg("refresh")
         .output()
         .with_context(|| format!("ssh refresh failed: {}", remote.name))?;
+    let mut warning = None;
     if !refresh.status.success() {
-        anyhow::bail!(
-            "remote refresh failed: {}",
-            String::from_utf8_lossy(&refresh.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&refresh.stderr).trim().to_string();
+        if remote_refresh_subcommand_unsupported(&stderr) {
+            warning = Some(format!(
+                "remote sync warning for {}: remote agent-history does not support the `refresh` subcommand; imported the existing remote cache without refreshing. Upgrade agent-history on {} to restore fresh remote syncs.",
+                remote.name, remote.host
+            ));
+        } else {
+            anyhow::bail!("remote refresh failed: {stderr}");
+        }
     }
 
     // Step 2: rsync the remote's cache DB
@@ -465,7 +492,15 @@ fn refresh_and_rsync_remote(remote: &config::RemoteConfig) -> anyhow::Result<Pat
         );
     }
 
-    Ok(local_db)
+    Ok(RemoteSyncFetch { local_db, warning })
+}
+
+fn remote_refresh_subcommand_unsupported(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("unexpected argument 'refresh'")
+        || lower.contains("unrecognized subcommand 'refresh'")
+        || (lower.contains("usage: agent-history [options]")
+            && !lower.contains("usage: agent-history [options] [command]"))
 }
 
 fn run_indexer(
@@ -2258,6 +2293,15 @@ mod tests {
         assert_eq!(rec.phase.as_deref(), Some("commentary"));
         assert_eq!(rec.text, "了解。");
         assert_eq!(rec.timestamp.as_deref(), Some("2026-02-11T14:16:44.023Z"));
+    }
+
+    #[test]
+    fn remote_refresh_subcommand_unsupported_matches_legacy_clap_output() {
+        let stderr = "error: unexpected argument 'refresh' found\nUsage: agent-history [OPTIONS]\nFor more information, try '--help'.";
+        assert!(remote_refresh_subcommand_unsupported(stderr));
+        assert!(!remote_refresh_subcommand_unsupported(
+            "remote refresh failed: permission denied"
+        ));
     }
 
     #[test]
