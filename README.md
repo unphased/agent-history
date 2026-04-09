@@ -74,7 +74,7 @@ cargo run --release
 For headless refresh/export:
 ```bash
 agent-history refresh
-agent-history export --format ndjson
+agent-history export --format tsv
 ```
 
 ## Multi-Machine Config
@@ -125,10 +125,10 @@ When remotes are configured, startup does this:
 
 ```bash
 ssh user@host agent-history refresh
-ssh user@host agent-history export --format ndjson
+rsync -az user@host:~/.local/state/agent-history/index.sqlite ~/.local/state/agent-history/remotes/<name>/index.sqlite
 ```
 
-The returned NDJSON is imported into the local SQLite cache, so search stays local and snappy even if a remote is temporarily offline. The log view shows remote sync freshness, counts, durations, and failures.
+The remote cache DB is imported into the local SQLite cache area, so search stays local and snappy even if a remote is temporarily offline. The log view shows remote sync freshness, counts, durations, and failures.
 
 ## List Format
 Each result row is:
@@ -172,6 +172,12 @@ rm ~/.local/state/agent-history/index.sqlite && time agent-history refresh
 
 # Refresh the local cache without launching the TUI
 agent-history refresh
+
+# Export one message/turn per TSV row
+agent-history export --format tsv
+
+# Filter export with the same matcher as the TUI, then pipe into fzf
+agent-history export --format tsv --query "cloud run" | fzf --delimiter=$'\t' --with-nth=1,2,8,9,14
 
 # Write telemetry JSONL to a custom path
 agent-history --telemetry-log /tmp/agent-history-events.jsonl

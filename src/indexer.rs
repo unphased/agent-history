@@ -1,6 +1,6 @@
 use crate::{
-    args::{RefreshArgs, RunArgs, ScanArgs},
-    cache, config, telemetry,
+    args::{ExportArgs, ExportFormat, RefreshArgs, RunArgs, ScanArgs},
+    cache, config, search, telemetry,
 };
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -10,7 +10,7 @@ use std::{
     collections::{HashSet, VecDeque},
     env,
     fs::{self, File},
-    io::{BufRead as _, BufReader},
+    io::{self, BufRead as _, BufReader},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
@@ -167,6 +167,39 @@ pub fn refresh_local_cache(args: RefreshArgs) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, &tx).map(|_| ())
 }
 
+pub fn export_records(args: ExportArgs) -> anyhow::Result<()> {
+    let cache_plan = ExportCachePlan::new(&args.scan)?;
+    let (tx, _rx) = mpsc::channel();
+
+    run_indexer_from_scan_args_with_cache_path(&args.scan, &tx, Some(cache_plan.db_path.clone()))?;
+
+    let sync_args = RunArgs {
+        scan: args.scan.clone(),
+        query: args.query.clone(),
+        max_results: 0,
+    };
+    sync_remotes_from_args_with_cache_path(&sync_args, &tx, &cache_plan.db_path)?;
+
+    let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
+    let mut records = cache::load_all_with_remotes(&store)?;
+    if let Some(query) = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let compiled = search::CompiledQuery::new(query);
+        records.retain(|record| compiled.matches_record(record));
+    }
+
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    match args.format {
+        ExportFormat::Tsv => write_records_as_tsv(&mut lock, &records)?,
+    }
+    Ok(())
+}
+
 fn run_indexer_from_args(args: RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
     run_indexer_from_scan_args(&args.scan, tx)
 }
@@ -174,6 +207,18 @@ fn run_indexer_from_args(args: RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyh
 fn run_indexer_from_scan_args(
     args: &ScanArgs,
     tx: &mpsc::Sender<IndexerEvent>,
+) -> anyhow::Result<()> {
+    run_indexer_from_scan_args_with_cache_path(
+        args,
+        tx,
+        (!args.no_cache).then(cache::default_db_path),
+    )
+}
+
+fn run_indexer_from_scan_args_with_cache_path(
+    args: &ScanArgs,
+    tx: &mpsc::Sender<IndexerEvent>,
+    cache_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let app_config = config::load_config(args.config.as_deref())?;
@@ -257,7 +302,7 @@ fn run_indexer_from_scan_args(
                     .to_string(),
             })
             .ok();
-            // 続行（history は取り込めないだけ）
+            // Continue; only history import is unavailable.
             roots.sort();
             roots.dedup();
             extra_files.sort();
@@ -271,7 +316,7 @@ fn run_indexer_from_scan_args(
                     opencode_storage_roots,
                 },
                 tx,
-                None,
+                cache_path,
                 false,
                 machine.clone(),
                 (!args.no_telemetry).then(|| {
@@ -315,7 +360,7 @@ fn run_indexer_from_scan_args(
             opencode_storage_roots,
         },
         tx,
-        (!args.no_cache).then(cache::default_db_path),
+        cache_path,
         args.rebuild_index,
         machine,
         (!args.no_telemetry).then(|| {
@@ -327,6 +372,15 @@ fn run_indexer_from_scan_args(
 }
 
 fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> anyhow::Result<()> {
+    let cache_path = cache::default_db_path();
+    sync_remotes_from_args_with_cache_path(args, tx, &cache_path)
+}
+
+fn sync_remotes_from_args_with_cache_path(
+    args: &RunArgs,
+    tx: &mpsc::Sender<IndexerEvent>,
+    cache_path: &Path,
+) -> anyhow::Result<()> {
     let cfg = config::load_config(args.scan.config.as_deref())?;
     let remotes: Vec<config::RemoteConfig> = cfg
         .remotes
@@ -336,7 +390,6 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
     if remotes.is_empty() {
         return Ok(());
     }
-    let cache_path = cache::default_db_path();
     let telemetry_path = (!args.scan.no_telemetry).then(|| {
         args.scan
             .telemetry_log
@@ -354,7 +407,7 @@ fn sync_remotes_from_args(args: &RunArgs, tx: &mpsc::Sender<IndexerEvent>) -> an
                 json!({"remote_name": remote.name, "host": remote.host}),
             );
         }
-        match refresh_and_rsync_remote(&remote, &cache_path) {
+        match refresh_and_rsync_remote(&remote, cache_path) {
             Ok(local_db) => {
                 let records =
                     cache::load_records_from_remote_db(&local_db, &remote.name).unwrap_or_default();
@@ -484,6 +537,100 @@ fn remote_refresh_subcommand_unsupported(stderr: &str) -> bool {
         || lower.contains("unrecognized subcommand 'refresh'")
         || (lower.contains("usage: agent-history [options]")
             && !lower.contains("usage: agent-history [options] [command]"))
+}
+
+struct ExportCachePlan {
+    db_path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl ExportCachePlan {
+    fn new(args: &ScanArgs) -> anyhow::Result<Self> {
+        if !args.no_cache {
+            return Ok(Self {
+                db_path: cache::default_db_path(),
+                cleanup_dir: None,
+            });
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-history-export-{}-{}",
+            std::process::id(),
+            unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&root)
+            .with_context(|| format!("export temp dir creation failed: {}", root.display()))?;
+        Ok(Self {
+            db_path: root.join("index.sqlite"),
+            cleanup_dir: Some(root),
+        })
+    }
+}
+
+impl Drop for ExportCachePlan {
+    fn drop(&mut self) {
+        if let Some(dir) = self.cleanup_dir.as_ref() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn write_records_as_tsv(mut out: impl io::Write, records: &[MessageRecord]) -> anyhow::Result<()> {
+    for record in records {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            tsv_field(record.timestamp.as_deref().unwrap_or("")),
+            source_name(record.source),
+            tsv_field(record.account.as_deref().unwrap_or("")),
+            tsv_field(record.origin.as_str()),
+            tsv_field(record.machine_name.as_str()),
+            tsv_field(record.machine_id.as_str()),
+            tsv_field(record.project_slug.as_deref().unwrap_or("")),
+            tsv_field(record.session_id.as_deref().unwrap_or("")),
+            role_name(record.role),
+            tsv_field(record.phase.as_deref().unwrap_or("")),
+            tsv_field(record.cwd.as_deref().unwrap_or("")),
+            tsv_field(&record.file.to_string_lossy()),
+            record.line,
+            tsv_field(record.text.as_str()),
+        )?;
+    }
+    Ok(())
+}
+
+fn tsv_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn source_name(source: SourceKind) -> &'static str {
+    match source {
+        SourceKind::CodexSessionJsonl => "codex-session",
+        SourceKind::CodexHistoryJsonl => "codex-history",
+        SourceKind::ClaudeProjectJsonl => "claude-project",
+        SourceKind::OpenCodeSession => "opencode-session",
+    }
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
+        Role::Unknown => "unknown",
+    }
+}
+
+fn unix_timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 fn run_indexer(
@@ -2276,6 +2423,88 @@ mod tests {
         assert_eq!(rec.phase.as_deref(), Some("commentary"));
         assert_eq!(rec.text, "了解。");
         assert_eq!(rec.timestamp.as_deref(), Some("2026-02-11T14:16:44.023Z"));
+    }
+
+    #[test]
+    fn write_records_as_tsv_outputs_one_single_line_row_per_record() {
+        let record = MessageRecord {
+            timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+            role: Role::Assistant,
+            text: "hello\tworld\nnext".to_string(),
+            file: PathBuf::from("/tmp/demo path.jsonl"),
+            line: 7,
+            session_id: Some("sid-1".to_string()),
+            account: Some("work".to_string()),
+            cwd: Some("/tmp/project".to_string()),
+            phase: Some("commentary".to_string()),
+            images: Vec::new(),
+            machine_id: "mbp".to_string(),
+            machine_name: "MacBook Pro".to_string(),
+            project_slug: Some("proj".to_string()),
+            origin: "local".to_string(),
+            source: SourceKind::CodexSessionJsonl,
+        };
+
+        let mut out = Vec::new();
+        write_records_as_tsv(&mut out, &[record]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert_eq!(rendered.matches('\n').count(), 1);
+        assert!(rendered.contains("sid-1"));
+        assert!(rendered.contains("hello\\tworld\\nnext"));
+        assert!(rendered.contains("codex-session"));
+        assert!(rendered.contains("assistant"));
+    }
+
+    #[test]
+    fn tsv_field_escapes_control_characters() {
+        assert_eq!(tsv_field("a\tb\nc\rd\\"), "a\\tb\\nc\\rd\\\\");
+    }
+
+    #[test]
+    fn compiled_query_filters_export_records_like_the_tui() {
+        let mut records = vec![
+            MessageRecord {
+                timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+                role: Role::User,
+                text: "hello world".to_string(),
+                file: PathBuf::from("/tmp/a.jsonl"),
+                line: 1,
+                session_id: Some("a".to_string()),
+                account: None,
+                cwd: None,
+                phase: None,
+                images: Vec::new(),
+                machine_id: "local".to_string(),
+                machine_name: "local".to_string(),
+                project_slug: None,
+                origin: "local".to_string(),
+                source: SourceKind::CodexSessionJsonl,
+            },
+            MessageRecord {
+                timestamp: Some("2026-01-01T00:00:01Z".to_string()),
+                role: Role::User,
+                text: "goodbye".to_string(),
+                file: PathBuf::from("/tmp/b.jsonl"),
+                line: 2,
+                session_id: Some("b".to_string()),
+                account: None,
+                cwd: None,
+                phase: None,
+                images: Vec::new(),
+                machine_id: "local".to_string(),
+                machine_name: "local".to_string(),
+                project_slug: None,
+                origin: "local".to_string(),
+                source: SourceKind::CodexSessionJsonl,
+            },
+        ];
+
+        let compiled = search::CompiledQuery::new("hello");
+        records.retain(|record| compiled.matches_record(record));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id.as_deref(), Some("a"));
     }
 
     #[test]

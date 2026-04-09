@@ -15,6 +15,9 @@ fn main() -> anyhow::Result<()> {
         Some(args::Command::Refresh(refresh)) => {
             indexer::refresh_local_cache(refresh).context("refresh failed")?;
         }
+        Some(args::Command::Export(export)) => {
+            indexer::export_records(export).context("export failed")?;
+        }
         None => {
             tui::run(cli.run).context("TUI run failed")?;
         }

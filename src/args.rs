@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
@@ -19,6 +19,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     Refresh(RefreshArgs),
+    Export(ExportArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -74,4 +75,23 @@ pub struct RunArgs {
 pub struct RefreshArgs {
     #[command(flatten)]
     pub scan: ScanArgs,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ExportArgs {
+    #[command(flatten)]
+    pub scan: ScanArgs,
+
+    /// Optional query filter using the same matching rules as the TUI
+    #[arg(long, short = 'q', value_name = "QUERY")]
+    pub query: Option<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = ExportFormat::Tsv)]
+    pub format: ExportFormat,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ExportFormat {
+    Tsv,
 }
