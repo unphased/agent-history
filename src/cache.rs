@@ -14,8 +14,6 @@ const SCHEMA_VERSION: i64 = 4;
 pub struct RemoteSyncStatus {
     pub remote_name: String,
     pub host: String,
-    pub machine_id: Option<String>,
-    pub machine_name: Option<String>,
     pub last_attempted_ms: Option<i64>,
     pub last_success_ms: Option<i64>,
     pub last_duration_ms: Option<i64>,
@@ -116,6 +114,7 @@ impl CacheStore {
         Ok(out)
     }
 
+    #[cfg(test)]
     pub fn load_records(&self, unit_keys: &[String]) -> anyhow::Result<Vec<MessageRecord>> {
         let mut out = Vec::new();
         for chunk in unit_keys.chunks(400) {
@@ -153,41 +152,6 @@ impl CacheStore {
             for row in rows {
                 out.push(row?);
             }
-        }
-        Ok(out)
-    }
-
-    pub fn load_all_records(&self) -> anyhow::Result<Vec<MessageRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
-                 FROM message_records ORDER BY origin, unit_key, ord",
-            )
-            .context("cache all-record query failed")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(MessageRecord {
-                timestamp: row.get(0)?,
-                role: role_from_db(row.get::<_, i64>(1)?),
-                text: row.get(2)?,
-                file: PathBuf::from(row.get::<_, String>(3)?),
-                line: row.get::<_, i64>(4)? as u32,
-                session_id: row.get(5)?,
-                account: row.get(6)?,
-                cwd: row.get(7)?,
-                phase: row.get(8)?,
-                images: serde_json::from_str::<Vec<ImageAttachment>>(&row.get::<_, String>(9)?)
-                    .unwrap_or_default(),
-                source: source_from_db(row.get::<_, i64>(10)?),
-                machine_id: row.get(11)?,
-                machine_name: row.get(12)?,
-                project_slug: row.get(13)?,
-                origin: row.get(14)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
         }
         Ok(out)
     }
@@ -360,21 +324,19 @@ impl CacheStore {
 
     pub fn load_remote_sync_states(&self) -> anyhow::Result<Vec<RemoteSyncStatus>> {
         let mut stmt = self.conn.prepare(
-            "SELECT remote_name, host, machine_id, machine_name, last_attempted_ms, last_success_ms, last_duration_ms, imported_records, imported_sessions, last_error
+            "SELECT remote_name, host, last_attempted_ms, last_success_ms, last_duration_ms, imported_records, imported_sessions, last_error
              FROM remote_sync_state ORDER BY remote_name"
         ).context("remote sync state query failed")?;
         let rows = stmt.query_map([], |row| {
             Ok(RemoteSyncStatus {
                 remote_name: row.get(0)?,
                 host: row.get(1)?,
-                machine_id: row.get(2)?,
-                machine_name: row.get(3)?,
-                last_attempted_ms: row.get(4)?,
-                last_success_ms: row.get(5)?,
-                last_duration_ms: row.get(6)?,
-                imported_records: row.get(7)?,
-                imported_sessions: row.get(8)?,
-                last_error: row.get(9)?,
+                last_attempted_ms: row.get(2)?,
+                last_success_ms: row.get(3)?,
+                last_duration_ms: row.get(4)?,
+                imported_records: row.get(5)?,
+                imported_sessions: row.get(6)?,
+                last_error: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
