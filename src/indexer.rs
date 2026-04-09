@@ -10,7 +10,7 @@ use std::{
     collections::{HashSet, VecDeque},
     env,
     fs::{self, File},
-    io::{self, BufRead as _, BufReader, Write as _},
+    io::{self, BufRead as _, BufReader},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
@@ -170,6 +170,25 @@ pub fn refresh_local_cache(args: RefreshArgs) -> anyhow::Result<()> {
 pub fn export_records(args: ExportArgs) -> anyhow::Result<()> {
     let cache_plan = ExportCachePlan::new(&args.scan)?;
     let (tx, _rx) = mpsc::channel();
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    let compiled_query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(search::CompiledQuery::new);
+
+    let emitted_snapshot = if !args.scan.no_cache
+        && !args.scan.rebuild_index
+        && cache_plan.db_path.exists()
+    {
+        let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
+        stream_export_records(&mut lock, &store, compiled_query.as_ref())?;
+        true
+    } else {
+        false
+    };
 
     run_indexer_from_scan_args_with_cache_path(&args.scan, &tx, Some(cache_plan.db_path.clone()))?;
 
@@ -180,32 +199,13 @@ pub fn export_records(args: ExportArgs) -> anyhow::Result<()> {
     };
     sync_remotes_from_args_with_cache_path(&sync_args, &tx, &cache_plan.db_path)?;
 
-    let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
-    let stdout = io::stdout();
-    let mut lock = stdout.lock();
-    let compiled_query = args
-        .query
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(search::CompiledQuery::new);
-    let mut rows_written = 0usize;
-    match args.format {
-        ExportFormat::Tsv => cache::stream_all_with_remotes(&store, |record| {
-            if let Some(compiled) = compiled_query.as_ref()
-                && !compiled.matches_record(&record)
-            {
-                return Ok(());
-            }
-            write_record_as_tsv(&mut lock, &record)?;
-            rows_written = rows_written.saturating_add(1);
-            if rows_written == 1 || rows_written.is_multiple_of(128) {
-                lock.flush()?;
-            }
-            Ok(())
-        })?,
+    if !emitted_snapshot {
+        let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
+        match args.format {
+            ExportFormat::Tsv => stream_export_records(&mut lock, &store, compiled_query.as_ref())?,
+        }
     }
-    lock.flush()?;
+
     Ok(())
 }
 
@@ -611,6 +611,29 @@ fn write_record_as_tsv(mut out: impl io::Write, record: &MessageRecord) -> anyho
         record.line,
         tsv_field(record.text.as_str()),
     )?;
+    Ok(())
+}
+
+fn stream_export_records(
+    mut out: impl io::Write,
+    store: &cache::CacheStore,
+    compiled_query: Option<&search::CompiledQuery>,
+) -> anyhow::Result<()> {
+    let mut rows_written = 0usize;
+    cache::stream_all_with_remotes(store, |record| {
+        if let Some(compiled) = compiled_query
+            && !compiled.matches_record(&record)
+        {
+            return Ok(());
+        }
+        write_record_as_tsv(&mut out, &record)?;
+        rows_written = rows_written.saturating_add(1);
+        if rows_written == 1 || rows_written.is_multiple_of(128) {
+            out.flush()?;
+        }
+        Ok(())
+    })?;
+    out.flush()?;
     Ok(())
 }
 
