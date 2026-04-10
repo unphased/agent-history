@@ -556,30 +556,32 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn tag_style(bg: Color) -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(bg)
-        .add_modifier(Modifier::BOLD)
+fn tag_style(fg: Color, bg: Color) -> Style {
+    Style::default().fg(fg).bg(bg)
 }
 
 fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
     tags.show_host && sess.origin != "local" && !sess.machine_name.trim().is_empty()
 }
 
+const REMOTE_ACCENT: Color = Color::Rgb(138, 112, 144);
+const REMOTE_TAG_BG: Color = Color::Rgb(82, 70, 88);
+const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
+const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
+
 fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if tags.show_provider {
         spans.push(Span::styled(
             format!(" {} ", provider_label(sess.source, sess.account.as_deref())),
-            tag_style(Color::Cyan),
+            tag_style(Color::Rgb(210, 217, 224), Color::Rgb(64, 78, 92)),
         ));
         spans.push(Span::raw(" "));
     }
     if should_show_host_tag(sess, tags) {
         spans.push(Span::styled(
             format!(" {} ", sess.machine_name),
-            tag_style(Color::Magenta),
+            tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
         ));
         spans.push(Span::raw(" "));
     }
@@ -591,7 +593,7 @@ fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
     {
         spans.push(Span::styled(
             format!(" {project} "),
-            tag_style(Color::Yellow),
+            tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
         ));
         spans.push(Span::raw(" "));
     }
@@ -2005,6 +2007,8 @@ struct App {
     show_telemetry: bool,
     preview_bgcolor_target: Option<String>,
     preview_bgcolor: Option<Color>,
+    preview_remote_style: bool,
+    preview_bgcolor_cache: HashMap<String, Option<Color>>,
     ui_tags: config::UiTagConfig,
     remotes: HashMap<String, config::RemoteConfig>,
 }
@@ -2075,6 +2079,8 @@ fn run_app(
         show_telemetry: false,
         preview_bgcolor_target: None,
         preview_bgcolor: None,
+        preview_remote_style: false,
+        preview_bgcolor_cache: HashMap::new(),
         ui_tags: app_config.ui.tags,
         remotes,
     };
@@ -2343,6 +2349,16 @@ fn selected_preview_bgcolor_target(app: &App) -> Option<&str> {
     session.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty())
 }
 
+fn selected_preview_is_remote(app: &App) -> bool {
+    let Some(hit) = app.selected_hit() else {
+        return false;
+    };
+    let Some(session) = app.sessions.get(hit.session_idx) else {
+        return false;
+    };
+    session.origin != "local"
+}
+
 const EVENTS_PREVIEW_BGCOLOR: &str = "#202020";
 
 fn parse_hex_color(hex: &str) -> Option<Color> {
@@ -2400,28 +2416,39 @@ fn resolve_preview_bgcolor_for_target(target: &str) -> anyhow::Result<Option<Col
 }
 
 fn sync_preview_bgcolor(app: &mut App) {
-    let target = if app.show_telemetry {
+    let preview_remote_style = !app.show_telemetry && selected_preview_is_remote(app);
+    let target = if app.show_telemetry || preview_remote_style {
         Some(EVENTS_PREVIEW_BGCOLOR.to_string())
     } else {
         selected_preview_bgcolor_target(app).map(str::to_owned)
     };
-    if target == app.preview_bgcolor_target {
+    if target == app.preview_bgcolor_target && preview_remote_style == app.preview_remote_style {
         return;
     }
 
-    match target
-        .as_deref()
-        .map(resolve_preview_bgcolor_for_target)
-        .transpose()
-    {
-        Ok(color) => {
-            app.preview_bgcolor_target = target;
-            app.preview_bgcolor = color.flatten();
+    let color = match target.as_ref() {
+        None => None,
+        Some(target) => {
+            if let Some(cached) = app.preview_bgcolor_cache.get(target) {
+                *cached
+            } else {
+                match resolve_preview_bgcolor_for_target(target) {
+                    Ok(color) => {
+                        app.preview_bgcolor_cache.insert(target.clone(), color);
+                        color
+                    }
+                    Err(err) => {
+                        app.indexing.last_warn = Some(format!("preview bgcolor update failed: {err}"));
+                        return;
+                    }
+                }
+            }
         }
-        Err(err) => {
-            app.indexing.last_warn = Some(format!("preview bgcolor update failed: {err}"));
-        }
-    }
+    };
+
+    app.preview_bgcolor_target = target;
+    app.preview_bgcolor = color;
+    app.preview_remote_style = preview_remote_style;
 }
 
 fn app_panes(area: Rect) -> (Rect, Rect) {
@@ -3244,11 +3271,20 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .preview_bgcolor
         .map(|color| Style::default().bg(color))
         .unwrap_or_default();
+    let preview_border_style = if app.preview_remote_style {
+        Style::default()
+            .fg(REMOTE_PREVIEW_BORDER_FG)
+            .bg(REMOTE_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let preview = Paragraph::new(Text::from(preview_doc.lines))
         .style(preview_style)
         .block(
             Block::default()
                 .style(preview_style)
+                .border_style(preview_border_style)
                 .borders(Borders::ALL)
                 .title(if app.show_telemetry {
                     "Events"
@@ -3300,9 +3336,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         };
         let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
         let selected_base_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD);
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED);
         let selected_match_style = Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
@@ -3806,6 +3841,8 @@ mod tests {
             show_telemetry: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
+            preview_remote_style: false,
+            preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         }
@@ -4406,6 +4443,8 @@ mod tests {
             show_telemetry: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
+            preview_remote_style: false,
+            preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
@@ -4474,6 +4513,8 @@ mod tests {
             show_telemetry: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
+            preview_remote_style: false,
+            preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
@@ -4964,6 +5005,8 @@ mod tests {
             show_telemetry: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
+            preview_remote_style: false,
+            preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
