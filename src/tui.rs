@@ -606,7 +606,11 @@ fn result_line_text(
     hit_count: usize,
 ) -> String {
     let ts = short_ts(sess.last_ts.as_deref());
-    let prefix = format!("{ts} [{}] {}", sess.dir, sess.first_line);
+    let dir_prefix = match sess.project_slug.as_deref() {
+        Some(project) if project == sess.dir => String::new(),
+        _ => format!("[{}] ", sess.dir),
+    };
+    let prefix = format!("{ts} {dir_prefix}{}", sess.first_line);
 
     let Some(rec) = matched else {
         return prefix;
@@ -642,10 +646,21 @@ fn result_line(
         .strip_prefix(&ts)
         .unwrap_or(&full_text)
         .trim_start();
-    let tag_spans = session_tag_spans(sess, ui_tags);
+    let tag_spans: Vec<Span<'static>> = session_tag_spans(sess, ui_tags)
+        .into_iter()
+        .map(|span| {
+            let style = span
+                .style
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED);
+            Span::styled(span.content.into_owned(), style)
+        })
+        .collect();
 
     let mut spans: Vec<Span<'static>> = vec![Span::styled(ts, base_style)];
-    if !rest.is_empty() || !tag_spans.is_empty() {
+    if !tag_spans.is_empty() {
+        spans.push(Span::styled("  ".to_string(), base_style));
+    } else if !rest.is_empty() {
         spans.push(Span::styled(" ".to_string(), base_style));
     }
     spans.extend(tag_spans);
@@ -2361,6 +2376,12 @@ fn selected_preview_is_remote(app: &App) -> bool {
 
 const EVENTS_PREVIEW_BGCOLOR: &str = "#202020";
 
+fn events_preview_style() -> Style {
+    parse_hex_color(EVENTS_PREVIEW_BGCOLOR)
+        .map(|color| Style::default().bg(color))
+        .unwrap_or_default()
+}
+
 fn parse_hex_color(hex: &str) -> Option<Color> {
     let hex = hex.trim();
     let digits = hex.strip_prefix('#')?;
@@ -3083,8 +3104,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
             let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
             app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+            let telemetry_style = events_preview_style();
             let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
-                .block(Block::default().borders(Borders::ALL).title("Events"))
+                .style(telemetry_style)
+                .block(
+                    Block::default()
+                        .style(telemetry_style)
+                        .borders(Borders::ALL)
+                        .title("Events"),
+                )
                 .scroll((app.preview_scroll as u16, 0))
                 .wrap(Wrap { trim: false });
             f.render_widget(telemetry, telemetry_area);
@@ -3161,8 +3189,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
         let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
         app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+        let telemetry_style = events_preview_style();
         let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
-            .block(Block::default().borders(Borders::ALL).title("Events"))
+            .style(telemetry_style)
+            .block(
+                Block::default()
+                    .style(telemetry_style)
+                    .borders(Borders::ALL)
+                    .title("Events"),
+            )
             .scroll((app.preview_scroll as u16, 0))
             .wrap(Wrap { trim: false });
         f.render_widget(telemetry, telemetry_area);
@@ -3336,6 +3371,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         };
         let matched = hit.matched_record_idx.and_then(|idx| app.all.get(idx));
         let selected_base_style = Style::default()
+            .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::UNDERLINED);
         let selected_match_style = Style::default()
