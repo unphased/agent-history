@@ -6,7 +6,7 @@ use crate::{
     },
     search, telemetry,
 };
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor,
@@ -30,7 +30,7 @@ use std::{
     cmp,
     collections::HashMap,
     env, fs,
-    io::{self, Stdout, Write},
+    io::{self, Stdout},
     mem,
     path::{Path, PathBuf},
     process::Command,
@@ -2003,7 +2003,8 @@ struct App {
     telemetry_log_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
     show_telemetry: bool,
-    last_bgcolor_target: Option<String>,
+    preview_bgcolor_target: Option<String>,
+    preview_bgcolor: Option<Color>,
     ui_tags: config::UiTagConfig,
     remotes: HashMap<String, config::RemoteConfig>,
 }
@@ -2072,7 +2073,8 @@ fn run_app(
         }),
         cache_path: (!args.scan.no_cache).then(cache::default_db_path),
         show_telemetry: false,
-        last_bgcolor_target: None,
+        preview_bgcolor_target: None,
+        preview_bgcolor: None,
         ui_tags: app_config.ui.tags,
         remotes,
     };
@@ -2082,7 +2084,7 @@ fn run_app(
             handle_indexer_event(&mut app, ev);
         }
 
-        sync_terminal_bgcolor(terminal, &mut app);
+        sync_preview_bgcolor(&mut app);
 
         terminal.draw(|f| ui(f, &mut app)).context("描画に失敗")?;
 
@@ -2335,85 +2337,91 @@ fn handle_key(
     Ok(false)
 }
 
-fn selected_bgcolor_target(app: &App) -> Option<&str> {
+fn selected_preview_bgcolor_target(app: &App) -> Option<&str> {
     let hit = app.selected_hit()?;
     let session = app.sessions.get(hit.session_idx)?;
     session.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty())
 }
 
-const EVENTS_TERMINAL_BGCOLOR: &str = "#202020";
+const EVENTS_PREVIEW_BGCOLOR: &str = "#202020";
 
-fn emit_terminal_bgcolor_hex(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    hex: &str,
-) -> anyhow::Result<()> {
-    let osc11 = format!("\u{1b}]11;{hex}\u{1b}\\");
-    terminal
-        .backend_mut()
-        .write_all(osc11.as_bytes())
-        .context("failed to emit terminal background escape sequence")?;
-    terminal
-        .backend_mut()
-        .flush()
-        .context("failed to flush terminal background escape sequence")?;
-    Ok(())
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.trim();
+    let digits = hex.strip_prefix('#')?;
+    if digits.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some(Color::Rgb(red, green, blue))
 }
 
-fn emit_terminal_bgcolor_for_path(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    path: &str,
-) -> anyhow::Result<()> {
+fn resolve_preview_bgcolor_for_target(target: &str) -> anyhow::Result<Option<Color>> {
+    if target.starts_with('#') {
+        return parse_hex_color(target)
+            .map(Some)
+            .ok_or_else(|| anyhow!("invalid preview background color: {target}"));
+    }
+
     let Some(home) = env::var_os("HOME") else {
-        return Ok(());
+        return Ok(None);
     };
     let script = PathBuf::from(home).join("util/bgcolor.sh");
     if !script.is_file() {
-        return Ok(());
+        return Ok(None);
     }
 
     let output = Command::new(script)
-        .arg("--format=osc11")
-        .arg(path)
+        .arg("--format=hex")
+        .arg(target)
         .output()
-        .context("failed to resolve terminal background color")?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Ok(());
+        .context("failed to resolve preview background color")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "preview background resolver failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
     }
 
-    terminal
-        .backend_mut()
-        .write_all(&output.stdout)
-        .context("failed to emit terminal background escape sequence")?;
-    terminal
-        .backend_mut()
-        .flush()
-        .context("failed to flush terminal background escape sequence")?;
-    Ok(())
+    let hex = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if hex.is_empty() {
+        return Ok(None);
+    }
+
+    parse_hex_color(&hex)
+        .map(Some)
+        .ok_or_else(|| anyhow!("invalid preview background color: {hex}"))
 }
 
-fn sync_terminal_bgcolor(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) {
+fn sync_preview_bgcolor(app: &mut App) {
     let target = if app.show_telemetry {
-        Some(EVENTS_TERMINAL_BGCOLOR.to_string())
+        Some(EVENTS_PREVIEW_BGCOLOR.to_string())
     } else {
-        selected_bgcolor_target(app).map(str::to_owned)
+        selected_preview_bgcolor_target(app).map(str::to_owned)
     };
-    if target == app.last_bgcolor_target {
+    if target == app.preview_bgcolor_target {
         return;
     }
 
-    if let Some(value) = target.as_deref() {
-        let result = if value.starts_with('#') {
-            emit_terminal_bgcolor_hex(terminal, value)
-        } else {
-            emit_terminal_bgcolor_for_path(terminal, value)
-        };
-        if let Err(err) = result {
-            app.indexing.last_warn = Some(format!("bgcolor update failed: {err}"));
-            return;
+    match target
+        .as_deref()
+        .map(resolve_preview_bgcolor_for_target)
+        .transpose()
+    {
+        Ok(color) => {
+            app.preview_bgcolor_target = target;
+            app.preview_bgcolor = color.flatten();
+        }
+        Err(err) => {
+            app.indexing.last_warn = Some(format!("preview bgcolor update failed: {err}"));
         }
     }
-
-    app.last_bgcolor_target = target;
 }
 
 fn app_panes(area: Rect) -> (Rect, Rect) {
@@ -3232,9 +3240,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
+    let preview_style = app
+        .preview_bgcolor
+        .map(|color| Style::default().bg(color))
+        .unwrap_or_default();
     let preview = Paragraph::new(Text::from(preview_doc.lines))
+        .style(preview_style)
         .block(
             Block::default()
+                .style(preview_style)
                 .borders(Borders::ALL)
                 .title(if app.show_telemetry {
                     "Events"
@@ -3790,7 +3804,8 @@ mod tests {
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
-            last_bgcolor_target: None,
+            preview_bgcolor_target: None,
+            preview_bgcolor: None,
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         }
@@ -4389,7 +4404,8 @@ mod tests {
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
-            last_bgcolor_target: None,
+            preview_bgcolor_target: None,
+            preview_bgcolor: None,
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
@@ -4456,7 +4472,8 @@ mod tests {
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
-            last_bgcolor_target: None,
+            preview_bgcolor_target: None,
+            preview_bgcolor: None,
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
@@ -4894,7 +4911,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_bgcolor_target_uses_selected_session_cwd() {
+    fn selected_preview_bgcolor_target_uses_selected_session_cwd() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:01Z"),
@@ -4945,12 +4962,26 @@ mod tests {
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
-            last_bgcolor_target: None,
+            preview_bgcolor_target: None,
+            preview_bgcolor: None,
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
         };
 
-        assert_eq!(selected_bgcolor_target(&app), Some("/tmp/project-a"));
+        assert_eq!(
+            selected_preview_bgcolor_target(&app),
+            Some("/tmp/project-a")
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_rgb_hex() {
+        assert_eq!(
+            parse_hex_color("#123abc"),
+            Some(Color::Rgb(0x12, 0x3a, 0xbc))
+        );
+        assert_eq!(parse_hex_color("123abc"), None);
+        assert_eq!(parse_hex_color("#123abz"), None);
     }
 
     #[test]
