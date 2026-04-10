@@ -659,7 +659,7 @@ fn result_line(
 
     let mut spans: Vec<Span<'static>> = vec![Span::styled(ts, base_style)];
     if !tag_spans.is_empty() {
-        spans.push(Span::styled("  ".to_string(), base_style));
+        spans.push(Span::raw(" "));
     } else if !rest.is_empty() {
         spans.push(Span::styled(" ".to_string(), base_style));
     }
@@ -2542,6 +2542,14 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
 }
 
 impl App {
+    fn matched_turn_count(&self) -> usize {
+        self.filtered.iter().map(|hit| hit.hit_count).sum()
+    }
+
+    fn total_turn_count(&self) -> usize {
+        self.all.len()
+    }
+
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
 
@@ -3281,7 +3289,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let results = Paragraph::new(Text::from(lines)).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Results ({})", app.filtered.len())),
+            .title(format!(
+                "Results (sessions {}/{} turns {}/{})",
+                app.filtered.len(),
+                app.sessions.len(),
+                app.matched_turn_count(),
+                app.total_turn_count()
+            )),
     );
     f.render_widget(results, results_area);
 
@@ -4947,6 +4961,48 @@ mod tests {
         assert!(rendered.contains("session opener"));
         assert!(rendered.contains("matching context"));
         assert!(rendered.contains("[3 hits]"));
+    }
+
+    #[test]
+    fn matched_turn_count_sums_hits_across_filtered_sessions() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "needle one",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "needle two",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "haystack",
+                "b",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:04Z"),
+                Role::Assistant,
+                "needle three",
+                "b",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "needle".to_string();
+
+        app.update_results();
+
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(app.matched_turn_count(), 3);
+        assert_eq!(app.total_turn_count(), 4);
     }
 
     #[test]
