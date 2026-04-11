@@ -87,6 +87,12 @@ struct PreviewDoc {
     first_match_line: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBrowserPane {
+    Start,
+    End,
+}
+
 const PREVIEW_MAX_MATCHES: usize = 100;
 const PREVIEW_MAX_LINES: usize = 5000;
 
@@ -646,16 +652,7 @@ fn result_line(
         .strip_prefix(&ts)
         .unwrap_or(&full_text)
         .trim_start();
-    let tag_spans: Vec<Span<'static>> = session_tag_spans(sess, ui_tags)
-        .into_iter()
-        .map(|span| {
-            let style = span
-                .style
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::UNDERLINED);
-            Span::styled(span.content.into_owned(), style)
-        })
-        .collect();
+    let tag_spans = session_tag_spans(sess, ui_tags);
 
     let mut spans: Vec<Span<'static>> = vec![Span::styled(ts, base_style)];
     if !tag_spans.is_empty() {
@@ -2011,6 +2008,9 @@ struct App {
     offset: usize,
     preview_scroll: usize,
     preview_scroll_reset_pending: bool,
+    session_browser_start_scroll: usize,
+    session_browser_end_scroll: usize,
+    session_browser_active_pane: SessionBrowserPane,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -2080,6 +2080,9 @@ fn run_app(
         offset: 0,
         preview_scroll: 0,
         preview_scroll_reset_pending: false,
+        session_browser_start_scroll: 0,
+        session_browser_end_scroll: usize::MAX,
+        session_browser_active_pane: SessionBrowserPane::Start,
         last_query: String::new(),
         last_results: Vec::new(),
         indexing: IndexingProgress::default(),
@@ -2186,6 +2189,10 @@ fn handle_key(
 
     // Accept query input even while indexing is still in progress.
     match key.code {
+        KeyCode::Tab if app.showing_session_browser() => {
+            app.toggle_session_browser_active_pane();
+            return Ok(false);
+        }
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.scroll_preview_lines(-1);
             return Ok(false);
@@ -2524,14 +2531,38 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
+            if app.showing_session_browser() && point_in_rect(mouse.column, mouse.row, preview_area) {
+                let panes = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                    .split(preview_area);
+                let pane = if point_in_rect(mouse.column, mouse.row, panes[0]) {
+                    SessionBrowserPane::Start
+                } else {
+                    SessionBrowserPane::End
+                };
+                app.set_session_browser_active_pane(pane);
+                app.scroll_preview_lines(-preview_line_step);
+            } else if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(-preview_line_step);
             } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(-results_line_step);
             }
         }
         MouseEventKind::ScrollDown => {
-            if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
+            if app.showing_session_browser() && point_in_rect(mouse.column, mouse.row, preview_area) {
+                let panes = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                    .split(preview_area);
+                let pane = if point_in_rect(mouse.column, mouse.row, panes[0]) {
+                    SessionBrowserPane::Start
+                } else {
+                    SessionBrowserPane::End
+                };
+                app.set_session_browser_active_pane(pane);
+                app.scroll_preview_lines(preview_line_step);
+            } else if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(preview_line_step);
             } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(results_line_step);
@@ -2542,6 +2573,10 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
 }
 
 impl App {
+    fn showing_session_browser(&self) -> bool {
+        self.ready && !self.show_telemetry && self.query.trim().is_empty() && self.selected_hit().is_some()
+    }
+
     fn matched_turn_count(&self) -> usize {
         self.filtered.iter().map(|hit| hit.hit_count).sum()
     }
@@ -2644,8 +2679,103 @@ impl App {
     }
 
     fn reset_preview_scroll_to_match(&mut self) {
+        if self.showing_session_browser() {
+            self.session_browser_start_scroll = 0;
+            self.session_browser_end_scroll = usize::MAX;
+            self.session_browser_active_pane = SessionBrowserPane::Start;
+            self.preview_scroll_reset_pending = true;
+            return;
+        }
         self.preview_scroll = self.build_preview_doc().first_match_line.saturating_sub(2);
         self.preview_scroll_reset_pending = true;
+    }
+
+    fn session_browser_doc(&self) -> PreviewDoc {
+        let Some(hit) = self.selected_hit() else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
+        };
+        let Some(sess) = self.sessions.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
+        };
+        let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+            };
+        };
+
+        let base_style = Style::default();
+        let match_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::raw(format!("session id: {}", sess.session_id)),
+            Line::raw(format!(
+                "account: {}",
+                sess.account.as_deref().unwrap_or("")
+            )),
+            Line::raw(format!("host: {}", sess.machine_name)),
+            Line::raw(format!("machine id: {}", sess.machine_id)),
+            Line::raw(format!("origin: {}", sess.origin)),
+            Line::raw(format!(
+                "project: {}",
+                sess.project_slug.as_deref().unwrap_or("")
+            )),
+            Line::raw(format!("source: {}", source_label(sess.source))),
+            Line::raw(format!("turns: {}", record_idxs.len())),
+            Line::raw(""),
+        ];
+
+        for (pos, &idx) in record_idxs.iter().enumerate() {
+            let Some(rec) = self.all.get(idx) else {
+                continue;
+            };
+            let role = match rec.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+                Role::Unknown => "unknown",
+            };
+
+            lines.push(Line::raw(format!(
+                "turn {}   {}   role: {role}   phase: {}",
+                pos + 1,
+                short_ts(rec.timestamp.as_deref()),
+                rec.phase.as_deref().unwrap_or("")
+            )));
+            lines.push(Line::raw(format!(
+                "file: {}:{}",
+                rec.file.display(),
+                rec.line
+            )));
+            if !rec.images.is_empty() {
+                lines.push(Line::raw(format!("images: {}", rec.images.len())));
+                for path in materialize_record_images(rec) {
+                    lines.push(Line::raw(format!("image file: {path}")));
+                }
+            }
+            lines.extend(render_preview_message_lines(
+                &rec.text,
+                "",
+                base_style,
+                match_style,
+            ));
+            lines.push(Line::raw(""));
+        }
+
+        PreviewDoc {
+            lines,
+            first_match_line: 0,
+        }
     }
 
     fn build_preview_doc(&self) -> PreviewDoc {
@@ -2976,6 +3106,20 @@ impl App {
     }
 
     fn scroll_preview_lines(&mut self, delta: i32) {
+        if self.showing_session_browser() {
+            match self.session_browser_active_pane {
+                SessionBrowserPane::Start => {
+                    let cur = self.session_browser_start_scroll as i32;
+                    self.session_browser_start_scroll = cmp::max(0, cur + delta) as usize;
+                }
+                SessionBrowserPane::End => {
+                    let cur = self.session_browser_end_scroll as i32;
+                    self.session_browser_end_scroll = cmp::max(0, cur + delta) as usize;
+                }
+            }
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
         let cur = self.preview_scroll as i32;
         self.preview_scroll = cmp::max(0, cur + delta) as usize;
         self.preview_scroll_reset_pending = false;
@@ -3023,6 +3167,17 @@ impl App {
     fn toggle_telemetry_view(&mut self) {
         self.show_telemetry = !self.show_telemetry;
         self.reset_preview_scroll_to_match();
+    }
+
+    fn set_session_browser_active_pane(&mut self, pane: SessionBrowserPane) {
+        self.session_browser_active_pane = pane;
+    }
+
+    fn toggle_session_browser_active_pane(&mut self) {
+        self.session_browser_active_pane = match self.session_browser_active_pane {
+            SessionBrowserPane::Start => SessionBrowserPane::End,
+            SessionBrowserPane::End => SessionBrowserPane::Start,
+        };
     }
 }
 
@@ -3328,22 +3483,74 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         Style::default()
     };
-    let preview = Paragraph::new(Text::from(preview_doc.lines))
-        .style(preview_style)
-        .block(
-            Block::default()
+    if app.showing_session_browser() {
+        let browser_doc = app.session_browser_doc();
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .split(preview_area);
+
+        for (pane_kind, pane_area, title) in [
+            (SessionBrowserPane::Start, panes[0], "Start"),
+            (SessionBrowserPane::End, panes[1], "End"),
+        ] {
+            let pane_inner_height = pane_area.height.saturating_sub(2) as usize;
+            let pane_inner_width = pane_area.width.saturating_sub(2) as usize;
+            let pane_total_lines = preview_visual_line_count(&browser_doc.lines, pane_inner_width);
+            let pane_max_scroll = pane_total_lines.saturating_sub(pane_inner_height);
+            let scroll = match pane_kind {
+                SessionBrowserPane::Start => {
+                    app.session_browser_start_scroll =
+                        cmp::min(app.session_browser_start_scroll, pane_max_scroll);
+                    app.session_browser_start_scroll
+                }
+                SessionBrowserPane::End => {
+                    if app.preview_scroll_reset_pending {
+                        app.session_browser_end_scroll = pane_max_scroll;
+                    } else {
+                        app.session_browser_end_scroll =
+                            cmp::min(app.session_browser_end_scroll, pane_max_scroll);
+                    }
+                    app.session_browser_end_scroll
+                }
+            };
+            let border_style = if app.session_browser_active_pane == pane_kind {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                preview_border_style
+            };
+            let pane = Paragraph::new(Text::from(browser_doc.lines.clone()))
                 .style(preview_style)
-                .border_style(preview_border_style)
-                .borders(Borders::ALL)
-                .title(if app.show_telemetry {
-                    "Events"
-                } else {
-                    "Preview"
-                }),
-        )
-        .scroll((app.preview_scroll as u16, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(preview, preview_area);
+                .block(
+                    Block::default()
+                        .style(preview_style)
+                        .border_style(border_style)
+                        .borders(Borders::ALL)
+                        .title(title),
+                )
+                .scroll((scroll as u16, 0))
+                .wrap(Wrap { trim: false });
+            f.render_widget(pane, pane_area);
+        }
+        app.preview_scroll_reset_pending = false;
+    } else {
+        let preview = Paragraph::new(Text::from(preview_doc.lines))
+            .style(preview_style)
+            .block(
+                Block::default()
+                    .style(preview_style)
+                    .border_style(preview_border_style)
+                    .borders(Borders::ALL)
+                    .title(if app.show_telemetry {
+                        "Events"
+                    } else {
+                        "Preview"
+                    }),
+            )
+            .scroll((app.preview_scroll as u16, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(preview, preview_area);
+    }
 
     let footer = Layout::default()
         .direction(Direction::Vertical)
@@ -3361,7 +3568,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        if app.showing_session_browser() {
+            "  Tab: switch start/end"
+        } else {
+            ""
+        },
         app.query.trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
@@ -3392,7 +3604,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        let p = Paragraph::new(Text::from(vec![result_line(
+        let mut selected_line = result_line(
             sess,
             matched,
             hit.hit_count,
@@ -3400,7 +3612,40 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             &app.ui_tags,
             selected_base_style,
             selected_match_style,
-        )]));
+        );
+        let mut adjusted_spans = Vec::with_capacity(selected_line.spans.len());
+        for span in selected_line.spans.drain(..) {
+            if span.style.bg.is_some() {
+                let content = span.content.into_owned();
+                if content.starts_with(' ') && content.ends_with(' ') && content.len() >= 2 {
+                    adjusted_spans.push(Span::styled(
+                        " ".to_string(),
+                        span.style.add_modifier(Modifier::BOLD),
+                    ));
+                    adjusted_spans.push(Span::styled(
+                        content[1..content.len() - 1].to_string(),
+                        span.style
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                    adjusted_spans.push(Span::styled(
+                        " ".to_string(),
+                        span.style.add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    adjusted_spans.push(Span::styled(
+                        content,
+                        span.style
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                }
+            } else {
+                adjusted_spans.push(span);
+            }
+        }
+        selected_line.spans = adjusted_spans;
+        let p = Paragraph::new(Text::from(vec![selected_line]));
         f.render_widget(p, highlight_area);
     }
 }
@@ -3882,6 +4127,9 @@ mod tests {
             offset: 0,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
+            session_browser_start_scroll: 0,
+            session_browser_end_scroll: usize::MAX,
+            session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -4484,6 +4732,9 @@ mod tests {
             offset: 0,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
+            session_browser_start_scroll: 0,
+            session_browser_end_scroll: usize::MAX,
+            session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -4554,6 +4805,9 @@ mod tests {
             offset: 0,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
+            session_browser_start_scroll: 0,
+            session_browser_end_scroll: usize::MAX,
+            session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
@@ -4788,7 +5042,8 @@ mod tests {
             },
         );
 
-        assert_eq!(app.preview_scroll, 3);
+        assert_eq!(app.session_browser_active_pane, SessionBrowserPane::Start);
+        assert_eq!(app.session_browser_start_scroll, 3);
         assert_eq!(app.selected, 0);
     }
 
@@ -5088,6 +5343,9 @@ mod tests {
             offset: 0,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
+            session_browser_start_scroll: 0,
+            session_browser_end_scroll: usize::MAX,
+            session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
             indexing: IndexingProgress::default(),
