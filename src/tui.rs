@@ -85,6 +85,7 @@ struct SessionHit {
 struct PreviewDoc {
     lines: Vec<Line<'static>>,
     first_match_line: usize,
+    match_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +402,21 @@ fn preview_visual_line_offset(lines: &[Line<'_>], raw_line_index: usize, width: 
         .take(raw_line_index.min(lines.len()))
         .map(|line| wrapped_line_height(line, width))
         .sum()
+}
+
+fn preview_raw_line_index_for_visual_offset(lines: &[Line<'_>], width: usize, visual_offset: usize) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let mut acc = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        let height = wrapped_line_height(line, width);
+        if visual_offset < acc.saturating_add(height) {
+            return idx;
+        }
+        acc = acc.saturating_add(height);
+    }
+    lines.len().saturating_sub(1)
 }
 
 fn short_ts(ts: Option<&str>) -> String {
@@ -2213,6 +2229,16 @@ fn handle_key(
             app.toggle_telemetry_view();
             return Ok(false);
         }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_match(1, width);
+            return Ok(false);
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_match(-1, width);
+            return Ok(false);
+        }
         KeyCode::Backspace => {
             if app.cursor_pos > 0 {
                 let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
@@ -2572,6 +2598,20 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     }
 }
 
+fn current_preview_inner_width(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+) -> anyhow::Result<usize> {
+    let area = terminal.size().context("terminal size取得に失敗")?;
+    let area: Rect = area.into();
+    let preview_area = if app.show_telemetry {
+        area
+    } else {
+        app_panes(area).1
+    };
+    Ok(preview_area.width.saturating_sub(2) as usize)
+}
+
 impl App {
     fn showing_session_browser(&self) -> bool {
         self.ready && !self.show_telemetry && self.query.trim().is_empty() && self.selected_hit().is_some()
@@ -2695,18 +2735,21 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
         let Some(sess) = self.sessions.get(hit.session_idx) else {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
         let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
 
@@ -2775,6 +2818,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line: 0,
+            match_lines: Vec::new(),
         }
     }
 
@@ -2794,12 +2838,14 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
         let Some(sess) = self.sessions.get(hit.session_idx) else {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
 
@@ -2808,6 +2854,7 @@ impl App {
                 return PreviewDoc {
                     lines: vec![Line::raw("(no match)")],
                     first_match_line: 0,
+                    match_lines: Vec::new(),
                 };
             };
 
@@ -2855,6 +2902,7 @@ impl App {
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         }
 
@@ -2863,6 +2911,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
 
@@ -2909,6 +2958,7 @@ impl App {
         ];
 
         let first_match_line = lines.len();
+        let mut match_lines = Vec::new();
         let mut shown_matches = 0usize;
         let mut lines_used = lines.len();
         let mut line_limited = false;
@@ -2950,12 +3000,18 @@ impl App {
                     }
                     section.push(Line::raw(""));
                 }
-                section.extend(render_preview_message_lines(
-                    &rec.text,
-                    query,
-                    base_style,
-                    match_style,
-                ));
+                for raw_line in rec.text.lines() {
+                    let raw_line_index = section.len();
+                    section.extend(render_preview_message_lines(
+                        raw_line,
+                        query,
+                        base_style,
+                        match_style,
+                    ));
+                    if !search::find_match_ranges(query, raw_line).is_empty() {
+                        match_lines.push(lines_used + raw_line_index);
+                    }
+                }
                 section.push(Line::raw(""));
                 section
             };
@@ -2986,6 +3042,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line,
+            match_lines,
         }
     }
 
@@ -2994,6 +3051,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("events disabled")],
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         };
 
@@ -3009,6 +3067,7 @@ impl App {
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
+                match_lines: Vec::new(),
             };
         }
 
@@ -3102,6 +3161,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line,
+            match_lines: Vec::new(),
         }
     }
 
@@ -3128,6 +3188,36 @@ impl App {
     fn scroll_preview_page(&mut self, dir: i32) {
         let delta = 10i32 * dir;
         self.scroll_preview_lines(delta);
+    }
+
+    fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
+        if self.showing_session_browser() || self.show_telemetry || self.query.trim().is_empty() {
+            return;
+        }
+        let doc = self.build_preview_doc();
+        if doc.match_lines.is_empty() {
+            return;
+        }
+
+        let current_raw = preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, self.preview_scroll);
+        let target_raw = if dir >= 0 {
+            doc.match_lines
+                .iter()
+                .copied()
+                .find(|&line| line > current_raw)
+                .unwrap_or(doc.match_lines[0])
+        } else {
+            doc.match_lines
+                .iter()
+                .copied()
+                .rev()
+                .find(|&line| line < current_raw)
+                .unwrap_or(*doc.match_lines.last().unwrap())
+        };
+
+        self.preview_scroll =
+            preview_visual_line_offset(&doc.lines, target_raw, preview_width).saturating_sub(2);
+        self.preview_scroll_reset_pending = false;
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -3568,7 +3658,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  Ctrl+n/p: next/prev match  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
         if app.showing_session_browser() {
             "  Tab: switch start/end"
         } else {
@@ -5258,6 +5348,25 @@ mod tests {
         assert_eq!(app.filtered.len(), 2);
         assert_eq!(app.matched_turn_count(), 3);
         assert_eq!(app.total_turn_count(), 4);
+    }
+
+    #[test]
+    fn jump_preview_match_moves_between_matching_lines() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "alpha\nneedle one\nbeta\nneedle two",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "needle".to_string();
+
+        app.update_results();
+        let initial_scroll = app.preview_scroll;
+
+        app.jump_preview_match(1, 80);
+        assert!(app.preview_scroll > initial_scroll);
     }
 
     #[test]
