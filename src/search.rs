@@ -5,11 +5,18 @@ pub struct CompiledQuery {
     tokens: Vec<Token>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermMatchRange {
+    pub start: usize,
+    pub end: usize,
+    pub term_index: usize,
+}
+
 #[derive(Debug, Clone)]
 struct Token {
     raw: String,
-    // Some: ASCII case-insensitive（needleにASCII英字が含まれ、かつ大文字を含まない）
-    // None: 通常の contains（大小区別 / 非ASCII）
+    // Some: ASCII case-insensitive when the needle contains ASCII letters but no uppercase.
+    // None: regular contains matching, which stays case-sensitive or non-ASCII aware.
     lower_ascii: Option<Vec<u8>>,
 }
 
@@ -92,6 +99,52 @@ pub fn find_match_ranges(query: &str, haystack: &str) -> Vec<(usize, usize)> {
     }
 
     merged
+}
+
+pub fn find_term_match_ranges(query: &str, haystack: &str) -> Vec<TermMatchRange> {
+    let compiled = CompiledQuery::new(query);
+    if compiled.tokens.is_empty() {
+        return vec![];
+    }
+
+    let mut ranges: Vec<TermMatchRange> = Vec::new();
+    for (term_index, token) in compiled.tokens.iter().enumerate() {
+        ranges.extend(
+            find_token_ranges(haystack, token)
+                .into_iter()
+                .map(|(start, end)| TermMatchRange {
+                    start,
+                    end,
+                    term_index,
+                }),
+        );
+    }
+
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    ranges.sort_unstable_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(b.end.cmp(&a.end))
+            .then(a.term_index.cmp(&b.term_index))
+    });
+
+    let mut resolved: Vec<TermMatchRange> = Vec::with_capacity(ranges.len());
+    let mut covered_until = 0usize;
+    for mut range in ranges {
+        if range.end <= covered_until {
+            continue;
+        }
+        if range.start < covered_until {
+            range.start = covered_until;
+        }
+        covered_until = range.end;
+        resolved.push(range);
+    }
+
+    resolved
 }
 
 fn record_matches_token(rec: &MessageRecord, token: &Token) -> bool {
@@ -348,6 +401,44 @@ mod tests {
         assert_eq!(
             parse_query_parts("\"unclosed phrase"),
             vec!["unclosed phrase"]
+        );
+    }
+
+    #[test]
+    fn find_term_match_ranges_keeps_distinct_terms_separate() {
+        assert_eq!(
+            find_term_match_ranges("hello world", "hello world"),
+            vec![
+                TermMatchRange {
+                    start: 0,
+                    end: 5,
+                    term_index: 0
+                },
+                TermMatchRange {
+                    start: 6,
+                    end: 11,
+                    term_index: 1
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn find_term_match_ranges_clips_overlapping_terms() {
+        assert_eq!(
+            find_term_match_ranges("ell llo", "Hello"),
+            vec![
+                TermMatchRange {
+                    start: 1,
+                    end: 4,
+                    term_index: 0
+                },
+                TermMatchRange {
+                    start: 4,
+                    end: 5,
+                    term_index: 1
+                }
+            ]
         );
     }
 }

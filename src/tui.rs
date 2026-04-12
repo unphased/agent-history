@@ -12,7 +12,7 @@ use crossterm::{
     cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEvent, MouseEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -25,7 +25,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     cmp,
     collections::HashMap,
@@ -35,8 +35,28 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TagFilterKind {
+    Provider,
+    Host,
+    Project,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TagFilter {
+    kind: TagFilterKind,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionTagSpec {
+    filter: TagFilter,
+    content: String,
+    style: Style,
+}
 
 #[derive(Debug, Default, Clone)]
 struct IndexingProgress {
@@ -546,6 +566,26 @@ fn format_telemetry_event_line(row: &Value) -> String {
             telemetry_metric_u64(data, "records").unwrap_or(0),
             telemetry_metric_u64(data, "sessions").unwrap_or(0)
         ),
+        "query_match_metrics_help" => telemetry_metric_str(data, "summary")
+            .unwrap_or("While Events is open, Ctrl+g toggles query match performance metrics.")
+            .to_string(),
+        "query_match_metrics_toggle" => format!(
+            "enabled={} hotkey={} {}",
+            telemetry_metric_bool(data, "enabled").unwrap_or(false),
+            telemetry_metric_str(data, "hotkey").unwrap_or("Ctrl+g"),
+            telemetry_metric_str(data, "summary").unwrap_or("")
+        ),
+        "query_match_metrics" => format!(
+            "query={} ms={} candidates={} matched_sessions={} matched_turns={} total_sessions={} total_turns={} reused_prefix_cache={}",
+            truncate_middle(telemetry_metric_str(data, "query").unwrap_or(""), 40),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "candidate_sessions").unwrap_or(0),
+            telemetry_metric_u64(data, "matched_sessions").unwrap_or(0),
+            telemetry_metric_u64(data, "matched_turns").unwrap_or(0),
+            telemetry_metric_u64(data, "total_sessions").unwrap_or(0),
+            telemetry_metric_u64(data, "total_turns").unwrap_or(0),
+            telemetry_metric_bool(data, "reused_prefix_cache").unwrap_or(false)
+        ),
         _ => serde_json::to_string(data).unwrap_or_default(),
     };
 
@@ -590,22 +630,53 @@ const REMOTE_ACCENT: Color = Color::Rgb(138, 112, 144);
 const REMOTE_TAG_BG: Color = Color::Rgb(82, 70, 88);
 const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
+const QUERY_MATCH_FG: Color = Color::Black;
 
-fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
+const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
+    (224, 132, 120),
+    (223, 156, 112),
+    (220, 180, 110),
+    (191, 176, 104),
+    (153, 179, 108),
+    (112, 180, 130),
+    (102, 178, 158),
+    (101, 166, 188),
+    (110, 146, 205),
+    (136, 132, 206),
+    (171, 125, 194),
+    (198, 121, 171),
+];
+
+fn query_match_style_for(term_index: usize) -> Style {
+    let (red, green, blue) = QUERY_MATCH_PALETTE[term_index % QUERY_MATCH_PALETTE.len()];
+    Style::default()
+        .fg(QUERY_MATCH_FG)
+        .bg(Color::Rgb(red, green, blue))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<SessionTagSpec> {
+    let mut specs = Vec::new();
     if tags.show_provider {
-        spans.push(Span::styled(
-            format!(" {} ", provider_label(sess.source, sess.account.as_deref())),
-            tag_style(Color::Rgb(210, 217, 224), Color::Rgb(64, 78, 92)),
-        ));
-        spans.push(Span::raw(" "));
+        let value = provider_label(sess.source, sess.account.as_deref());
+        specs.push(SessionTagSpec {
+            filter: TagFilter {
+                kind: TagFilterKind::Provider,
+                value: value.clone(),
+            },
+            content: format!(" {value} "),
+            style: tag_style(Color::Rgb(210, 217, 224), Color::Rgb(64, 78, 92)),
+        });
     }
     if should_show_host_tag(sess, tags) {
-        spans.push(Span::styled(
-            format!(" {} ", sess.machine_name),
-            tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
-        ));
-        spans.push(Span::raw(" "));
+        specs.push(SessionTagSpec {
+            filter: TagFilter {
+                kind: TagFilterKind::Host,
+                value: sess.machine_name.clone(),
+            },
+            content: format!(" {} ", sess.machine_name),
+            style: tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
+        });
     }
     if tags.show_project
         && let Some(project) = sess
@@ -613,10 +684,22 @@ fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
             .as_deref()
             .filter(|s| !s.trim().is_empty())
     {
-        spans.push(Span::styled(
-            format!(" {project} "),
-            tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
-        ));
+        specs.push(SessionTagSpec {
+            filter: TagFilter {
+                kind: TagFilterKind::Project,
+                value: project.to_string(),
+            },
+            content: format!(" {project} "),
+            style: tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
+        });
+    }
+    specs
+}
+
+fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for spec in session_tag_specs(sess, tags) {
+        spans.push(Span::styled(spec.content, spec.style));
         spans.push(Span::raw(" "));
     }
     spans
@@ -660,7 +743,6 @@ fn result_line(
     query: &str,
     ui_tags: &config::UiTagConfig,
     base_style: Style,
-    match_style: Style,
 ) -> Line<'static> {
     let full_text = result_line_text(sess, matched, hit_count);
     let ts = short_ts(sess.last_ts.as_deref());
@@ -678,23 +760,14 @@ fn result_line(
     }
     spans.extend(tag_spans);
     if !rest.is_empty() {
-        let text_line = highlighted_line(rest, query, base_style, match_style);
+        let text_line = highlighted_line(rest, query, base_style);
         spans.extend(text_line.spans);
     }
     Line::from(spans)
 }
 
-fn highlighted_line(
-    text: &str,
-    query: &str,
-    base_style: Style,
-    match_style: Style,
-) -> Line<'static> {
-    Line::from(highlight_spans(
-        vec![Span::styled(text.to_string(), base_style)],
-        query,
-        match_style,
-    ))
+fn highlighted_line(text: &str, query: &str, base_style: Style) -> Line<'static> {
+    Line::from(highlight_spans(vec![Span::styled(text.to_string(), base_style)], query))
 }
 
 #[derive(Clone, Copy)]
@@ -791,11 +864,7 @@ enum CodeLanguage {
     Shell,
 }
 
-fn highlight_spans(
-    spans: Vec<Span<'static>>,
-    query: &str,
-    match_style: Style,
-) -> Vec<Span<'static>> {
+fn highlight_spans(spans: Vec<Span<'static>>, query: &str) -> Vec<Span<'static>> {
     if query.is_empty() {
         return spans;
     }
@@ -804,7 +873,7 @@ fn highlight_spans(
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    let ranges = search::find_match_ranges(query, &full_text);
+    let ranges = search::find_term_match_ranges(query, &full_text);
     if ranges.is_empty() {
         return spans;
     }
@@ -820,14 +889,14 @@ fn highlight_spans(
         let span_end = span_start + content.len();
         let mut local = 0usize;
 
-        while range_idx < ranges.len() && ranges[range_idx].1 <= span_start {
+        while range_idx < ranges.len() && ranges[range_idx].end <= span_start {
             range_idx += 1;
         }
 
         let mut cur = range_idx;
-        while cur < ranges.len() && ranges[cur].0 < span_end {
-            let start = ranges[cur].0.max(span_start) - span_start;
-            let end = ranges[cur].1.min(span_end) - span_start;
+        while cur < ranges.len() && ranges[cur].start < span_end {
+            let start = ranges[cur].start.max(span_start) - span_start;
+            let end = ranges[cur].end.min(span_end) - span_start;
 
             if start > local {
                 push_styled_text(&mut out, content[local..start].to_string(), style);
@@ -836,12 +905,12 @@ fn highlight_spans(
                 push_styled_text(
                     &mut out,
                     content[start..end].to_string(),
-                    style.patch(match_style),
+                    style.patch(query_match_style_for(ranges[cur].term_index)),
                 );
             }
             local = end;
 
-            if ranges[cur].1 <= span_end {
+            if ranges[cur].end <= span_end {
                 cur += 1;
             } else {
                 break;
@@ -863,7 +932,6 @@ fn render_preview_message_lines(
     text: &str,
     query: &str,
     base_style: Style,
-    match_style: Style,
 ) -> Vec<Line<'static>> {
     let theme = MarkdownTheme::new(base_style);
     let mut lines = Vec::new();
@@ -893,7 +961,7 @@ fn render_preview_message_lines(
             render_markdown_line(raw_line, &theme)
         };
 
-        lines.push(Line::from(highlight_spans(spans, query, match_style)));
+        lines.push(Line::from(highlight_spans(spans, query)));
     }
 
     if lines.is_empty() {
@@ -2015,6 +2083,7 @@ struct App {
     query: String,
     cursor_pos: usize,
     max_results: usize,
+    active_tag_filters: Vec<TagFilter>,
 
     all: Vec<MessageRecord>,
     sessions: Vec<SessionSummary>,
@@ -2030,12 +2099,15 @@ struct App {
 
     last_query: String,
     last_results: Vec<usize>,
+    last_tag_filters: Vec<TagFilter>,
 
     indexing: IndexingProgress,
     ready: bool,
     telemetry_log_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
     show_telemetry: bool,
+    match_metrics_enabled: bool,
+    match_metrics_help_emitted: bool,
     preview_bgcolor_target: Option<String>,
     preview_bgcolor: Option<Color>,
     preview_remote_style: bool,
@@ -2088,6 +2160,7 @@ fn run_app(
         query: initial_query,
         cursor_pos: initial_cursor,
         max_results: args.max_results,
+        active_tag_filters: Vec::new(),
         all: Vec::new(),
         sessions: Vec::new(),
         session_records: Vec::new(),
@@ -2101,6 +2174,7 @@ fn run_app(
         session_browser_active_pane: SessionBrowserPane::Start,
         last_query: String::new(),
         last_results: Vec::new(),
+        last_tag_filters: Vec::new(),
         indexing: IndexingProgress::default(),
         ready: false,
         telemetry_log_path: (!args.scan.no_telemetry).then(|| {
@@ -2111,6 +2185,8 @@ fn run_app(
         }),
         cache_path: (!args.scan.no_cache).then(cache::default_db_path),
         show_telemetry: false,
+        match_metrics_enabled: false,
+        match_metrics_help_emitted: false,
         preview_bgcolor_target: None,
         preview_bgcolor: None,
         preview_remote_style: false,
@@ -2229,6 +2305,12 @@ fn handle_key(
             app.toggle_telemetry_view();
             return Ok(false);
         }
+        KeyCode::Char('g')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
+        {
+            app.toggle_match_metrics();
+            return Ok(false);
+        }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let width = current_preview_inner_width(terminal, app)?;
             app.jump_preview_match(1, width);
@@ -2260,9 +2342,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.query.clear();
-            app.cursor_pos = 0;
-            app.update_results();
+            app.clear_query_and_filters();
             return Ok(false);
         }
         KeyCode::Left => {
@@ -2531,6 +2611,70 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
         && y < rect.y.saturating_add(rect.height)
 }
 
+fn visible_result_range(app: &App, results_area: Rect) -> (usize, usize) {
+    let inner_height = results_area.height.saturating_sub(2) as usize;
+    let total = app.filtered.len();
+    let visible_start = cmp::min(app.offset, total);
+    let visible_end = cmp::min(visible_start + inner_height, total);
+    (visible_start, visible_end)
+}
+
+fn tag_filter_at_result_column(
+    sess: &SessionSummary,
+    tags: &config::UiTagConfig,
+    content_x: usize,
+) -> Option<TagFilter> {
+    let ts_width = short_ts(sess.last_ts.as_deref()).chars().count();
+    let specs = session_tag_specs(sess, tags);
+    if specs.is_empty() {
+        return None;
+    }
+
+    let mut cursor = ts_width + 1;
+    for spec in specs {
+        let width = spec.content.chars().count();
+        if (cursor..cursor + width).contains(&content_x) {
+            return Some(spec.filter);
+        }
+        cursor += width + 1;
+    }
+
+    None
+}
+
+fn handle_results_click(app: &mut App, results_area: Rect, mouse: MouseEvent) {
+    if !point_in_rect(mouse.column, mouse.row, results_area) {
+        return;
+    }
+    if mouse.row <= results_area.y || mouse.row >= results_area.y + results_area.height.saturating_sub(1) {
+        return;
+    }
+    if mouse.column <= results_area.x || mouse.column >= results_area.x + results_area.width.saturating_sub(1) {
+        return;
+    }
+
+    let (visible_start, visible_end) = visible_result_range(app, results_area);
+    let row = visible_start + (mouse.row - results_area.y - 1) as usize;
+    if row >= visible_end {
+        return;
+    }
+
+    app.selected = row;
+    app.reset_preview_scroll_to_match();
+
+    let Some(hit) = app.filtered.get(row).copied() else {
+        return;
+    };
+    let Some(sess) = app.sessions.get(hit.session_idx) else {
+        return;
+    };
+
+    let content_x = (mouse.column - results_area.x - 1) as usize;
+    if let Some(filter) = tag_filter_at_result_column(sess, &app.ui_tags, content_x) {
+        app.toggle_tag_filter(filter);
+    }
+}
+
 fn handle_mouse(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -2556,6 +2700,11 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     };
 
     match mouse.kind {
+        MouseEventKind::Down(_) => {
+            if !app.show_telemetry {
+                handle_results_click(app, results_area, mouse);
+            }
+        }
         MouseEventKind::ScrollUp => {
             if app.showing_session_browser() && point_in_rect(mouse.column, mouse.row, preview_area) {
                 let panes = Layout::default()
@@ -2612,9 +2761,70 @@ fn current_preview_inner_width(
     Ok(preview_area.width.saturating_sub(2) as usize)
 }
 
+fn emit_ui_telemetry_event(path: Option<&Path>, kind: &str, data: Value) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut sink) = telemetry::TelemetrySink::open(path) {
+        let _ = sink.emit(kind, data);
+    }
+}
+
 impl App {
     fn showing_session_browser(&self) -> bool {
         self.ready && !self.show_telemetry && self.query.trim().is_empty() && self.selected_hit().is_some()
+    }
+
+    fn matches_active_tag_filters(&self, sess: &SessionSummary) -> bool {
+        self.active_tag_filters.iter().all(|filter| match filter.kind {
+            TagFilterKind::Provider => {
+                provider_label(sess.source, sess.account.as_deref()) == filter.value
+            }
+            TagFilterKind::Host => sess.machine_name == filter.value,
+            TagFilterKind::Project => sess.project_slug.as_deref() == Some(filter.value.as_str()),
+        })
+    }
+
+    fn toggle_tag_filter(&mut self, filter: TagFilter) {
+        if let Some(existing_idx) = self
+            .active_tag_filters
+            .iter()
+            .position(|existing| existing.kind == filter.kind)
+        {
+            if self.active_tag_filters[existing_idx].value == filter.value {
+                self.active_tag_filters.remove(existing_idx);
+            } else {
+                self.active_tag_filters[existing_idx] = filter;
+            }
+        } else {
+            self.active_tag_filters.push(filter);
+        }
+        self.update_results();
+    }
+
+    fn clear_query_and_filters(&mut self) {
+        self.query.clear();
+        self.cursor_pos = 0;
+        self.active_tag_filters.clear();
+        self.update_results();
+    }
+
+    fn query_title(&self) -> String {
+        if self.active_tag_filters.is_empty() {
+            return "Query".to_string();
+        }
+
+        let filters = self
+            .active_tag_filters
+            .iter()
+            .map(|filter| match filter.kind {
+                TagFilterKind::Provider => format!("provider={}", filter.value),
+                TagFilterKind::Host => format!("host={}", filter.value),
+                TagFilterKind::Project => format!("project={}", filter.value),
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        format!("Query  [{filters}]")
     }
 
     fn matched_turn_count(&self) -> usize {
@@ -2627,6 +2837,7 @@ impl App {
 
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
+        let started = Instant::now();
 
         let prev_selected_global = self.filtered.get(self.selected).map(|hit| hit.session_idx);
 
@@ -2634,25 +2845,45 @@ impl App {
         let limit = |n: usize| -> bool { max != 0 && n >= max };
 
         let mut results: Vec<SessionHit> = Vec::new();
+        let mut candidate_sessions = self.sessions.len();
+        let mut reused_prefix_cache = false;
 
         if q.is_empty() {
             let mut i = 0usize;
             while i < self.sessions.len() && !limit(results.len()) {
-                results.push(SessionHit {
-                    session_idx: i,
-                    matched_record_idx: None,
-                    hit_count: 0,
-                });
+                if self.matches_active_tag_filters(&self.sessions[i]) {
+                    results.push(SessionHit {
+                        session_idx: i,
+                        matched_record_idx: None,
+                        hit_count: 0,
+                    });
+                }
                 i += 1;
             }
         } else {
-            let base: Box<dyn Iterator<Item = usize>> = if !self.last_query.is_empty()
+            let use_cached_prefix = !self.last_query.is_empty()
                 && q.starts_with(&self.last_query)
                 && !self.last_results.is_empty()
-            {
+                && self.active_tag_filters == self.last_tag_filters
+            ;
+            reused_prefix_cache = use_cached_prefix;
+            candidate_sessions = if use_cached_prefix {
+                self.last_results.len()
+            } else {
+                self.sessions
+                    .iter()
+                    .filter(|sess| self.matches_active_tag_filters(sess))
+                    .count()
+            };
+            let base: Box<dyn Iterator<Item = usize>> = if use_cached_prefix {
                 Box::new(self.last_results.iter().copied())
             } else {
-                Box::new(0..self.sessions.len())
+                Box::new(
+                    self.sessions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, sess)| self.matches_active_tag_filters(sess).then_some(idx)),
+                )
             };
 
             let compiled = search::CompiledQuery::new(&q);
@@ -2669,6 +2900,28 @@ impl App {
         self.filtered = results;
         self.last_query = q;
         self.last_results = self.filtered.iter().map(|hit| hit.session_idx).collect();
+        self.last_tag_filters = self.active_tag_filters.clone();
+        if self.match_metrics_enabled && !self.last_query.is_empty() {
+            emit_ui_telemetry_event(
+                self.telemetry_log_path.as_deref(),
+                "query_match_metrics",
+                json!({
+                    "query": self.last_query,
+                    "tag_filters": self
+                        .active_tag_filters
+                        .iter()
+                        .map(|filter| filter.value.clone())
+                        .collect::<Vec<_>>(),
+                    "duration_ms": started.elapsed().as_millis(),
+                    "candidate_sessions": candidate_sessions,
+                    "matched_sessions": self.filtered.len(),
+                    "matched_turns": self.matched_turn_count(),
+                    "total_sessions": self.sessions.len(),
+                    "total_turns": self.total_turn_count(),
+                    "reused_prefix_cache": reused_prefix_cache,
+                }),
+            );
+        }
 
         self.offset = 0;
         self.selected = 0;
@@ -2754,10 +3007,6 @@ impl App {
         };
 
         let base_style = Style::default();
-        let match_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
@@ -2810,7 +3059,6 @@ impl App {
                 &rec.text,
                 "",
                 base_style,
-                match_style,
             ));
             lines.push(Line::raw(""));
         }
@@ -2829,10 +3077,6 @@ impl App {
 
         let query = self.query.trim();
         let base_style = Style::default();
-        let match_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
 
         let Some(hit) = self.selected_hit() else {
             return PreviewDoc {
@@ -2896,7 +3140,6 @@ impl App {
                 &rec.text,
                 query,
                 base_style,
-                match_style,
             ));
 
             return PreviewDoc {
@@ -3006,7 +3249,6 @@ impl App {
                         raw_line,
                         query,
                         base_style,
-                        match_style,
                     ));
                     if !search::find_match_ranges(query, raw_line).is_empty() {
                         match_lines.push(lines_used + raw_line_index);
@@ -3256,7 +3498,31 @@ impl App {
 
     fn toggle_telemetry_view(&mut self) {
         self.show_telemetry = !self.show_telemetry;
+        if self.show_telemetry && !self.match_metrics_help_emitted {
+            emit_ui_telemetry_event(
+                self.telemetry_log_path.as_deref(),
+                "query_match_metrics_help",
+                json!({
+                    "hotkey": "Ctrl+g",
+                    "summary": "While Events is open, Ctrl+g toggles query match performance metrics.",
+                }),
+            );
+            self.match_metrics_help_emitted = true;
+        }
         self.reset_preview_scroll_to_match();
+    }
+
+    fn toggle_match_metrics(&mut self) {
+        self.match_metrics_enabled = !self.match_metrics_enabled;
+        emit_ui_telemetry_event(
+            self.telemetry_log_path.as_deref(),
+            "query_match_metrics_toggle",
+            json!({
+                "enabled": self.match_metrics_enabled,
+                "hotkey": "Ctrl+g",
+                "summary": "While Events is open, Ctrl+g toggles query match performance metrics.",
+            }),
+        );
     }
 
     fn set_session_browser_active_pane(&mut self, pane: SessionBrowserPane) {
@@ -3285,7 +3551,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let query = Paragraph::new(format!("> {}", app.query))
-        .block(Block::default().borders(Borders::ALL).title("Query"))
+        .block(Block::default().borders(Borders::ALL).title(app.query_title()))
         .style(Style::default().fg(Color::White));
     f.render_widget(query, root[0]);
     // Place the terminal cursor in the query bar (border + "> " prefix = 3 chars offset)
@@ -3413,7 +3679,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let keys = Paragraph::new(
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
@@ -3471,7 +3737,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  query: \"{}\"",
+            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
             app.query.trim()
         ))
         .style(Style::default().fg(Color::DarkGray));
@@ -3509,10 +3775,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let visible_start = cmp::min(app.offset, total);
     let visible_end = cmp::min(visible_start + inner_height, total);
     let query = app.query.trim();
-    let result_match_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line> = Vec::new();
     for hit in app.filtered[visible_start..visible_end].iter() {
@@ -3527,7 +3789,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             query,
             &app.ui_tags,
             Style::default(),
-            result_match_style,
         ));
     }
 
@@ -3658,7 +3919,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  Ctrl+n/p: next/prev match  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  Ctrl+n/p: next/prev match  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
         if app.showing_session_browser() {
             "  Tab: switch start/end"
         } else {
@@ -3690,10 +3951,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::UNDERLINED);
-        let selected_match_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
         let mut selected_line = result_line(
             sess,
             matched,
@@ -3701,7 +3958,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             query,
             &app.ui_tags,
             selected_base_style,
-            selected_match_style,
         );
         let mut adjusted_spans = Vec::with_capacity(selected_line.spans.len());
         for span in selected_line.spans.drain(..) {
@@ -4209,6 +4465,7 @@ mod tests {
             query: String::new(),
             cursor_pos: 0,
             max_results: 0,
+            active_tag_filters: Vec::new(),
             all: Vec::new(),
             sessions: Vec::new(),
             session_records: Vec::new(),
@@ -4222,11 +4479,14 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
+            last_tag_filters: Vec::new(),
             indexing: IndexingProgress::default(),
             ready: false,
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
+            match_metrics_enabled: false,
+            match_metrics_help_emitted: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -4814,6 +5074,7 @@ mod tests {
             query: String::new(),
             cursor_pos: 0,
             max_results: 0,
+            active_tag_filters: Vec::new(),
             all,
             sessions,
             session_records,
@@ -4827,11 +5088,14 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
+            last_tag_filters: Vec::new(),
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
+            match_metrics_enabled: false,
+            match_metrics_help_emitted: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -4887,6 +5151,7 @@ mod tests {
             query: "needle".to_string(),
             cursor_pos: 6,
             max_results: 0,
+            active_tag_filters: Vec::new(),
             all,
             sessions,
             session_records,
@@ -4900,11 +5165,14 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
+            last_tag_filters: Vec::new(),
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
+            match_metrics_enabled: false,
+            match_metrics_help_emitted: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -5256,6 +5524,72 @@ mod tests {
     }
 
     #[test]
+    fn clicking_project_tag_filters_results_without_touching_query() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+
+        let mut beta = mr(
+            Some("2026-02-10T00:00:02Z"),
+            Role::User,
+            "second",
+            "session-beta",
+            SourceKind::CodexSessionJsonl,
+        );
+        beta.cwd = Some("/tmp/beta".to_string());
+        beta.project_slug = Some("beta".to_string());
+
+        let all = vec![alpha, beta];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        let area = Rect::new(0, 0, 100, 30);
+        let (results_area, _) = app_panes(area);
+        let sess = app.sessions.get(app.filtered[0].session_idx).unwrap();
+        let expected_project = sess.project_slug.clone().unwrap();
+        let rendered = result_line(
+            sess,
+            None,
+            0,
+            "",
+            &app.ui_tags,
+            Style::default(),
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+        let project_offset = rendered
+            .find(&format!(" {} ", expected_project))
+            .unwrap() as u16
+            + 1;
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: results_area.x + 1 + project_offset,
+                row: results_area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.query, "");
+        assert_eq!(app.active_tag_filters.len(), 1);
+        assert_eq!(app.active_tag_filters[0].kind, TagFilterKind::Project);
+        assert_eq!(app.active_tag_filters[0].value, expected_project);
+        assert_eq!(app.filtered.len(), 1);
+        assert_eq!(app.sessions[app.filtered[0].session_idx].project_slug, Some(expected_project));
+    }
+
+    #[test]
     fn result_line_includes_match_snippet_and_hit_count() {
         let sess = SessionSummary {
             source: SourceKind::CodexSessionJsonl,
@@ -5295,7 +5629,6 @@ mod tests {
             3,
             "",
             &config::UiTagConfig::default(),
-            Style::default(),
             Style::default(),
         );
         let rendered = line
@@ -5393,7 +5726,6 @@ mod tests {
             "",
             &config::UiTagConfig::default(),
             Style::default(),
-            Style::default(),
         );
         let rendered = line
             .spans
@@ -5433,6 +5765,7 @@ mod tests {
             query: String::new(),
             cursor_pos: 0,
             max_results: 0,
+            active_tag_filters: Vec::new(),
             all,
             sessions,
             session_records,
@@ -5457,11 +5790,14 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             last_query: String::new(),
             last_results: vec![],
+            last_tag_filters: Vec::new(),
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
             cache_path: None,
             show_telemetry: false,
+            match_metrics_enabled: false,
+            match_metrics_help_emitted: false,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -5488,12 +5824,7 @@ mod tests {
 
     #[test]
     fn highlighted_line_splits_matching_spans() {
-        let line = highlighted_line(
-            "Hello there hello",
-            "hello",
-            Style::default(),
-            Style::default().fg(Color::Yellow),
-        );
+        let line = highlighted_line("Hello there hello", "hello", Style::default());
 
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[0].content.as_ref(), "Hello");
@@ -5502,12 +5833,30 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_line_uses_distinct_colors_for_distinct_query_terms() {
+        let line = highlighted_line("alpha beta", "alpha beta", Style::default());
+        let alpha = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "alpha")
+            .unwrap();
+        let beta = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "beta")
+            .unwrap();
+
+        assert_eq!(alpha.style, query_match_style_for(0));
+        assert_eq!(beta.style, query_match_style_for(1));
+        assert_ne!(alpha.style.bg, beta.style.bg);
+    }
+
+    #[test]
     fn preview_markdown_renders_headings_and_inline_code() {
         let lines = render_preview_message_lines(
             "# Heading with `code`",
             "",
             Style::default(),
-            Style::default().bg(Color::Yellow),
         );
         let theme = MarkdownTheme::new(Style::default());
 
@@ -5524,7 +5873,6 @@ mod tests {
             "[docs](https://example.com)",
             "",
             Style::default(),
-            Style::default().bg(Color::Yellow),
         );
         let theme = MarkdownTheme::new(Style::default());
 
@@ -5539,7 +5887,6 @@ mod tests {
             "```rust\nlet answer = 42;\n```",
             "",
             Style::default(),
-            Style::default().bg(Color::Yellow),
         );
         let theme = MarkdownTheme::new(Style::default());
 
@@ -5565,7 +5912,6 @@ mod tests {
             "```\nplain text\n```",
             "",
             Style::default(),
-            Style::default().bg(Color::Yellow),
         );
         let theme = MarkdownTheme::new(Style::default());
 
@@ -5577,15 +5923,10 @@ mod tests {
 
     #[test]
     fn preview_markdown_query_highlight_overrides_code_style() {
-        let match_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
         let lines = render_preview_message_lines(
             "```rust\nlet value = 42;\n```",
             "42",
             Style::default(),
-            match_style,
         );
         let theme = MarkdownTheme::new(Style::default());
 
@@ -5594,7 +5935,7 @@ mod tests {
             .iter()
             .find(|span| span.content.as_ref() == "42")
             .unwrap();
-        assert_eq!(highlight.style, theme.code_number.patch(match_style));
+        assert_eq!(highlight.style, theme.code_number.patch(query_match_style_for(0)));
     }
 
     #[test]
@@ -5603,7 +5944,6 @@ mod tests {
             "> quoted\n- item",
             "",
             Style::default(),
-            Style::default().bg(Color::Yellow),
         );
         let theme = MarkdownTheme::new(Style::default());
 
