@@ -1,5 +1,5 @@
 use crate::{
-    args::RunArgs,
+    args::{LogGroup, RunArgs},
     cache, config,
     indexer::{
         ImageAttachment, ImageAttachmentKind, IndexerEvent, MessageRecord, Role, SourceKind,
@@ -28,7 +28,7 @@ use ratatui::{
 use serde_json::{Value, json};
 use std::{
     cmp,
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, Stdout},
     mem,
@@ -108,6 +108,46 @@ struct PreviewDoc {
     match_lines: Vec<usize>,
 }
 
+#[derive(Debug, Default)]
+struct EventBuffer {
+    records: VecDeque<telemetry::EventRecord>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl EventBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            records: VecDeque::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn seed(&mut self, records: Vec<telemetry::EventRecord>) {
+        for record in records {
+            self.push(record);
+        }
+    }
+
+    fn push(&mut self, record: telemetry::EventRecord) {
+        let record_len = record.encoded_len();
+        self.records.push_back(record);
+        self.total_bytes = self.total_bytes.saturating_add(record_len);
+        while self.total_bytes > self.max_bytes {
+            let Some(oldest) = self.records.pop_front() else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(oldest.encoded_len());
+        }
+    }
+
+    fn recent(&self, max_records: usize) -> impl Iterator<Item = &telemetry::EventRecord> {
+        let skip = self.records.len().saturating_sub(max_records);
+        self.records.iter().skip(skip)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionBrowserPane {
     Start,
@@ -116,6 +156,7 @@ enum SessionBrowserPane {
 
 const PREVIEW_MAX_MATCHES: usize = 100;
 const PREVIEW_MAX_LINES: usize = 5000;
+const EVENT_BUFFER_MAX_BYTES: usize = 50 * 1024 * 1024;
 
 fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<usize>>) {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -461,18 +502,6 @@ fn compact_single_line(s: &str) -> String {
     first_non_empty_line(s).replace(['\t', '\n'], " ")
 }
 
-fn latest_lines(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(body) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut lines: Vec<String> = body.lines().map(|line| line.to_string()).collect();
-    if lines.len() > max_lines {
-        let start = lines.len() - max_lines;
-        lines.drain(0..start);
-    }
-    lines
-}
-
 fn telemetry_metric_u64(data: &Value, key: &str) -> Option<u64> {
     data.get(key).and_then(|value| value.as_u64())
 }
@@ -485,21 +514,26 @@ fn telemetry_metric_str<'a>(data: &'a Value, key: &str) -> Option<&'a str> {
     data.get(key).and_then(|value| value.as_str())
 }
 
-fn format_telemetry_event_line(row: &Value) -> String {
-    let ts = row
-        .get("ts_ms")
-        .map(|value| {
-            value
-                .as_u64()
-                .map(|ts| short_ts(Some(&ts.to_string())))
-                .unwrap_or_else(|| value.to_string())
-        })
+fn log_group_label(group: LogGroup) -> &'static str {
+    group.as_str()
+}
+
+fn log_group_toggle_key(group: LogGroup) -> &'static str {
+    match group {
+        LogGroup::Perf => "Ctrl+g",
+        LogGroup::Remote => "Ctrl+r",
+    }
+}
+
+fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
+    let ts = short_ts(Some(&record.ts_ms.to_string()));
+    let kind = record.kind.as_str();
+    let data = &record.data;
+    let prefix = record
+        .group
+        .as_deref()
+        .map(|group| format!("[{group}] "))
         .unwrap_or_default();
-    let kind = row
-        .get("kind")
-        .and_then(|value| value.as_str())
-        .unwrap_or("event");
-    let data = row.get("data").unwrap_or(&Value::Null);
 
     let summary = match kind {
         "indexer_started" => format!(
@@ -566,16 +600,17 @@ fn format_telemetry_event_line(row: &Value) -> String {
             telemetry_metric_u64(data, "records").unwrap_or(0),
             telemetry_metric_u64(data, "sessions").unwrap_or(0)
         ),
-        "query_match_metrics_help" => telemetry_metric_str(data, "summary")
-            .unwrap_or("While Events is open, Ctrl+g toggles query match performance metrics.")
+        "log_groups_help" => telemetry_metric_str(data, "summary")
+            .unwrap_or("While Events is open, Ctrl+g toggles perf and Ctrl+r toggles remote logging.")
             .to_string(),
-        "query_match_metrics_toggle" => format!(
-            "enabled={} hotkey={} {}",
+        "log_group_toggle" => format!(
+            "group={} enabled={} hotkey={} {}",
+            telemetry_metric_str(data, "group").unwrap_or(""),
             telemetry_metric_bool(data, "enabled").unwrap_or(false),
-            telemetry_metric_str(data, "hotkey").unwrap_or("Ctrl+g"),
+            telemetry_metric_str(data, "hotkey").unwrap_or(""),
             telemetry_metric_str(data, "summary").unwrap_or("")
         ),
-        "query_match_metrics" => format!(
+        "perf_results_summary" => format!(
             "query={} ms={} candidates={} matched_sessions={} matched_turns={} total_sessions={} total_turns={} reused_prefix_cache={}",
             truncate_middle(telemetry_metric_str(data, "query").unwrap_or(""), 40),
             telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
@@ -586,13 +621,63 @@ fn format_telemetry_event_line(row: &Value) -> String {
             telemetry_metric_u64(data, "total_turns").unwrap_or(0),
             telemetry_metric_bool(data, "reused_prefix_cache").unwrap_or(false)
         ),
+        "perf_results_phase" => format!(
+            "phase={} ms={} candidates={} matched_sessions={}",
+            telemetry_metric_str(data, "phase").unwrap_or(""),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "candidate_sessions").unwrap_or(0),
+            telemetry_metric_u64(data, "matched_sessions").unwrap_or(0)
+        ),
+        "perf_preview_summary" => format!(
+            "mode={} session={} ms={} session_records={} matched_records={} rendered_records={} raw_lines={} rendered_lines={} first_match_line={} truncated_matches={} truncated_lines={}",
+            telemetry_metric_str(data, "mode").unwrap_or(""),
+            truncate_middle(telemetry_metric_str(data, "session_id").unwrap_or(""), 24),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "session_records").unwrap_or(0),
+            telemetry_metric_u64(data, "matched_records").unwrap_or(0),
+            telemetry_metric_u64(data, "rendered_records").unwrap_or(0),
+            telemetry_metric_u64(data, "raw_lines").unwrap_or(0),
+            telemetry_metric_u64(data, "rendered_lines").unwrap_or(0),
+            telemetry_metric_u64(data, "first_match_line").unwrap_or(0),
+            telemetry_metric_bool(data, "truncated_by_match_limit").unwrap_or(false),
+            telemetry_metric_bool(data, "truncated_by_line_limit").unwrap_or(false)
+        ),
+        "perf_preview_phase" => format!(
+            "mode={} phase={} ms={} records={} lines={} bytes={}",
+            telemetry_metric_str(data, "mode").unwrap_or(""),
+            telemetry_metric_str(data, "phase").unwrap_or(""),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "records").unwrap_or(0),
+            telemetry_metric_u64(data, "lines").unwrap_or(0),
+            telemetry_metric_u64(data, "bytes").unwrap_or(0)
+        ),
+        "remote_sync_started" => format!(
+            "remote={} host={} started",
+            telemetry_metric_str(data, "remote_name").unwrap_or(""),
+            telemetry_metric_str(data, "host").unwrap_or("")
+        ),
+        "remote_sync_finished" => format!(
+            "remote={} host={} ms={} records={} sessions={}",
+            telemetry_metric_str(data, "remote_name").unwrap_or(""),
+            telemetry_metric_str(data, "host").unwrap_or(""),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_u64(data, "records").unwrap_or(0),
+            telemetry_metric_u64(data, "sessions").unwrap_or(0)
+        ),
+        "remote_sync_failed" => format!(
+            "remote={} host={} ms={} error={}",
+            telemetry_metric_str(data, "remote_name").unwrap_or(""),
+            telemetry_metric_str(data, "host").unwrap_or(""),
+            telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+            telemetry_metric_str(data, "error").unwrap_or("")
+        ),
         _ => serde_json::to_string(data).unwrap_or_default(),
     };
 
     if ts.is_empty() {
-        format!("{kind}: {summary}")
+        format!("{prefix}{kind}: {summary}")
     } else {
-        format!("{ts}  {kind}: {summary}")
+        format!("{ts}  {prefix}{kind}: {summary}")
     }
 }
 
@@ -2104,10 +2189,13 @@ struct App {
     indexing: IndexingProgress,
     ready: bool,
     telemetry_log_path: Option<PathBuf>,
+    telemetry_sink: Option<telemetry::TelemetrySink>,
+    telemetry_events: EventBuffer,
     cache_path: Option<PathBuf>,
     show_telemetry: bool,
-    match_metrics_enabled: bool,
-    match_metrics_help_emitted: bool,
+    enabled_log_groups: HashSet<LogGroup>,
+    log_groups_help_emitted: bool,
+    ui_status: Option<String>,
     preview_bgcolor_target: Option<String>,
     preview_bgcolor: Option<Color>,
     preview_remote_style: bool,
@@ -2154,6 +2242,19 @@ fn run_app(
         .cloned()
         .map(|remote| (remote.name.clone(), remote))
         .collect();
+    let telemetry_log_path = (!args.scan.no_telemetry).then(|| {
+        args.scan
+            .telemetry_log
+            .clone()
+            .unwrap_or_else(telemetry::default_log_path)
+    });
+    let mut telemetry_events = EventBuffer::new(EVENT_BUFFER_MAX_BYTES);
+    if let Some(path) = telemetry_log_path.as_ref() {
+        telemetry_events.seed(telemetry::read_recent_records(path, EVENT_BUFFER_MAX_BYTES));
+    }
+    let telemetry_sink = telemetry_log_path
+        .as_ref()
+        .and_then(|path| telemetry::TelemetrySink::open(path).ok());
     let initial_query = args.query.unwrap_or_default();
     let initial_cursor = initial_query.len();
     let mut app = App {
@@ -2177,16 +2278,14 @@ fn run_app(
         last_tag_filters: Vec::new(),
         indexing: IndexingProgress::default(),
         ready: false,
-        telemetry_log_path: (!args.scan.no_telemetry).then(|| {
-            args.scan
-                .telemetry_log
-                .clone()
-                .unwrap_or_else(telemetry::default_log_path)
-        }),
+        telemetry_log_path,
+        telemetry_sink,
+        telemetry_events,
         cache_path: (!args.scan.no_cache).then(cache::default_db_path),
         show_telemetry: false,
-        match_metrics_enabled: false,
-        match_metrics_help_emitted: false,
+        enabled_log_groups: args.log_groups.iter().copied().collect(),
+        log_groups_help_emitted: false,
+        ui_status: None,
         preview_bgcolor_target: None,
         preview_bgcolor: None,
         preview_remote_style: false,
@@ -2249,6 +2348,9 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
         IndexerEvent::Warn { message } => {
             app.indexing.last_warn = Some(message);
         }
+        IndexerEvent::Telemetry { record } => {
+            app.append_event_record(record);
+        }
         IndexerEvent::Done { records } => {
             apply_records(app, records);
         }
@@ -2305,10 +2407,12 @@ fn handle_key(
             app.toggle_telemetry_view();
             return Ok(false);
         }
-        KeyCode::Char('g')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
-        {
-            app.toggle_match_metrics();
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
+            app.toggle_log_group(LogGroup::Perf);
+            return Ok(false);
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
+            app.toggle_log_group(LogGroup::Remote);
             return Ok(false);
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2761,18 +2865,67 @@ fn current_preview_inner_width(
     Ok(preview_area.width.saturating_sub(2) as usize)
 }
 
-fn emit_ui_telemetry_event(path: Option<&Path>, kind: &str, data: Value) {
-    let Some(path) = path else {
-        return;
-    };
-    if let Ok(mut sink) = telemetry::TelemetrySink::open(path) {
-        let _ = sink.emit(kind, data);
-    }
-}
-
 impl App {
     fn showing_session_browser(&self) -> bool {
         self.ready && !self.show_telemetry && self.query.trim().is_empty() && self.selected_hit().is_some()
+    }
+
+    fn log_group_enabled(&self, group: LogGroup) -> bool {
+        self.enabled_log_groups.contains(&group)
+    }
+
+    fn events_title(&self) -> String {
+        let mut groups = self
+            .enabled_log_groups
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.as_str());
+        if groups.is_empty() {
+            return "Events [no verbose groups]".to_string();
+        }
+        let joined = groups
+            .into_iter()
+            .map(log_group_label)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("Events [{joined}]")
+    }
+
+    fn status_text(&self) -> String {
+        if let Some(status) = self.ui_status.as_deref() {
+            return format!("status: {status}");
+        }
+        self.indexing
+            .last_warn
+            .as_deref()
+            .map(|s| format!("status: {s}"))
+            .unwrap_or_default()
+    }
+
+    fn set_ui_status(&mut self, status: impl Into<String>) {
+        self.ui_status = Some(status.into());
+    }
+
+    fn append_event_record(&mut self, record: telemetry::EventRecord) {
+        self.telemetry_events.push(record);
+    }
+
+    fn emit_event_record(&mut self, record: telemetry::EventRecord) {
+        self.telemetry_events.push(record.clone());
+        if let Some(sink) = self.telemetry_sink.as_mut()
+            && let Err(err) = sink.emit_record(&record)
+        {
+            self.indexing.last_warn = Some(format!("telemetry log write failed: {err:#}"));
+        }
+    }
+
+    fn emit_event(&mut self, kind: &str, data: Value) {
+        self.emit_event_record(telemetry::EventRecord::new(None, kind, data));
+    }
+
+    fn emit_group_event(&mut self, group: LogGroup, kind: &str, data: Value) {
+        self.emit_event_record(telemetry::EventRecord::new(Some(group.as_str()), kind, data));
     }
 
     fn matches_active_tag_filters(&self, sess: &SessionSummary) -> bool {
@@ -2838,6 +2991,8 @@ impl App {
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
         let started = Instant::now();
+        let perf_enabled = self.log_group_enabled(LogGroup::Perf);
+        let mut candidate_phase_started = perf_enabled.then(Instant::now);
 
         let prev_selected_global = self.filtered.get(self.selected).map(|hit| hit.session_idx);
 
@@ -2847,6 +3002,8 @@ impl App {
         let mut results: Vec<SessionHit> = Vec::new();
         let mut candidate_sessions = self.sessions.len();
         let mut reused_prefix_cache = false;
+        let mut candidate_phase_duration_ms = 0u128;
+        let mut match_phase_duration_ms = 0u128;
 
         if q.is_empty() {
             let mut i = 0usize;
@@ -2859,6 +3016,9 @@ impl App {
                     });
                 }
                 i += 1;
+            }
+            if let Some(started) = candidate_phase_started.take() {
+                candidate_phase_duration_ms = started.elapsed().as_millis();
             }
         } else {
             let use_cached_prefix = !self.last_query.is_empty()
@@ -2875,6 +3035,9 @@ impl App {
                     .filter(|sess| self.matches_active_tag_filters(sess))
                     .count()
             };
+            if let Some(started) = candidate_phase_started.take() {
+                candidate_phase_duration_ms = started.elapsed().as_millis();
+            }
             let base: Box<dyn Iterator<Item = usize>> = if use_cached_prefix {
                 Box::new(self.last_results.iter().copied())
             } else {
@@ -2887,6 +3050,7 @@ impl App {
             };
 
             let compiled = search::CompiledQuery::new(&q);
+            let match_phase_started = perf_enabled.then(Instant::now);
             for idx in base {
                 if let Some(hit) = self.session_match(idx, &compiled) {
                     results.push(hit);
@@ -2895,33 +3059,15 @@ impl App {
                     }
                 }
             }
+            if let Some(started) = match_phase_started {
+                match_phase_duration_ms = started.elapsed().as_millis();
+            }
         }
 
         self.filtered = results;
-        self.last_query = q;
+        self.last_query = q.clone();
         self.last_results = self.filtered.iter().map(|hit| hit.session_idx).collect();
         self.last_tag_filters = self.active_tag_filters.clone();
-        if self.match_metrics_enabled && !self.last_query.is_empty() {
-            emit_ui_telemetry_event(
-                self.telemetry_log_path.as_deref(),
-                "query_match_metrics",
-                json!({
-                    "query": self.last_query,
-                    "tag_filters": self
-                        .active_tag_filters
-                        .iter()
-                        .map(|filter| filter.value.clone())
-                        .collect::<Vec<_>>(),
-                    "duration_ms": started.elapsed().as_millis(),
-                    "candidate_sessions": candidate_sessions,
-                    "matched_sessions": self.filtered.len(),
-                    "matched_turns": self.matched_turn_count(),
-                    "total_sessions": self.sessions.len(),
-                    "total_turns": self.total_turn_count(),
-                    "reused_prefix_cache": reused_prefix_cache,
-                }),
-            );
-        }
 
         self.offset = 0;
         self.selected = 0;
@@ -2931,6 +3077,46 @@ impl App {
             self.selected = pos;
         }
         self.reset_preview_scroll_to_match();
+
+        if perf_enabled {
+            self.emit_group_event(
+                LogGroup::Perf,
+                "perf_results_summary",
+                json!({
+                    "query": self.last_query,
+                    "tag_filter_count": self.active_tag_filters.len(),
+                    "duration_ms": started.elapsed().as_millis(),
+                    "candidate_sessions": candidate_sessions,
+                    "matched_sessions": self.filtered.len(),
+                    "matched_turns": self.matched_turn_count(),
+                    "total_sessions": self.sessions.len(),
+                    "total_turns": self.total_turn_count(),
+                    "reused_prefix_cache": reused_prefix_cache,
+                }),
+            );
+            self.emit_group_event(
+                LogGroup::Perf,
+                "perf_results_phase",
+                json!({
+                    "phase": "candidate_enumeration",
+                    "duration_ms": candidate_phase_duration_ms,
+                    "candidate_sessions": candidate_sessions,
+                    "matched_sessions": self.filtered.len(),
+                }),
+            );
+            if !self.last_query.is_empty() {
+                self.emit_group_event(
+                    LogGroup::Perf,
+                    "perf_results_phase",
+                    json!({
+                        "phase": "query_match_scan",
+                        "duration_ms": match_phase_duration_ms,
+                        "candidate_sessions": candidate_sessions,
+                        "matched_sessions": self.filtered.len(),
+                    }),
+                );
+            }
+        }
     }
 
     fn session_match(
@@ -3296,13 +3482,16 @@ impl App {
             };
         };
 
-        let mut lines: Vec<Line<'static>> = vec![Line::raw(format!("log: {}", path.display()))];
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::raw(format!("log: {}", path.display())),
+            Line::raw(format!("buffer cap: {} MB", EVENT_BUFFER_MAX_BYTES / (1024 * 1024))),
+        ];
         if let Ok(metadata) = fs::metadata(path) {
             lines.push(Line::raw(format!("bytes: {}", metadata.len())));
         }
 
-        let raw_lines = latest_lines(path, 400);
-        if raw_lines.is_empty() {
+        let recent_records = self.telemetry_events.recent(400).collect::<Vec<_>>();
+        if recent_records.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::raw("(no events yet)"));
             return PreviewDoc {
@@ -3312,23 +3501,17 @@ impl App {
             };
         }
 
-        let parsed: Vec<Value> = raw_lines
+        let latest_start = recent_records
             .iter()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .collect();
-        let latest_start = parsed
-            .iter()
-            .rposition(|row| {
-                row.get("kind").and_then(|value| value.as_str()) == Some("indexer_started")
-            })
+            .rposition(|record| record.kind == "indexer_started")
             .unwrap_or(0);
-        let run = &parsed[latest_start..];
+        let run = &recent_records[latest_start..];
 
         let find_data = |kind: &str| {
             run.iter()
                 .rev()
-                .find(|row| row.get("kind").and_then(|value| value.as_str()) == Some(kind))
-                .and_then(|row| row.get("data"))
+                .find(|record| record.kind == kind)
+                .map(|record| &record.data)
         };
 
         if let Some(data) = find_data("cache_open_finished") {
@@ -3395,8 +3578,8 @@ impl App {
         lines.push(Line::raw(""));
 
         let first_match_line = lines.len();
-        for row in run.iter().rev() {
-            lines.push(Line::raw(format_telemetry_event_line(row)));
+        for record in run.iter().rev() {
+            lines.push(Line::raw(format_telemetry_event_line(record)));
         }
 
         PreviewDoc {
@@ -3404,6 +3587,93 @@ impl App {
             first_match_line,
             match_lines: Vec::new(),
         }
+    }
+
+    fn emit_preview_perf_summary(&mut self, mode: &str, doc: &PreviewDoc, duration_ms: u128) {
+        if !self.log_group_enabled(LogGroup::Perf) || self.show_telemetry {
+            return;
+        }
+
+        let Some(hit) = self.selected_hit() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get(hit.session_idx) else {
+            return;
+        };
+        let record_idxs = self
+            .session_records
+            .get(hit.session_idx)
+            .cloned()
+            .unwrap_or_default();
+        let session_records = record_idxs.len();
+        let query = self.query.trim();
+        let matched_record_idxs = if query.is_empty() {
+            record_idxs.clone()
+        } else {
+            let compiled = search::CompiledQuery::new(query);
+            record_idxs
+                .iter()
+                .copied()
+                .filter(|&idx| compiled.matches_record(&self.all[idx]))
+                .collect::<Vec<_>>()
+        };
+        let rendered_records = if query.is_empty() {
+            matched_record_idxs.len()
+        } else {
+            matched_record_idxs.len().min(PREVIEW_MAX_MATCHES)
+        };
+        let processed_record_idxs = if query.is_empty() {
+            matched_record_idxs
+        } else {
+            matched_record_idxs
+                .into_iter()
+                .take(PREVIEW_MAX_MATCHES)
+                .collect::<Vec<_>>()
+        };
+        let raw_lines = processed_record_idxs
+            .iter()
+            .filter_map(|&idx| self.all.get(idx))
+            .map(|rec| rec.text.lines().count())
+            .sum::<usize>();
+        let raw_bytes = processed_record_idxs
+            .iter()
+            .filter_map(|&idx| self.all.get(idx))
+            .map(|rec| rec.text.len())
+            .sum::<usize>();
+
+        self.emit_group_event(
+            LogGroup::Perf,
+            "perf_preview_summary",
+            json!({
+                "mode": mode,
+                "session_id": sess.session_id,
+                "duration_ms": duration_ms,
+                "session_records": session_records,
+                "matched_records": if query.is_empty() { session_records } else { processed_record_idxs.len() },
+                "rendered_records": rendered_records,
+                "raw_lines": raw_lines,
+                "raw_bytes": raw_bytes,
+                "rendered_lines": doc.lines.len(),
+                "first_match_line": doc.first_match_line,
+                "truncated_by_match_limit": !query.is_empty() && processed_record_idxs.len() < self.session_records.get(hit.session_idx).map(|records| {
+                    let compiled = search::CompiledQuery::new(query);
+                    records.iter().filter(|&&idx| compiled.matches_record(&self.all[idx])).count()
+                }).unwrap_or_default(),
+                "truncated_by_line_limit": doc.lines.iter().count() >= PREVIEW_MAX_LINES,
+            }),
+        );
+        self.emit_group_event(
+            LogGroup::Perf,
+            "perf_preview_phase",
+            json!({
+                "mode": mode,
+                "phase": "document_build",
+                "duration_ms": duration_ms,
+                "records": rendered_records,
+                "lines": doc.lines.len(),
+                "bytes": raw_bytes,
+            }),
+        );
     }
 
     fn scroll_preview_lines(&mut self, delta: i32) {
@@ -3497,29 +3767,38 @@ impl App {
 
     fn toggle_telemetry_view(&mut self) {
         self.show_telemetry = !self.show_telemetry;
-        if self.show_telemetry && !self.match_metrics_help_emitted {
-            emit_ui_telemetry_event(
-                self.telemetry_log_path.as_deref(),
-                "query_match_metrics_help",
+        if self.show_telemetry && !self.log_groups_help_emitted {
+            self.emit_event(
+                "log_groups_help",
                 json!({
-                    "hotkey": "Ctrl+g",
-                    "summary": "While Events is open, Ctrl+g toggles query match performance metrics.",
+                    "summary": "While Events is open, Ctrl+g toggles perf logging and Ctrl+r toggles remote logging.",
                 }),
             );
-            self.match_metrics_help_emitted = true;
+            self.log_groups_help_emitted = true;
         }
         self.reset_preview_scroll_to_match();
     }
 
-    fn toggle_match_metrics(&mut self) {
-        self.match_metrics_enabled = !self.match_metrics_enabled;
-        emit_ui_telemetry_event(
-            self.telemetry_log_path.as_deref(),
-            "query_match_metrics_toggle",
+    fn toggle_log_group(&mut self, group: LogGroup) {
+        let enabled = if self.enabled_log_groups.contains(&group) {
+            self.enabled_log_groups.remove(&group);
+            false
+        } else {
+            self.enabled_log_groups.insert(group);
+            true
+        };
+        self.set_ui_status(format!(
+            "{} logging {}",
+            log_group_label(group),
+            if enabled { "enabled" } else { "disabled" }
+        ));
+        self.emit_event(
+            "log_group_toggle",
             json!({
-                "enabled": self.match_metrics_enabled,
-                "hotkey": "Ctrl+g",
-                "summary": "While Events is open, Ctrl+g toggles query match performance metrics.",
+                "group": group.as_str(),
+                "enabled": enabled,
+                "hotkey": log_group_toggle_key(group),
+                "summary": format!("{} logging {}", log_group_label(group), if enabled { "enabled" } else { "disabled" }),
             }),
         );
     }
@@ -3629,7 +3908,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     Block::default()
                         .style(telemetry_style)
                         .borders(Borders::ALL)
-                        .title("Events"),
+                        .title(app.events_title()),
                 )
                 .scroll((app.preview_scroll as u16, 0))
                 .wrap(Wrap { trim: false });
@@ -3665,20 +3944,14 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
             .split(root[2]);
 
-        let status = Paragraph::new(
-            app.indexing
-                .last_warn
-                .as_deref()
-                .map(|s| format!("status: {s}"))
-                .unwrap_or_default(),
-        )
+        let status = Paragraph::new(app.status_text())
         .style(Style::default().fg(Color::Yellow));
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
@@ -3714,7 +3987,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 Block::default()
                     .style(telemetry_style)
                     .borders(Borders::ALL)
-                    .title("Events"),
+                    .title(app.events_title()),
             )
             .scroll((app.preview_scroll as u16, 0))
             .wrap(Wrap { trim: false });
@@ -3725,18 +3998,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
             .split(root[2]);
 
-        let status = Paragraph::new(
-            app.indexing
-                .last_warn
-                .as_deref()
-                .map(|s| format!("status: {s}"))
-                .unwrap_or_default(),
-        )
+        let status = Paragraph::new(app.status_text())
         .style(Style::default().fg(Color::Yellow));
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
             app.query.trim()
         ))
         .style(Style::default().fg(Color::DarkGray));
@@ -3773,7 +4040,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let visible_start = cmp::min(app.offset, total);
     let visible_end = cmp::min(visible_start + inner_height, total);
-    let query = app.query.trim();
+    let query = app.query.trim().to_string();
 
     let mut lines: Vec<Line> = Vec::new();
     for hit in app.filtered[visible_start..visible_end].iter() {
@@ -3785,7 +4052,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             sess,
             matched,
             hit.hit_count,
-            query,
+            &query,
             &app.ui_tags,
             Style::default(),
         ));
@@ -3808,19 +4075,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let preview_area = main[1];
     let preview_inner_height = preview_area.height.saturating_sub(2) as usize;
     let preview_inner_width = preview_area.width.saturating_sub(2) as usize;
-    let preview_doc = app.build_preview_doc();
-    if app.preview_scroll_reset_pending {
-        let first_match_visual_line = preview_visual_line_offset(
-            &preview_doc.lines,
-            preview_doc.first_match_line,
-            preview_inner_width,
-        );
-        app.preview_scroll = first_match_visual_line.saturating_sub(2);
-        app.preview_scroll_reset_pending = false;
-    }
-    let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
-    let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
-    app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     let preview_style = app
         .preview_bgcolor
         .map(|color| Style::default().bg(color))
@@ -3834,7 +4088,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         Style::default()
     };
     if app.showing_session_browser() {
+        let browser_started = Instant::now();
         let browser_doc = app.session_browser_doc();
+        let browser_duration_ms = browser_started.elapsed().as_millis();
+        app.emit_preview_perf_summary("session_browser", &browser_doc, browser_duration_ms);
         let panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -3884,6 +4141,42 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
         app.preview_scroll_reset_pending = false;
     } else {
+        let preview_started = Instant::now();
+        let preview_doc = app.build_preview_doc();
+        let preview_duration_ms = preview_started.elapsed().as_millis();
+        let preview_mode = if query.is_empty() {
+            "empty_query"
+        } else {
+            "query_preview"
+        };
+        app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
+        if app.preview_scroll_reset_pending {
+            let first_match_visual_line = preview_visual_line_offset(
+                &preview_doc.lines,
+                preview_doc.first_match_line,
+                preview_inner_width,
+            );
+            app.preview_scroll = first_match_visual_line.saturating_sub(2);
+            app.preview_scroll_reset_pending = false;
+        }
+        let layout_started = Instant::now();
+        let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+        let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
+        app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
+        if app.log_group_enabled(LogGroup::Perf) {
+            app.emit_group_event(
+                LogGroup::Perf,
+                "perf_preview_phase",
+                json!({
+                    "mode": preview_mode,
+                    "phase": "visual_layout",
+                    "duration_ms": layout_started.elapsed().as_millis(),
+                    "records": 0,
+                    "lines": preview_total_lines,
+                    "bytes": 0,
+                }),
+            );
+        }
         let preview = Paragraph::new(Text::from(preview_doc.lines))
             .style(preview_style)
             .block(
@@ -3892,9 +4185,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     .border_style(preview_border_style)
                     .borders(Borders::ALL)
                     .title(if app.show_telemetry {
-                        "Events"
+                        app.events_title()
                     } else {
-                        "Preview"
+                        "Preview".to_string()
                     }),
             )
             .scroll((app.preview_scroll as u16, 0))
@@ -3907,13 +4200,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
         .split(root[2]);
 
-    let status = Paragraph::new(
-        app.indexing
-            .last_warn
-            .as_deref()
-            .map(|s| format!("status: {s}"))
-            .unwrap_or_default(),
-    )
+    let status = Paragraph::new(app.status_text())
     .style(Style::default().fg(Color::Yellow));
     f.render_widget(status, footer[0]);
 
@@ -3954,7 +4241,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             sess,
             matched,
             hit.hit_count,
-            query,
+            &query,
             &app.ui_tags,
             selected_base_style,
         );
@@ -4482,10 +4769,13 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: false,
             telemetry_log_path: None,
+            telemetry_sink: None,
+            telemetry_events: EventBuffer::new(EVENT_BUFFER_MAX_BYTES),
             cache_path: None,
             show_telemetry: false,
-            match_metrics_enabled: false,
-            match_metrics_help_emitted: false,
+            enabled_log_groups: HashSet::new(),
+            log_groups_help_emitted: false,
+            ui_status: None,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -5091,10 +5381,13 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            telemetry_sink: None,
+            telemetry_events: EventBuffer::new(EVENT_BUFFER_MAX_BYTES),
             cache_path: None,
             show_telemetry: false,
-            match_metrics_enabled: false,
-            match_metrics_help_emitted: false,
+            enabled_log_groups: HashSet::new(),
+            log_groups_help_emitted: false,
+            ui_status: None,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -5169,10 +5462,13 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            telemetry_sink: None,
+            telemetry_events: EventBuffer::new(EVENT_BUFFER_MAX_BYTES),
             cache_path: None,
             show_telemetry: false,
-            match_metrics_enabled: false,
-            match_metrics_help_emitted: false,
+            enabled_log_groups: HashSet::new(),
+            log_groups_help_emitted: false,
+            ui_status: None,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,
@@ -5225,6 +5521,10 @@ mod tests {
         let mut app = empty_app();
         app.ready = true;
         app.telemetry_log_path = Some(log);
+        app.telemetry_events.seed(telemetry::read_recent_records(
+            app.telemetry_log_path.as_ref().unwrap(),
+            EVENT_BUFFER_MAX_BYTES,
+        ));
         app.show_telemetry = true;
 
         let doc = app.build_preview_doc();
@@ -5794,10 +6094,13 @@ mod tests {
             indexing: IndexingProgress::default(),
             ready: true,
             telemetry_log_path: None,
+            telemetry_sink: None,
+            telemetry_events: EventBuffer::new(EVENT_BUFFER_MAX_BYTES),
             cache_path: None,
             show_telemetry: false,
-            match_metrics_enabled: false,
-            match_metrics_help_emitted: false,
+            enabled_log_groups: HashSet::new(),
+            log_groups_help_emitted: false,
+            ui_status: None,
             preview_bgcolor_target: None,
             preview_bgcolor: None,
             preview_remote_style: false,

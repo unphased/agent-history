@@ -1,6 +1,21 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
+pub enum LogGroup {
+    Perf,
+    Remote,
+}
+
+impl LogGroup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Perf => "perf",
+            Self::Remote => "remote",
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "agent-history")]
 #[command(
@@ -69,6 +84,10 @@ pub struct RunArgs {
     /// Max number of results shown (0 = unlimited)
     #[arg(long, default_value_t = 5000)]
     pub max_results: usize,
+
+    /// Enable verbose log groups for this run (comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "GROUP")]
+    pub log_groups: Vec<LogGroup>,
 }
 
 #[derive(Parser, Debug, Clone)]
