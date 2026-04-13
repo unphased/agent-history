@@ -3844,6 +3844,10 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn footer_height(&self) -> u16 {
+        if self.status_text().is_empty() { 1 } else { 2 }
+    }
+
     fn set_ui_status(&mut self, status: impl Into<String>) {
         self.ui_status = Some(status.into());
     }
@@ -5021,7 +5025,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             [
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(app.footer_height()),
             ]
             .as_ref(),
         )
@@ -5143,15 +5147,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             f.render_widget(p, main[1]);
         }
 
-        let footer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
-            .split(root[2]);
-
-        let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
-        f.render_widget(status, footer[0]);
-
-        let keys = Paragraph::new(
+        render_footer(
+            f,
+            root[2],
+            app.status_text(),
             if app.show_telemetry {
                 format!(
                     "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
@@ -5159,9 +5158,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 )
             } else {
                 "Esc/Ctrl+c: quit  Ctrl+t: events".to_string()
-            }
-        ).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(keys, footer[1]);
+            },
+        );
         return;
     }
 
@@ -5196,20 +5194,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .wrap(Wrap { trim: false });
         f.render_widget(telemetry, telemetry_area);
 
-        let footer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
-            .split(root[2]);
-
-        let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
-        f.render_widget(status, footer[0]);
-
-        let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
-            app.displayed_query().trim()
-        ))
-        .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(keys, footer[1]);
+        render_footer(
+            f,
+            root[2],
+            app.status_text(),
+            format!(
+                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                app.displayed_query().trim()
+            ),
+        );
         return;
     }
 
@@ -5483,21 +5476,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(preview, preview_area);
     }
 
-    let footer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
-        .split(root[2]);
-
-    let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
-    f.render_widget(status, footer[0]);
-
-    let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  PgUp/PgDn: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
-        if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
-        app.displayed_query().trim()
-    ))
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(keys, footer[1]);
+    render_footer(
+        f,
+        root[2],
+        app.status_text(),
+        format!(
+            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  PgUp/PgDn: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
+            if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
+            app.displayed_query().trim()
+        ),
+    );
 
     // Highlight the selected row by overdrawing it in the results pane.
     if total > 0 && inner_height > 0 && app.selected >= visible_start && app.selected < visible_end
@@ -5563,6 +5551,25 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let p = Paragraph::new(Text::from(vec![selected_line]));
         f.render_widget(p, highlight_area);
     }
+}
+
+fn render_footer(f: &mut ratatui::Frame, area: Rect, status_text: String, help_text: String) {
+    if status_text.is_empty() {
+        let keys = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
+        f.render_widget(keys, area);
+        return;
+    }
+
+    let footer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
+        .split(area);
+
+    let status = Paragraph::new(status_text).style(Style::default().fg(Color::Yellow));
+    f.render_widget(status, footer[0]);
+
+    let keys = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
+    f.render_widget(keys, footer[1]);
 }
 
 fn open_in_pager(
