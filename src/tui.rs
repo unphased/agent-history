@@ -142,9 +142,8 @@ impl EventBuffer {
         }
     }
 
-    fn recent(&self, max_records: usize) -> impl Iterator<Item = &telemetry::EventRecord> {
-        let skip = self.records.len().saturating_sub(max_records);
-        self.records.iter().skip(skip)
+    fn iter(&self) -> impl Iterator<Item = &telemetry::EventRecord> {
+        self.records.iter()
     }
 }
 
@@ -2171,6 +2170,9 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 struct App {
     query: String,
     cursor_pos: usize,
+    telemetry_query: String,
+    telemetry_cursor_pos: usize,
+    telemetry_search_active: bool,
     max_results: usize,
     active_tag_filters: Vec<TagFilter>,
 
@@ -2264,6 +2266,9 @@ fn run_app(
     let mut app = App {
         query: initial_query,
         cursor_pos: initial_cursor,
+        telemetry_query: String::new(),
+        telemetry_cursor_pos: 0,
+        telemetry_search_active: false,
         max_results: args.max_results,
         active_tag_filters: Vec::new(),
         all: Vec::new(),
@@ -2428,6 +2433,16 @@ fn handle_key(
             app.toggle_log_group(LogGroup::Remote);
             return Ok(false);
         }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
+            app.telemetry_search_active = !app.telemetry_search_active;
+            app.set_ui_status(if app.telemetry_search_active {
+                "events search enabled"
+            } else {
+                "events search disabled"
+            });
+            app.reset_telemetry_search();
+            return Ok(false);
+        }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let width = current_preview_inner_width(terminal, app)?;
             app.jump_preview_match(1, width);
@@ -2439,31 +2454,64 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Backspace => {
-            if app.cursor_pos > 0 {
+            if app.show_telemetry && app.telemetry_search_active {
+                if app.telemetry_cursor_pos > 0 {
+                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                    let prev_byte_pos =
+                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos - 1);
+                    app.telemetry_query.replace_range(prev_byte_pos..byte_pos, "");
+                    app.telemetry_cursor_pos -= 1;
+                    app.reset_telemetry_search();
+                }
+            } else if app.cursor_pos > 0 {
                 let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
                 let prev_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos - 1);
                 app.query.replace_range(prev_byte_pos..byte_pos, "");
                 app.cursor_pos -= 1;
+                app.update_results();
             }
-            app.update_results();
             return Ok(false);
         }
         KeyCode::Delete => {
-            let char_count = app.query.chars().count();
-            if app.cursor_pos < char_count {
-                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
-                let next_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos + 1);
-                app.query.replace_range(byte_pos..next_byte_pos, "");
+            if app.show_telemetry && app.telemetry_search_active {
+                let char_count = app.telemetry_query.chars().count();
+                if app.telemetry_cursor_pos < char_count {
+                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                    let next_byte_pos =
+                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos + 1);
+                    app.telemetry_query.replace_range(byte_pos..next_byte_pos, "");
+                    app.reset_telemetry_search();
+                }
+            } else {
+                let char_count = app.query.chars().count();
+                if app.cursor_pos < char_count {
+                    let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                    let next_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos + 1);
+                    app.query.replace_range(byte_pos..next_byte_pos, "");
+                }
+                app.update_results();
             }
-            app.update_results();
             return Ok(false);
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.clear_query_and_filters();
+            if app.show_telemetry && app.telemetry_search_active {
+                app.telemetry_query.clear();
+                app.telemetry_cursor_pos = 0;
+                app.reset_telemetry_search();
+            } else {
+                app.clear_query_and_filters();
+            }
             return Ok(false);
         }
         KeyCode::Left => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
+            if app.show_telemetry && app.telemetry_search_active {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.telemetry_cursor_pos =
+                        prev_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
+                } else {
+                    app.telemetry_cursor_pos = app.telemetry_cursor_pos.saturating_sub(1);
+                }
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
                 app.cursor_pos = prev_word_boundary(&app.query, app.cursor_pos);
             } else {
                 app.cursor_pos = app.cursor_pos.saturating_sub(1);
@@ -2471,38 +2519,71 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Right => {
-            let char_count = app.query.chars().count();
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                app.cursor_pos = next_word_boundary(&app.query, app.cursor_pos);
-            } else if app.cursor_pos < char_count {
-                app.cursor_pos += 1;
+            if app.show_telemetry && app.telemetry_search_active {
+                let char_count = app.telemetry_query.chars().count();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.telemetry_cursor_pos =
+                        next_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
+                } else if app.telemetry_cursor_pos < char_count {
+                    app.telemetry_cursor_pos += 1;
+                }
+            } else {
+                let char_count = app.query.chars().count();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.cursor_pos = next_word_boundary(&app.query, app.cursor_pos);
+                } else if app.cursor_pos < char_count {
+                    app.cursor_pos += 1;
+                }
             }
             return Ok(false);
         }
         KeyCode::Home => {
-            app.cursor_pos = 0;
+            if app.show_telemetry && app.telemetry_search_active {
+                app.telemetry_cursor_pos = 0;
+            } else {
+                app.cursor_pos = 0;
+            }
             return Ok(false);
         }
         KeyCode::End => {
-            app.cursor_pos = app.query.chars().count();
+            if app.show_telemetry && app.telemetry_search_active {
+                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
+            } else {
+                app.cursor_pos = app.query.chars().count();
+            }
             return Ok(false);
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.cursor_pos = 0;
+            if app.show_telemetry && app.telemetry_search_active {
+                app.telemetry_cursor_pos = 0;
+            } else {
+                app.cursor_pos = 0;
+            }
             return Ok(false);
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.cursor_pos = app.query.chars().count();
+            if app.show_telemetry && app.telemetry_search_active {
+                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
+            } else {
+                app.cursor_pos = app.query.chars().count();
+            }
             return Ok(false);
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
-                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
-                app.query.insert(byte_pos, c);
-                app.cursor_pos += 1;
-                app.update_results();
+                if app.show_telemetry && app.telemetry_search_active {
+                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                    app.telemetry_query.insert(byte_pos, c);
+                    app.telemetry_cursor_pos += 1;
+                    app.reset_telemetry_search();
+                } else {
+                    let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                    app.query.insert(byte_pos, c);
+                    app.cursor_pos += 1;
+                    app.update_results();
+                }
                 return Ok(false);
             }
         }
@@ -2920,6 +3001,48 @@ impl App {
         self.ui_status = Some(status.into());
     }
 
+    fn query_title(&self) -> String {
+        if self.show_telemetry && self.telemetry_search_active {
+            return "Events Search".to_string();
+        }
+        if self.active_tag_filters.is_empty() {
+            return "Query".to_string();
+        }
+
+        let filters = self
+            .active_tag_filters
+            .iter()
+            .map(|filter| match filter.kind {
+                TagFilterKind::Provider => format!("provider={}", filter.value),
+                TagFilterKind::Host => format!("host={}", filter.value),
+                TagFilterKind::Project => format!("project={}", filter.value),
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        format!("Query  [{filters}]")
+    }
+
+    fn displayed_query(&self) -> &str {
+        if self.show_telemetry && self.telemetry_search_active {
+            &self.telemetry_query
+        } else {
+            &self.query
+        }
+    }
+
+    fn displayed_cursor_pos(&self) -> usize {
+        if self.show_telemetry && self.telemetry_search_active {
+            self.telemetry_cursor_pos
+        } else {
+            self.cursor_pos
+        }
+    }
+
+    fn reset_telemetry_search(&mut self) {
+        self.preview_scroll = 0;
+        self.preview_scroll_reset_pending = true;
+    }
+
     fn append_event_record(&mut self, record: telemetry::EventRecord) {
         self.telemetry_events.push(record);
     }
@@ -2973,24 +3096,6 @@ impl App {
         self.cursor_pos = 0;
         self.active_tag_filters.clear();
         self.update_results();
-    }
-
-    fn query_title(&self) -> String {
-        if self.active_tag_filters.is_empty() {
-            return "Query".to_string();
-        }
-
-        let filters = self
-            .active_tag_filters
-            .iter()
-            .map(|filter| match filter.kind {
-                TagFilterKind::Provider => format!("provider={}", filter.value),
-                TagFilterKind::Host => format!("host={}", filter.value),
-                TagFilterKind::Project => format!("project={}", filter.value),
-            })
-            .collect::<Vec<_>>()
-            .join("  ");
-        format!("Query  [{filters}]")
     }
 
     fn matched_turn_count(&self) -> usize {
@@ -3503,8 +3608,8 @@ impl App {
             lines.push(Line::raw(format!("bytes: {}", metadata.len())));
         }
 
-        let recent_records = self.telemetry_events.recent(400).collect::<Vec<_>>();
-        if recent_records.is_empty() {
+        let buffered_records = self.telemetry_events.iter().collect::<Vec<_>>();
+        if buffered_records.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::raw("(no events yet)"));
             return PreviewDoc {
@@ -3514,91 +3619,118 @@ impl App {
             };
         }
 
-        let latest_start = recent_records
-            .iter()
-            .rposition(|record| record.kind == "indexer_started")
-            .unwrap_or(0);
-        let run = &recent_records[latest_start..];
-
+        let filter_query = self
+            .telemetry_search_active
+            .then_some(self.telemetry_query.trim())
+            .unwrap_or("");
         let find_data = |kind: &str| {
-            run.iter()
+            buffered_records
+                .iter()
                 .rev()
                 .find(|record| record.kind == kind)
                 .map(|record| &record.data)
         };
 
-        if let Some(data) = find_data("cache_open_finished") {
+        if filter_query.is_empty() {
             lines.push(Line::raw(format!(
-                "cache open: {} ms   size: {} bytes",
-                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
-                telemetry_metric_u64(data, "cache_bytes").unwrap_or(0)
+                "buffered events: {}",
+                buffered_records.len()
             )));
-        }
-        if let Some(data) = find_data("cache_load_finished") {
-            lines.push(Line::raw(format!(
-                "cache load: {} ms   records: {}   sessions: {}",
-                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
-                telemetry_metric_u64(data, "records").unwrap_or(0),
-                telemetry_metric_u64(data, "sessions").unwrap_or(0)
-            )));
-        }
-        if let Some(data) = find_data("refresh_finished") {
-            lines.push(Line::raw(format!(
-                "refresh: {} ms   skipped: {}   refreshed: {}   failed: {}",
-                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
-                telemetry_metric_u64(data, "skipped_units").unwrap_or(0),
-                telemetry_metric_u64(data, "refreshed_units").unwrap_or(0),
-                telemetry_metric_u64(data, "failed_units").unwrap_or(0)
-            )));
-        }
-        if let Some(data) = find_data("cache_reload_finished") {
-            lines.push(Line::raw(format!(
-                "cache reload: {} ms   records: {}   sessions: {}",
-                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
-                telemetry_metric_u64(data, "records").unwrap_or(0),
-                telemetry_metric_u64(data, "sessions").unwrap_or(0)
-            )));
-        }
-        if let Some(data) = find_data("indexer_finished") {
-            lines.push(Line::raw(format!(
-                "total: {} ms",
-                telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
-            )));
-        }
-        if let Some(cache_path) = self.cache_path.as_ref()
-            && let Ok(store) = cache::CacheStore::open(cache_path, false)
-            && let Ok(states) = store.load_remote_sync_states()
-            && !states.is_empty()
-        {
-            lines.push(Line::raw(""));
-            lines.push(Line::raw("remote sync:"));
-            for state in states {
+            if let Some(data) = find_data("cache_open_finished") {
                 lines.push(Line::raw(format!(
-                    "{}@{} attempted={} success={} records={} sessions={} duration={}ms error={}",
-                    state.remote_name,
-                    state.host,
-                    state.last_attempted_ms.unwrap_or(0),
-                    state.last_success_ms.unwrap_or(0),
-                    state.imported_records,
-                    state.imported_sessions,
-                    state.last_duration_ms.unwrap_or(0),
-                    state.last_error.unwrap_or_default(),
+                    "cache open: {} ms   size: {} bytes",
+                    telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                    telemetry_metric_u64(data, "cache_bytes").unwrap_or(0)
                 )));
             }
+            if let Some(data) = find_data("cache_load_finished") {
+                lines.push(Line::raw(format!(
+                    "cache load: {} ms   records: {}   sessions: {}",
+                    telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                    telemetry_metric_u64(data, "records").unwrap_or(0),
+                    telemetry_metric_u64(data, "sessions").unwrap_or(0)
+                )));
+            }
+            if let Some(data) = find_data("refresh_finished") {
+                lines.push(Line::raw(format!(
+                    "refresh: {} ms   skipped: {}   refreshed: {}   failed: {}",
+                    telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                    telemetry_metric_u64(data, "skipped_units").unwrap_or(0),
+                    telemetry_metric_u64(data, "refreshed_units").unwrap_or(0),
+                    telemetry_metric_u64(data, "failed_units").unwrap_or(0)
+                )));
+            }
+            if let Some(data) = find_data("cache_reload_finished") {
+                lines.push(Line::raw(format!(
+                    "cache reload: {} ms   records: {}   sessions: {}",
+                    telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                    telemetry_metric_u64(data, "records").unwrap_or(0),
+                    telemetry_metric_u64(data, "sessions").unwrap_or(0)
+                )));
+            }
+            if let Some(data) = find_data("indexer_finished") {
+                lines.push(Line::raw(format!(
+                    "total: {} ms",
+                    telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
+                )));
+            }
+            if let Some(cache_path) = self.cache_path.as_ref()
+                && let Ok(store) = cache::CacheStore::open(cache_path, false)
+                && let Ok(states) = store.load_remote_sync_states()
+                && !states.is_empty()
+            {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("remote sync:"));
+                for state in states {
+                    lines.push(Line::raw(format!(
+                        "{}@{} attempted={} success={} records={} sessions={} duration={}ms error={}",
+                        state.remote_name,
+                        state.host,
+                        state.last_attempted_ms.unwrap_or(0),
+                        state.last_success_ms.unwrap_or(0),
+                        state.imported_records,
+                        state.imported_sessions,
+                        state.last_duration_ms.unwrap_or(0),
+                        state.last_error.unwrap_or_default(),
+                    )));
+                }
+            }
+            lines.push(Line::raw(""));
+        } else {
+            lines.push(Line::raw(format!("search: {filter_query}")));
+            lines.push(Line::raw(""));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::raw("latest run events:"));
+        lines.push(Line::raw(if filter_query.is_empty() {
+            "events:"
+        } else {
+            "matching events:"
+        }));
         lines.push(Line::raw(""));
 
-        let first_match_line = lines.len();
-        for record in run.iter().rev() {
-            lines.push(Line::raw(format_telemetry_event_line(record)));
+        let mut first_match_line = lines.len();
+        let mut match_lines = Vec::new();
+        for record in buffered_records.iter().rev() {
+            let rendered = format_telemetry_event_line(record);
+            if !filter_query.is_empty() && search::find_match_ranges(filter_query, &rendered).is_empty() {
+                continue;
+            }
+            if match_lines.is_empty() {
+                first_match_line = lines.len();
+            }
+            match_lines.push(lines.len());
+            lines.push(highlighted_line(&rendered, filter_query, Style::default()));
+        }
+        if filter_query.is_empty() && match_lines.is_empty() {
+            first_match_line = lines.len();
+        }
+        if !filter_query.is_empty() && match_lines.is_empty() {
+            lines.push(Line::raw("(no matching events)"));
         }
 
         PreviewDoc {
             lines,
             first_match_line,
-            match_lines: Vec::new(),
+            match_lines,
         }
     }
 
@@ -3841,12 +3973,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         )
         .split(f.area());
 
-    let query = Paragraph::new(format!("> {}", app.query))
+    let displayed_query = app.displayed_query().to_string();
+    let query = Paragraph::new(format!("> {}", displayed_query))
         .block(Block::default().borders(Borders::ALL).title(app.query_title()))
         .style(Style::default().fg(Color::White));
     f.render_widget(query, root[0]);
     // Place the terminal cursor in the query bar (border + "> " prefix = 3 chars offset)
-    let cursor_x = root[0].x + 1 + 2 + app.cursor_pos as u16;
+    let cursor_x = root[0].x + 1 + 2 + app.displayed_cursor_pos() as u16;
     let cursor_y = root[0].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 
@@ -4016,8 +4149,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
-            app.query.trim()
+            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+s: search  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear{}  query: \"{}\"",
+            if app.telemetry_search_active { " search" } else { " query+tag filters" },
+            app.displayed_query().trim()
         ))
         .style(Style::default().fg(Color::DarkGray));
         f.render_widget(keys, footer[1]);
@@ -4224,7 +4358,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             ""
         },
-        app.query.trim()
+        app.displayed_query().trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(keys, footer[1]);
@@ -4763,6 +4897,9 @@ mod tests {
         App {
             query: String::new(),
             cursor_pos: 0,
+            telemetry_query: String::new(),
+            telemetry_cursor_pos: 0,
+            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all: Vec::new(),
@@ -5375,6 +5512,9 @@ mod tests {
         let mut app = App {
             query: String::new(),
             cursor_pos: 0,
+            telemetry_query: String::new(),
+            telemetry_cursor_pos: 0,
+            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
@@ -5456,6 +5596,9 @@ mod tests {
         let mut app = App {
             query: "needle".to_string(),
             cursor_pos: 6,
+            telemetry_query: String::new(),
+            telemetry_cursor_pos: 0,
+            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
@@ -5556,9 +5699,51 @@ mod tests {
         assert!(rendered.contains("cache open: 7 ms"));
         assert!(rendered.contains("cache load: 11 ms"));
         assert!(rendered.contains("refresh: 77 ms"));
-        assert!(rendered.contains("latest run events:"));
+        assert!(rendered.contains("buffered events: 7"));
+        assert!(rendered.contains("events:"));
         assert!(rendered.contains("unit_reindexed: ms=55"));
         assert!(rendered.contains("parts=300"));
+    }
+
+    #[test]
+    fn telemetry_preview_doc_search_filters_events() {
+        let tmp = TempDir::new("agent-history-telemetry-search");
+        let log = tmp.path.join("events.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"ts_ms\":1,\"kind\":\"log_path_info\",\"data\":{\"path\":\"/tmp/events.jsonl\"}}\n",
+                "{\"ts_ms\":2,\"kind\":\"cache_open_finished\",\"data\":{\"duration_ms\":7,\"cache_bytes\":4096}}\n",
+                "{\"ts_ms\":3,\"kind\":\"refresh_finished\",\"data\":{\"duration_ms\":77,\"skipped_units\":8,\"refreshed_units\":2,\"failed_units\":1}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut app = empty_app();
+        app.ready = true;
+        app.telemetry_log_path = Some(log.clone());
+        app.telemetry_events
+            .seed(telemetry::read_recent_records(&log, EVENT_BUFFER_MAX_BYTES));
+        app.show_telemetry = true;
+        app.telemetry_search_active = true;
+        app.telemetry_query = "refresh".to_string();
+
+        let doc = app.build_preview_doc();
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("search: refresh"));
+        assert!(rendered.contains("refresh_finished: ms=77"));
+        assert!(!rendered.contains("cache open: 7 ms"));
     }
 
     #[test]
@@ -6114,6 +6299,9 @@ mod tests {
         let app = App {
             query: String::new(),
             cursor_pos: 0,
+            telemetry_query: String::new(),
+            telemetry_cursor_pos: 0,
+            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
