@@ -3117,7 +3117,7 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
             [
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(app.footer_height()),
             ]
             .as_ref(),
         )
@@ -3231,7 +3231,7 @@ fn app_panes(area: Rect) -> (Rect, Rect) {
             [
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ]
             .as_ref(),
         )
@@ -5613,10 +5613,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn render_footer(f: &mut ratatui::Frame, area: Rect, status_text: String, help_text: String) {
-    let status = Paragraph::new(status_text).style(Style::default().fg(Color::Yellow));
     let keys = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(keys, area);
-    f.render_widget(status, area);
+    if !status_text.is_empty() {
+        let status = Paragraph::new(Line::from(vec![Span::styled(
+            status_text,
+            Style::default().fg(Color::Yellow),
+        )]));
+        f.render_widget(status, area);
+    }
 }
 
 fn open_in_pager(
