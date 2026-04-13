@@ -3853,6 +3853,23 @@ impl App {
         format!("{label}  {turns} {turn_label}")
     }
 
+    fn turn_position_in_selected_session(&self, record_idx: usize) -> Option<(usize, usize)> {
+        let hit = self.selected_hit()?;
+        let record_idxs = self.session_records.get(hit.session_idx)?;
+        let turn_idx = record_idxs.iter().position(|&idx| idx == record_idx)?;
+        Some((turn_idx + 1, record_idxs.len()))
+    }
+
+    fn query_preview_title(&self, label: &str, record_idx: Option<usize>) -> String {
+        let Some(record_idx) = record_idx else {
+            return self.preview_title(label);
+        };
+        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx) else {
+            return self.preview_title(label);
+        };
+        format!("{label}  turn {turn_idx}/{total_turns}")
+    }
+
     fn git_graph_title(&self) -> String {
         if !self.git_graph_visible {
             return "Git Graph".to_string();
@@ -5485,6 +5502,22 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 }),
             );
         }
+        let preview_title = if !app.showing_session_browser() && !query.is_empty() {
+            let current_record_idx = {
+                let raw = preview_center_raw_line(
+                    &preview_doc.lines,
+                    preview_inner_width,
+                    app.preview_scroll,
+                    preview_inner_height,
+                );
+                preview_doc.line_record_indices.get(raw).and_then(|idx| *idx)
+            };
+            app.query_preview_title("Preview", current_record_idx)
+        } else if app.showing_session_browser() {
+            app.preview_title("Turns")
+        } else {
+            app.preview_title("Preview")
+        };
         let preview = Paragraph::new(Text::from(with_anchor_indicator(
             &preview_doc,
             turn_anchor_record_idx,
@@ -5495,11 +5528,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 .style(preview_style)
                 .border_style(preview_border_style)
                 .borders(Borders::ALL)
-                .title(if app.showing_session_browser() {
-                    app.preview_title("Turns")
-                } else {
-                    app.preview_title("Preview")
-                }),
+                .title(preview_title),
         )
         .scroll((app.preview_scroll as u16, 0))
         .wrap(Wrap { trim: false });
@@ -7127,6 +7156,46 @@ mod tests {
 
         assert_eq!(app.preview_title("Start"), "Start  3 turns");
         assert_eq!(app.preview_title("Preview"), "Preview  3 turns");
+    }
+
+    #[test]
+    fn query_preview_title_uses_matched_turn_position() {
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::Assistant,
+                "needle second",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "needle".to_string();
+        app.update_results();
+
+        let matched_record_idx = app.selected_record().and_then(|_| {
+            app.selected_hit()
+                .and_then(|hit| hit.matched_record_idx)
+        });
+
+        assert_eq!(
+            app.query_preview_title("Preview", matched_record_idx),
+            "Preview  turn 2/3"
+        );
     }
 
     #[test]
