@@ -106,6 +106,7 @@ struct PreviewDoc {
     lines: Vec<Line<'static>>,
     first_match_line: usize,
     match_lines: Vec<usize>,
+    line_record_indices: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Default)]
@@ -153,9 +154,153 @@ enum SessionBrowserPane {
     End,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPreset {
+    Balanced,
+    TurnsWide,
+    GitWide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePane {
+    Results,
+    TurnPreview,
+    SessionBrowser(SessionBrowserPane),
+    GitGraph,
+    GitCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSplit {
+    ResultsGit,
+    GitTurns,
+    GitColumnVertical,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutRatios {
+    results_pct: u16,
+    git_pct: u16,
+    graph_pct: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutState {
+    preset: LayoutPreset,
+    results_pct: u16,
+    git_pct: u16,
+    graph_pct: u16,
+}
+
+#[derive(Debug, Clone)]
+struct GitCommitEntry {
+    hash: String,
+    epoch: i64,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitMatch {
+    anchor_record_idx: usize,
+    repo_root: PathBuf,
+    anchor_ts: i64,
+    selected_commit_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GitRepoContext {
+    repo_root: PathBuf,
+    commits: Vec<GitCommitEntry>,
+    graph_lines: Vec<String>,
+    graph_line_commit_indices: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct GitPaneDoc {
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaneGeometry {
+    root: Rect,
+    results: Rect,
+    git_graph: Option<Rect>,
+    git_commit: Option<Rect>,
+    turn_preview: Rect,
+    turn_start: Option<Rect>,
+    turn_end: Option<Rect>,
+    browser_single: bool,
+}
+
 const PREVIEW_MAX_MATCHES: usize = 100;
 const PREVIEW_MAX_LINES: usize = 5000;
 const EVENT_BUFFER_MAX_BYTES: usize = 50 * 1024 * 1024;
+const MIN_RESULTS_PCT: u16 = 12;
+const MIN_GIT_PCT: u16 = 16;
+const MIN_TURNS_PCT: u16 = 28;
+const MIN_GRAPH_PCT: u16 = 20;
+const MAX_GRAPH_PCT: u16 = 80;
+const BROWSE_SINGLE_PANE_SCREENFULS: usize = 5;
+
+impl LayoutPreset {
+    fn next(self) -> Self {
+        match self {
+            Self::Balanced => Self::TurnsWide,
+            Self::TurnsWide => Self::GitWide,
+            Self::GitWide => Self::Balanced,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::TurnsWide => "turns-wide",
+            Self::GitWide => "git-wide",
+        }
+    }
+}
+
+impl LayoutState {
+    fn new() -> Self {
+        let preset = LayoutPreset::Balanced;
+        let ratios = preset.default_ratios();
+        Self {
+            preset,
+            results_pct: ratios.results_pct,
+            git_pct: ratios.git_pct,
+            graph_pct: ratios.graph_pct,
+        }
+    }
+
+    fn reset_to_preset(&mut self) {
+        let ratios = self.preset.default_ratios();
+        self.results_pct = ratios.results_pct;
+        self.git_pct = ratios.git_pct;
+        self.graph_pct = ratios.graph_pct;
+    }
+}
+
+impl LayoutPreset {
+    fn default_ratios(self) -> LayoutRatios {
+        match self {
+            Self::Balanced => LayoutRatios {
+                results_pct: 20,
+                git_pct: 28,
+                graph_pct: 65,
+            },
+            Self::TurnsWide => LayoutRatios {
+                results_pct: 18,
+                git_pct: 22,
+                graph_pct: 65,
+            },
+            Self::GitWide => LayoutRatios {
+                results_pct: 16,
+                git_pct: 34,
+                graph_pct: 65,
+            },
+        }
+    }
+}
 
 fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<usize>>) {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -464,7 +609,11 @@ fn preview_visual_line_offset(lines: &[Line<'_>], raw_line_index: usize, width: 
         .sum()
 }
 
-fn preview_raw_line_index_for_visual_offset(lines: &[Line<'_>], width: usize, visual_offset: usize) -> usize {
+fn preview_raw_line_index_for_visual_offset(
+    lines: &[Line<'_>],
+    width: usize,
+    visual_offset: usize,
+) -> usize {
     if lines.is_empty() {
         return 0;
     }
@@ -479,12 +628,53 @@ fn preview_raw_line_index_for_visual_offset(lines: &[Line<'_>], width: usize, vi
     lines.len().saturating_sub(1)
 }
 
+fn preview_center_raw_line(
+    lines: &[Line<'_>],
+    width: usize,
+    scroll: usize,
+    inner_height: usize,
+) -> usize {
+    let center_offset = scroll.saturating_add(inner_height / 2);
+    preview_raw_line_index_for_visual_offset(lines, width, center_offset)
+}
+
 fn short_ts(ts: Option<&str>) -> String {
     let ts = ts.unwrap_or("");
     if let Some(formatted) = display_timestamp(ts) {
         return formatted;
     }
     ts.get(0..19).unwrap_or(ts).to_string()
+}
+
+fn parse_timestamp_epoch(ts: &str) -> Option<i64> {
+    if let Ok(n) = ts.parse::<i64>() {
+        let abs = n.unsigned_abs();
+        return Some(if abs >= 1_000_000_000_000 {
+            n / 1000
+        } else {
+            n
+        });
+    }
+    let trimmed = ts.trim();
+    let date_end = trimmed.find('T')?;
+    let time_start = date_end + 1;
+    let year = trimmed.get(0..4)?.parse::<i32>().ok()?;
+    let month = trimmed.get(5..7)?.parse::<u32>().ok()?;
+    let day = trimmed.get(8..10)?.parse::<u32>().ok()?;
+    let hour = trimmed
+        .get(time_start..time_start + 2)?
+        .parse::<i64>()
+        .ok()?;
+    let minute = trimmed
+        .get(time_start + 3..time_start + 5)?
+        .parse::<i64>()
+        .ok()?;
+    let second = trimmed
+        .get(time_start + 6..time_start + 8)?
+        .parse::<i64>()
+        .ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 fn first_non_empty_line(s: &str) -> &str {
@@ -600,7 +790,9 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
             telemetry_metric_u64(data, "sessions").unwrap_or(0)
         ),
         "log_groups_help" => telemetry_metric_str(data, "summary")
-            .unwrap_or("While Events is open, Ctrl+g toggles perf and Ctrl+r toggles remote logging.")
+            .unwrap_or(
+                "While Events is open, Ctrl+g toggles perf and Ctrl+r toggles remote logging.",
+            )
             .to_string(),
         "log_path_info" => format!(
             "events log path={}",
@@ -855,7 +1047,10 @@ fn result_line(
 }
 
 fn highlighted_line(text: &str, query: &str, base_style: Style) -> Line<'static> {
-    Line::from(highlight_spans(vec![Span::styled(text.to_string(), base_style)], query))
+    Line::from(highlight_spans(
+        vec![Span::styled(text.to_string(), base_style)],
+        query,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1016,11 +1211,7 @@ fn highlight_spans(spans: Vec<Span<'static>>, query: &str) -> Vec<Span<'static>>
     out
 }
 
-fn render_preview_message_lines(
-    text: &str,
-    query: &str,
-    base_style: Style,
-) -> Vec<Line<'static>> {
+fn render_preview_message_lines(text: &str, query: &str, base_style: Style) -> Vec<Line<'static>> {
     let theme = MarkdownTheme::new(base_style);
     let mut lines = Vec::new();
     let mut code_fence: Option<CodeFence> = None;
@@ -2186,6 +2377,14 @@ struct App {
     session_browser_start_scroll: usize,
     session_browser_end_scroll: usize,
     session_browser_active_pane: SessionBrowserPane,
+    git_graph_scroll: usize,
+    git_commit_scroll: usize,
+    git_graph_visible: bool,
+    git_commit_visible: bool,
+    active_pane: ActivePane,
+    active_split: Option<ActiveSplit>,
+    layout_state: LayoutState,
+    dragged_split: Option<ActiveSplit>,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -2207,17 +2406,20 @@ struct App {
     preview_bgcolor_cache: HashMap<String, Option<Color>>,
     ui_tags: config::UiTagConfig,
     remotes: HashMap<String, config::RemoteConfig>,
+    git_repo_cache: HashMap<PathBuf, GitRepoContext>,
+    git_commit_preview_cache: HashMap<(PathBuf, String), Vec<String>>,
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let rx = crate::indexer::spawn_indexer_from_args(args.clone());
 
     let mut stdout = io::stdout();
-    enable_raw_mode().context("raw modeの有効化に失敗")?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("画面切替に失敗")?;
+    enable_raw_mode().context("failed to enable raw mode")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to switch screen")?;
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("Terminal初期化に失敗")?;
+    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().ok();
 
     let res = run_app(&mut terminal, rx, args);
@@ -2280,6 +2482,14 @@ fn run_app(
         session_browser_start_scroll: 0,
         session_browser_end_scroll: usize::MAX,
         session_browser_active_pane: SessionBrowserPane::Start,
+        git_graph_scroll: 0,
+        git_commit_scroll: 0,
+        git_graph_visible: false,
+        git_commit_visible: false,
+        active_pane: ActivePane::Results,
+        active_split: None,
+        layout_state: LayoutState::new(),
+        dragged_split: None,
         last_query: String::new(),
         last_results: Vec::new(),
         last_tag_filters: Vec::new(),
@@ -2299,6 +2509,8 @@ fn run_app(
         preview_bgcolor_cache: HashMap::new(),
         ui_tags: app_config.ui.tags,
         remotes,
+        git_repo_cache: HashMap::new(),
+        git_commit_preview_cache: HashMap::new(),
     };
 
     if let Some(path) = app.telemetry_log_path.as_ref() {
@@ -2317,13 +2529,15 @@ fn run_app(
 
         sync_preview_bgcolor(&mut app);
 
-        terminal.draw(|f| ui(f, &mut app)).context("描画に失敗")?;
+        terminal
+            .draw(|f| ui(f, &mut app))
+            .context("failed to render ui")?;
 
-        if !event::poll(Duration::from_millis(50)).context("event pollに失敗")? {
+        if !event::poll(Duration::from_millis(50)).context("event poll failed")? {
             continue;
         }
 
-        let ev = event::read().context("event readに失敗")?;
+        let ev = event::read().context("event read failed")?;
         match ev {
             Event::Key(key) => {
                 if handle_key(terminal, &mut app, key)? {
@@ -2423,11 +2637,27 @@ fn handle_key(
             app.toggle_telemetry_view();
             return Ok(false);
         }
-        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_git_graph();
+            return Ok(false);
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_git_commit();
+            return Ok(false);
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cycle_layout_preset();
+            return Ok(false);
+        }
+        KeyCode::Char('g')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
+        {
             app.toggle_log_group(LogGroup::Perf);
             return Ok(false);
         }
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
+        KeyCode::Char('r')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
+        {
             app.toggle_log_group(LogGroup::Remote);
             return Ok(false);
         }
@@ -2441,13 +2671,42 @@ fn handle_key(
             app.jump_preview_match(-1, width);
             return Ok(false);
         }
+        KeyCode::Left
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.adjust_active_split(-2);
+            return Ok(false);
+        }
+        KeyCode::Right
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.adjust_active_split(2);
+            return Ok(false);
+        }
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.adjust_active_split(-2);
+            return Ok(false);
+        }
+        KeyCode::Down
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.adjust_active_split(2);
+            return Ok(false);
+        }
         KeyCode::Backspace => {
             if app.show_telemetry {
                 if app.telemetry_cursor_pos > 0 {
                     let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
                     let prev_byte_pos =
                         char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos - 1);
-                    app.telemetry_query.replace_range(prev_byte_pos..byte_pos, "");
+                    app.telemetry_query
+                        .replace_range(prev_byte_pos..byte_pos, "");
                     app.telemetry_cursor_pos -= 1;
                     app.reset_telemetry_search();
                 }
@@ -2467,7 +2726,8 @@ fn handle_key(
                     let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
                     let next_byte_pos =
                         char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos + 1);
-                    app.telemetry_query.replace_range(byte_pos..next_byte_pos, "");
+                    app.telemetry_query
+                        .replace_range(byte_pos..next_byte_pos, "");
                     app.reset_telemetry_search();
                 }
             } else {
@@ -2626,7 +2886,7 @@ fn handle_key(
                             }
                             Ok(st) => {
                                 app.indexing.last_warn = Some(format!(
-                                    "resume失敗: {} (code={})",
+                                    "resume failed: {} (code={})",
                                     target.program,
                                     st.code()
                                         .map(|c| c.to_string())
@@ -2635,12 +2895,13 @@ fn handle_key(
                             }
                             Err(e) => {
                                 app.indexing.last_warn =
-                                    Some(format!("resume失敗: {}: {e}", target.program));
+                                    Some(format!("resume failed: {}: {e}", target.program));
                             }
                         }
                     }
                     None => {
-                        app.indexing.last_warn = Some("この行はresume対象にできません".to_string());
+                        app.indexing.last_warn =
+                            Some("the selected row cannot be resumed".to_string());
                     }
                 }
             }
@@ -2758,7 +3019,8 @@ fn sync_preview_bgcolor(app: &mut App) {
                         color
                     }
                     Err(err) => {
-                        app.indexing.last_warn = Some(format!("preview bgcolor update failed: {err}"));
+                        app.indexing.last_warn =
+                            Some(format!("preview bgcolor update failed: {err}"));
                         return;
                     }
                 }
@@ -2769,6 +3031,163 @@ fn sync_preview_bgcolor(app: &mut App) {
     app.preview_bgcolor_target = target;
     app.preview_bgcolor = color;
     app.preview_remote_style = preview_remote_style;
+}
+
+fn parse_git_commit_line(line: &str) -> Option<GitCommitEntry> {
+    let mut parts = line.splitn(3, '\t');
+    let hash = parts.next()?.trim();
+    let epoch = parts.next()?.trim().parse::<i64>().ok()?;
+    let summary = parts.next().unwrap_or("").trim().to_string();
+    Some(GitCommitEntry {
+        hash: hash.to_string(),
+        epoch,
+        summary,
+    })
+}
+
+fn point_near_vertical_split(x: u16, rect: Rect) -> bool {
+    rect.width > 0 && x == rect.x.saturating_sub(1)
+}
+
+fn point_near_horizontal_split(y: u16, rect: Rect) -> bool {
+    rect.height > 0 && y == rect.y.saturating_sub(1)
+}
+
+fn with_anchor_indicator(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
+    let Some(anchor_record_idx) = anchor_record_idx else {
+        return doc.lines.clone();
+    };
+    let mut lines = doc.lines.clone();
+    let Some(line_idx) = doc
+        .line_record_indices
+        .iter()
+        .position(|record_idx| *record_idx == Some(anchor_record_idx))
+    else {
+        return lines;
+    };
+    let mut spans = vec![Span::styled(
+        "git anchor  ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(lines[line_idx].spans.clone());
+    lines[line_idx] = Line::from(spans);
+    lines
+}
+
+fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ]
+            .as_ref(),
+        )
+        .split(area)[1];
+
+    if app.show_telemetry || !app.git_graph_visible {
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
+            .split(root);
+        let browser_single = app.is_single_session_browser(
+            main[1].width.saturating_sub(2) as usize,
+            main[1].height.saturating_sub(2) as usize,
+        );
+        let (turn_start, turn_end) = if app.showing_session_browser() && !browser_single {
+            let panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                .split(main[1]);
+            (Some(panes[0]), Some(panes[1]))
+        } else {
+            (None, None)
+        };
+        return PaneGeometry {
+            root,
+            results: main[0],
+            git_graph: None,
+            git_commit: None,
+            turn_preview: main[1],
+            turn_start,
+            turn_end,
+            browser_single,
+        };
+    }
+
+    let mut results_pct = app.layout_state.results_pct.clamp(MIN_RESULTS_PCT, 100);
+    let max_results = 100 - MIN_GIT_PCT - MIN_TURNS_PCT;
+    results_pct = results_pct.min(max_results);
+    let remaining = 100 - results_pct;
+    let mut git_pct = app
+        .layout_state
+        .git_pct
+        .clamp(MIN_GIT_PCT, remaining - MIN_TURNS_PCT);
+    let turns_pct = remaining - git_pct;
+    if turns_pct < MIN_TURNS_PCT {
+        git_pct = remaining - MIN_TURNS_PCT;
+    }
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage(results_pct),
+                Constraint::Percentage(git_pct),
+                Constraint::Percentage(100 - results_pct - git_pct),
+            ]
+            .as_ref(),
+        )
+        .split(root);
+
+    let git_column = main[1];
+    let (git_graph, git_commit) = if app.git_commit_visible {
+        let graph_pct = app
+            .layout_state
+            .graph_pct
+            .clamp(MIN_GRAPH_PCT, MAX_GRAPH_PCT);
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                [
+                    Constraint::Percentage(graph_pct),
+                    Constraint::Percentage(100 - graph_pct),
+                ]
+                .as_ref(),
+            )
+            .split(git_column);
+        (Some(panes[0]), Some(panes[1]))
+    } else {
+        (Some(git_column), None)
+    };
+
+    let browser_single = app.is_single_session_browser(
+        main[2].width.saturating_sub(2) as usize,
+        main[2].height.saturating_sub(2) as usize,
+    );
+    let (turn_start, turn_end) = if app.showing_session_browser() && !browser_single {
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .split(main[2]);
+        (Some(panes[0]), Some(panes[1]))
+    } else {
+        (None, None)
+    };
+
+    PaneGeometry {
+        root,
+        results: main[0],
+        git_graph,
+        git_commit,
+        turn_preview: main[2],
+        turn_start,
+        turn_end,
+        browser_single,
+    }
 }
 
 fn app_panes(area: Rect) -> (Rect, Rect) {
@@ -2832,10 +3251,14 @@ fn handle_results_click(app: &mut App, results_area: Rect, mouse: MouseEvent) {
     if !point_in_rect(mouse.column, mouse.row, results_area) {
         return;
     }
-    if mouse.row <= results_area.y || mouse.row >= results_area.y + results_area.height.saturating_sub(1) {
+    if mouse.row <= results_area.y
+        || mouse.row >= results_area.y + results_area.height.saturating_sub(1)
+    {
         return;
     }
-    if mouse.column <= results_area.x || mouse.column >= results_area.x + results_area.width.saturating_sub(1) {
+    if mouse.column <= results_area.x
+        || mouse.column >= results_area.x + results_area.width.saturating_sub(1)
+    {
         return;
     }
 
@@ -2870,14 +3293,16 @@ fn handle_mouse(
         return Ok(());
     }
 
-    let area = terminal.size().context("terminal size取得に失敗")?;
+    let area = terminal.size().context("failed to get terminal size")?;
     route_mouse(app, area.into(), mouse);
     Ok(())
 }
 
 fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
-    let (results_area, preview_area) = app_panes(area);
-    let preview_line_step = 3;
+    let geometry = app_geometry(area, app);
+    let results_area = geometry.results;
+    let preview_area = geometry.turn_preview;
+    let preview_line_step: i32 = 3;
     let results_line_step = 1;
     let preview_hit_area = if app.show_telemetry {
         area
@@ -2887,20 +3312,75 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(_) => {
+            app.dragged_split = None;
+            if !app.show_telemetry && app.git_graph_visible {
+                if let Some(git_graph) = geometry.git_graph {
+                    if point_near_vertical_split(mouse.column, git_graph) {
+                        app.active_split = Some(ActiveSplit::ResultsGit);
+                        app.dragged_split = Some(ActiveSplit::ResultsGit);
+                    } else if point_near_vertical_split(mouse.column, geometry.turn_preview) {
+                        app.active_split = Some(ActiveSplit::GitTurns);
+                        app.dragged_split = Some(ActiveSplit::GitTurns);
+                    } else if let Some(git_commit) = geometry.git_commit
+                        && point_near_horizontal_split(mouse.row, git_commit)
+                    {
+                        app.active_split = Some(ActiveSplit::GitColumnVertical);
+                        app.dragged_split = Some(ActiveSplit::GitColumnVertical);
+                    }
+                }
+            }
             if !app.show_telemetry {
                 handle_results_click(app, results_area, mouse);
+                if let Some(git_graph) = geometry.git_graph
+                    && point_in_rect(mouse.column, mouse.row, git_graph)
+                {
+                    app.active_pane = ActivePane::GitGraph;
+                } else if let Some(git_commit) = geometry.git_commit
+                    && point_in_rect(mouse.column, mouse.row, git_commit)
+                {
+                    app.active_pane = ActivePane::GitCommit;
+                } else if let Some(turn_start) = geometry.turn_start
+                    && point_in_rect(mouse.column, mouse.row, turn_start)
+                {
+                    app.set_session_browser_active_pane(SessionBrowserPane::Start);
+                } else if let Some(turn_end) = geometry.turn_end
+                    && point_in_rect(mouse.column, mouse.row, turn_end)
+                {
+                    app.set_session_browser_active_pane(SessionBrowserPane::End);
+                } else if point_in_rect(mouse.column, mouse.row, geometry.turn_preview) {
+                    app.active_pane = ActivePane::TurnPreview;
+                } else if point_in_rect(mouse.column, mouse.row, results_area) {
+                    app.active_pane = ActivePane::Results;
+                }
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.showing_session_browser() && point_in_rect(mouse.column, mouse.row, preview_area) {
-                let panes = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                    .split(preview_area);
-                let pane = if point_in_rect(mouse.column, mouse.row, panes[0]) {
-                    SessionBrowserPane::Start
+            if let Some(git_graph) = geometry.git_graph
+                && point_in_rect(mouse.column, mouse.row, git_graph)
+            {
+                app.active_pane = ActivePane::GitGraph;
+                app.git_graph_scroll = app
+                    .git_graph_scroll
+                    .saturating_sub(preview_line_step as usize);
+            } else if let Some(git_commit) = geometry.git_commit
+                && point_in_rect(mouse.column, mouse.row, git_commit)
+            {
+                app.active_pane = ActivePane::GitCommit;
+                app.git_commit_scroll = app
+                    .git_commit_scroll
+                    .saturating_sub(preview_line_step as usize);
+            } else if app.showing_session_browser()
+                && !geometry.browser_single
+                && point_in_rect(mouse.column, mouse.row, preview_area)
+            {
+                let pane = if let Some(turn_start) = geometry.turn_start {
+                    if point_in_rect(mouse.column, mouse.row, turn_start) {
+                        SessionBrowserPane::Start
+                    } else {
+                        SessionBrowserPane::End
+                    }
                 } else {
-                    SessionBrowserPane::End
+                    SessionBrowserPane::Start
                 };
                 app.set_session_browser_active_pane(pane);
                 app.scroll_preview_lines(-preview_line_step);
@@ -2911,15 +3391,32 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
             }
         }
         MouseEventKind::ScrollDown => {
-            if app.showing_session_browser() && point_in_rect(mouse.column, mouse.row, preview_area) {
-                let panes = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                    .split(preview_area);
-                let pane = if point_in_rect(mouse.column, mouse.row, panes[0]) {
-                    SessionBrowserPane::Start
+            if let Some(git_graph) = geometry.git_graph
+                && point_in_rect(mouse.column, mouse.row, git_graph)
+            {
+                app.active_pane = ActivePane::GitGraph;
+                app.git_graph_scroll = app
+                    .git_graph_scroll
+                    .saturating_add(preview_line_step as usize);
+            } else if let Some(git_commit) = geometry.git_commit
+                && point_in_rect(mouse.column, mouse.row, git_commit)
+            {
+                app.active_pane = ActivePane::GitCommit;
+                app.git_commit_scroll = app
+                    .git_commit_scroll
+                    .saturating_add(preview_line_step as usize);
+            } else if app.showing_session_browser()
+                && !geometry.browser_single
+                && point_in_rect(mouse.column, mouse.row, preview_area)
+            {
+                let pane = if let Some(turn_start) = geometry.turn_start {
+                    if point_in_rect(mouse.column, mouse.row, turn_start) {
+                        SessionBrowserPane::Start
+                    } else {
+                        SessionBrowserPane::End
+                    }
                 } else {
-                    SessionBrowserPane::End
+                    SessionBrowserPane::Start
                 };
                 app.set_session_browser_active_pane(pane);
                 app.scroll_preview_lines(preview_line_step);
@@ -2929,6 +3426,47 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 app.move_selection(results_line_step);
             }
         }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(split) = app.dragged_split {
+                match split {
+                    ActiveSplit::ResultsGit | ActiveSplit::GitTurns => {
+                        let total = geometry.root.width.max(1);
+                        let rel = mouse.column.saturating_sub(geometry.root.x) as u32;
+                        let pct = ((rel * 100) / total as u32) as i16;
+                        match split {
+                            ActiveSplit::ResultsGit => {
+                                app.layout_state.results_pct = pct.clamp(
+                                    MIN_RESULTS_PCT as i16,
+                                    (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
+                                )
+                                    as u16;
+                            }
+                            ActiveSplit::GitTurns => {
+                                let base = app.layout_state.results_pct as i16;
+                                let git_pct = pct - base;
+                                let max_git = 100 - app.layout_state.results_pct - MIN_TURNS_PCT;
+                                app.layout_state.git_pct =
+                                    git_pct.clamp(MIN_GIT_PCT as i16, max_git as i16) as u16;
+                            }
+                            _ => {}
+                        }
+                    }
+                    ActiveSplit::GitColumnVertical => {
+                        if let Some(git_graph) = geometry.git_graph {
+                            let total =
+                                git_graph.height + geometry.git_commit.unwrap_or(git_graph).height;
+                            let rel = mouse.row.saturating_sub(git_graph.y) as u32;
+                            let pct = ((rel * 100) / total.max(1) as u32) as i16;
+                            app.layout_state.graph_pct =
+                                pct.clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16) as u16;
+                        }
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.dragged_split = None;
+        }
         _ => {}
     }
 }
@@ -2937,31 +3475,296 @@ fn current_preview_inner_width(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &App,
 ) -> anyhow::Result<usize> {
-    let area = terminal.size().context("terminal size取得に失敗")?;
+    let area = terminal.size().context("failed to get terminal size")?;
     let area: Rect = area.into();
+    let geometry = app_geometry(area, app);
     let preview_area = if app.show_telemetry {
         area
+    } else if let Some(area) = match app.active_pane {
+        ActivePane::GitGraph => geometry.git_graph,
+        ActivePane::GitCommit => geometry.git_commit,
+        ActivePane::SessionBrowser(SessionBrowserPane::Start) => geometry.turn_start,
+        ActivePane::SessionBrowser(SessionBrowserPane::End) => geometry.turn_end,
+        _ => Some(geometry.turn_preview),
+    } {
+        area
     } else {
-        app_panes(area).1
+        geometry.turn_preview
     };
     Ok(preview_area.width.saturating_sub(2) as usize)
 }
 
 impl App {
     fn showing_session_browser(&self) -> bool {
-        self.ready && !self.show_telemetry && self.query.trim().is_empty() && self.selected_hit().is_some()
+        self.ready
+            && !self.show_telemetry
+            && self.query.trim().is_empty()
+            && self.selected_hit().is_some()
+    }
+
+    fn active_turn_pane(&self) -> SessionBrowserPane {
+        match self.active_pane {
+            ActivePane::SessionBrowser(pane) => pane,
+            _ => self.session_browser_active_pane,
+        }
+    }
+
+    fn is_single_session_browser(&self, width: usize, height: usize) -> bool {
+        if !self.showing_session_browser() || width == 0 || height == 0 {
+            return false;
+        }
+        let doc = self.session_browser_doc();
+        let total_lines = preview_visual_line_count(&doc.lines, width);
+        total_lines <= height.saturating_mul(BROWSE_SINGLE_PANE_SCREENFULS)
+    }
+
+    fn toggle_git_graph(&mut self) {
+        self.git_graph_visible = !self.git_graph_visible;
+        if !self.git_graph_visible {
+            self.git_commit_visible = false;
+            self.active_pane = ActivePane::TurnPreview;
+        } else {
+            self.active_pane = ActivePane::GitGraph;
+        }
+        self.active_split = None;
+        self.dragged_split = None;
+        self.reset_preview_scroll_to_match();
+    }
+
+    fn toggle_git_commit(&mut self) {
+        if !self.git_graph_visible {
+            return;
+        }
+        self.git_commit_visible = !self.git_commit_visible;
+        if self.git_commit_visible {
+            self.active_pane = ActivePane::GitCommit;
+        } else if matches!(self.active_pane, ActivePane::GitCommit) {
+            self.active_pane = ActivePane::GitGraph;
+        }
+    }
+
+    fn cycle_layout_preset(&mut self) {
+        self.layout_state.preset = self.layout_state.preset.next();
+        self.layout_state.reset_to_preset();
+        self.set_ui_status(format!(
+            "layout preset {}",
+            self.layout_state.preset.label()
+        ));
+    }
+
+    fn adjust_active_split(&mut self, delta: i16) {
+        let Some(split) = self.active_split else {
+            return;
+        };
+        self.adjust_split(split, delta);
+    }
+
+    fn adjust_split(&mut self, split: ActiveSplit, delta: i16) {
+        match split {
+            ActiveSplit::ResultsGit => {
+                let next = (self.layout_state.results_pct as i16 + delta).clamp(
+                    MIN_RESULTS_PCT as i16,
+                    (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
+                );
+                self.layout_state.results_pct = next as u16;
+            }
+            ActiveSplit::GitTurns => {
+                let max_git = 100 - self.layout_state.results_pct - MIN_TURNS_PCT;
+                let next = (self.layout_state.git_pct as i16 + delta)
+                    .clamp(MIN_GIT_PCT as i16, max_git as i16);
+                self.layout_state.git_pct = next as u16;
+            }
+            ActiveSplit::GitColumnVertical => {
+                let next = (self.layout_state.graph_pct as i16 + delta)
+                    .clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16);
+                self.layout_state.graph_pct = next as u16;
+            }
+        }
     }
 
     fn log_group_enabled(&self, group: LogGroup) -> bool {
         self.enabled_log_groups.contains(&group)
     }
 
-    fn events_title(&self) -> String {
-        let mut groups = self
-            .enabled_log_groups
+    fn selected_git_match(
+        &mut self,
+        preview_width: usize,
+        preview_height: usize,
+    ) -> Option<GitMatch> {
+        if self.show_telemetry || !self.git_graph_visible {
+            return None;
+        }
+        let anchor_record_idx = self.selected_anchor_record_idx(preview_width, preview_height)?;
+        let rec = self.all.get(anchor_record_idx)?;
+        let cwd = rec.cwd.as_deref()?.trim();
+        if cwd.is_empty() {
+            return None;
+        }
+        let repo_root = self.resolve_repo_root(cwd)?;
+        let anchor_ts = parse_timestamp_epoch(rec.timestamp.as_deref()?)?;
+        let repo = self.git_repo_context(&repo_root).ok()?;
+        if repo.commits.is_empty() {
+            return None;
+        }
+        let mut selected_commit_idx = repo
+            .commits
             .iter()
-            .copied()
-            .collect::<Vec<_>>();
+            .position(|commit| commit.epoch >= anchor_ts)
+            .unwrap_or_else(|| repo.commits.len().saturating_sub(1));
+        if selected_commit_idx >= repo.commits.len() {
+            selected_commit_idx = repo.commits.len().saturating_sub(1);
+        }
+        Some(GitMatch {
+            anchor_record_idx,
+            repo_root,
+            anchor_ts,
+            selected_commit_idx,
+        })
+    }
+
+    fn selected_anchor_record_idx(
+        &self,
+        preview_width: usize,
+        preview_height: usize,
+    ) -> Option<usize> {
+        if self.show_telemetry {
+            return None;
+        }
+        if self.showing_session_browser() {
+            let doc = self.session_browser_doc();
+            let pane = self.active_turn_pane();
+            let scroll = match pane {
+                SessionBrowserPane::Start => self.session_browser_start_scroll,
+                SessionBrowserPane::End => self.session_browser_end_scroll,
+            };
+            let raw = preview_center_raw_line(&doc.lines, preview_width, scroll, preview_height);
+            return doc.line_record_indices.get(raw).and_then(|idx| *idx);
+        }
+
+        let doc = self.build_preview_doc();
+        let raw = preview_center_raw_line(
+            &doc.lines,
+            preview_width,
+            self.preview_scroll,
+            preview_height,
+        );
+        doc.line_record_indices.get(raw).and_then(|idx| *idx)
+    }
+
+    fn resolve_repo_root(&self, cwd: &str) -> Option<PathBuf> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!repo_root.is_empty()).then(|| PathBuf::from(repo_root))
+    }
+
+    fn git_repo_context(&mut self, repo_root: &Path) -> anyhow::Result<&GitRepoContext> {
+        if !self.git_repo_cache.contains_key(repo_root) {
+            let log_output = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .arg("log")
+                .arg("--pretty=format:%H%x09%ct%x09%s")
+                .output()
+                .with_context(|| format!("failed to read git log from {}", repo_root.display()))?;
+            if !log_output.status.success() {
+                return Err(anyhow!("git log failed for {}", repo_root.display()));
+            }
+            let commits = String::from_utf8_lossy(&log_output.stdout)
+                .lines()
+                .filter_map(parse_git_commit_line)
+                .collect::<Vec<_>>();
+
+            let graph_output = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .arg("log")
+                .arg("--graph")
+                .arg("--decorate")
+                .arg("--date=short")
+                .arg("--pretty=format:%H%x09%h %cd %d %s")
+                .output()
+                .with_context(|| {
+                    format!("failed to render git graph from {}", repo_root.display())
+                })?;
+            if !graph_output.status.success() {
+                return Err(anyhow!("git graph failed for {}", repo_root.display()));
+            }
+
+            let mut graph_lines = Vec::new();
+            let mut graph_line_commit_indices = Vec::new();
+            for line in String::from_utf8_lossy(&graph_output.stdout).lines() {
+                let mut parts = line.splitn(2, '\t');
+                let hash = parts.next().unwrap_or("").trim();
+                let display = parts.next().unwrap_or(line).to_string();
+                let commit_idx = commits.iter().position(|commit| commit.hash == hash);
+                graph_lines.push(display);
+                graph_line_commit_indices.push(commit_idx);
+            }
+
+            self.git_repo_cache.insert(
+                repo_root.to_path_buf(),
+                GitRepoContext {
+                    repo_root: repo_root.to_path_buf(),
+                    commits,
+                    graph_lines,
+                    graph_line_commit_indices,
+                },
+            );
+        }
+        self.git_repo_cache
+            .get(repo_root)
+            .ok_or_else(|| anyhow!("git repo cache missing for {}", repo_root.display()))
+    }
+
+    fn git_commit_preview_lines(
+        &mut self,
+        repo_root: &Path,
+        hash: &str,
+    ) -> anyhow::Result<&Vec<String>> {
+        let key = (repo_root.to_path_buf(), hash.to_string());
+        if !self.git_commit_preview_cache.contains_key(&key) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .arg("show")
+                .arg("--stat")
+                .arg("--summary")
+                .arg("--format=medium")
+                .arg("--color=never")
+                .arg("--no-ext-diff")
+                .arg(hash)
+                .output()
+                .with_context(|| {
+                    format!("failed to render git show for {}", repo_root.display())
+                })?;
+            if !output.status.success() {
+                return Err(anyhow!("git show failed for {}", repo_root.display()));
+            }
+            let lines = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            self.git_commit_preview_cache.insert(key.clone(), lines);
+        }
+        self.git_commit_preview_cache.get(&key).ok_or_else(|| {
+            anyhow!(
+                "git commit preview cache missing for {}",
+                repo_root.display()
+            )
+        })
+    }
+
+    fn events_title(&self) -> String {
+        let mut groups = self.enabled_log_groups.iter().copied().collect::<Vec<_>>();
         groups.sort_by_key(|group| group.as_str());
         if groups.is_empty() {
             return "Events [no verbose groups]".to_string();
@@ -2985,6 +3788,17 @@ impl App {
         let turns = self.selected_session_turn_count();
         let turn_label = if turns == 1 { "turn" } else { "turns" };
         format!("{label}  {turns} {turn_label}")
+    }
+
+    fn git_graph_title(&self) -> String {
+        if !self.git_graph_visible {
+            return "Git Graph".to_string();
+        }
+        format!("Git Graph  {}", self.layout_state.preset.label())
+    }
+
+    fn git_commit_title(&self) -> String {
+        "Commit Preview".to_string()
     }
 
     fn status_text(&self) -> String {
@@ -3062,17 +3876,25 @@ impl App {
     }
 
     fn emit_group_event(&mut self, group: LogGroup, kind: &str, data: Value) {
-        self.emit_event_record(telemetry::EventRecord::new(Some(group.as_str()), kind, data));
+        self.emit_event_record(telemetry::EventRecord::new(
+            Some(group.as_str()),
+            kind,
+            data,
+        ));
     }
 
     fn matches_active_tag_filters(&self, sess: &SessionSummary) -> bool {
-        self.active_tag_filters.iter().all(|filter| match filter.kind {
-            TagFilterKind::Provider => {
-                provider_label(sess.source, sess.account.as_deref()) == filter.value
-            }
-            TagFilterKind::Host => sess.machine_name == filter.value,
-            TagFilterKind::Project => sess.project_slug.as_deref() == Some(filter.value.as_str()),
-        })
+        self.active_tag_filters
+            .iter()
+            .all(|filter| match filter.kind {
+                TagFilterKind::Provider => {
+                    provider_label(sess.source, sess.account.as_deref()) == filter.value
+                }
+                TagFilterKind::Host => sess.machine_name == filter.value,
+                TagFilterKind::Project => {
+                    sess.project_slug.as_deref() == Some(filter.value.as_str())
+                }
+            })
     }
 
     fn toggle_tag_filter(&mut self, filter: TagFilter) {
@@ -3143,8 +3965,7 @@ impl App {
             let use_cached_prefix = !self.last_query.is_empty()
                 && q.starts_with(&self.last_query)
                 && !self.last_results.is_empty()
-                && self.active_tag_filters == self.last_tag_filters
-            ;
+                && self.active_tag_filters == self.last_tag_filters;
             reused_prefix_cache = use_cached_prefix;
             candidate_sessions = if use_cached_prefix {
                 self.last_results.len()
@@ -3157,16 +3978,14 @@ impl App {
             if let Some(started) = candidate_phase_started.take() {
                 candidate_phase_duration_ms = started.elapsed().as_millis();
             }
-            let base: Box<dyn Iterator<Item = usize>> = if use_cached_prefix {
-                Box::new(self.last_results.iter().copied())
-            } else {
-                Box::new(
-                    self.sessions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, sess)| self.matches_active_tag_filters(sess).then_some(idx)),
-                )
-            };
+            let base: Box<dyn Iterator<Item = usize>> =
+                if use_cached_prefix {
+                    Box::new(self.last_results.iter().copied())
+                } else {
+                    Box::new(self.sessions.iter().enumerate().filter_map(|(idx, sess)| {
+                        self.matches_active_tag_filters(sess).then_some(idx)
+                    }))
+                };
 
             let compiled = search::CompiledQuery::new(&q);
             let match_phase_started = perf_enabled.then(Instant::now);
@@ -3281,10 +4100,24 @@ impl App {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
+            if matches!(
+                self.active_pane,
+                ActivePane::SessionBrowser(_) | ActivePane::TurnPreview
+            ) {
+                self.active_pane = ActivePane::SessionBrowser(SessionBrowserPane::Start);
+            }
             self.preview_scroll_reset_pending = true;
-            return;
+        } else {
+            self.preview_scroll_reset_pending = true;
+            if !matches!(
+                self.active_pane,
+                ActivePane::GitGraph | ActivePane::GitCommit
+            ) {
+                self.active_pane = ActivePane::TurnPreview;
+            }
         }
-        self.preview_scroll_reset_pending = true;
+        self.git_graph_scroll = 0;
+        self.git_commit_scroll = 0;
     }
 
     fn session_browser_doc(&self) -> PreviewDoc {
@@ -3293,6 +4126,7 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
         let Some(sess) = self.sessions.get(hit.session_idx) else {
@@ -3300,6 +4134,7 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
         let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
@@ -3307,10 +4142,12 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
 
         let base_style = Style::default();
+        let mut line_record_indices = Vec::new();
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
@@ -3329,6 +4166,7 @@ impl App {
             Line::raw(format!("turns: {}", record_idxs.len())),
             Line::raw(""),
         ];
+        line_record_indices.resize(lines.len(), None);
 
         for (pos, &idx) in record_idxs.iter().enumerate() {
             let Some(rec) = self.all.get(idx) else {
@@ -3348,29 +4186,33 @@ impl App {
                 short_ts(rec.timestamp.as_deref()),
                 rec.phase.as_deref().unwrap_or("")
             )));
+            line_record_indices.push(Some(idx));
             lines.push(Line::raw(format!(
                 "file: {}:{}",
                 rec.file.display(),
                 rec.line
             )));
+            line_record_indices.push(Some(idx));
             if !rec.images.is_empty() {
                 lines.push(Line::raw(format!("images: {}", rec.images.len())));
+                line_record_indices.push(Some(idx));
                 for path in materialize_record_images(rec) {
                     lines.push(Line::raw(format!("image file: {path}")));
+                    line_record_indices.push(Some(idx));
                 }
             }
-            lines.extend(render_preview_message_lines(
-                &rec.text,
-                "",
-                base_style,
-            ));
+            let rendered_lines = render_preview_message_lines(&rec.text, "", base_style);
+            line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_lines.len()));
+            lines.extend(rendered_lines);
             lines.push(Line::raw(""));
+            line_record_indices.push(Some(idx));
         }
 
         PreviewDoc {
             lines,
             first_match_line: 0,
             match_lines: Vec::new(),
+            line_record_indices,
         }
     }
 
@@ -3387,6 +4229,7 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
         let Some(sess) = self.sessions.get(hit.session_idx) else {
@@ -3394,6 +4237,7 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
 
@@ -3403,6 +4247,7 @@ impl App {
                     lines: vec![Line::raw("(no match)")],
                     first_match_line: 0,
                     match_lines: Vec::new(),
+                    line_record_indices: vec![None],
                 };
             };
 
@@ -3433,6 +4278,7 @@ impl App {
                 Line::raw(format!("source: {}", source_label(rec.source))),
                 Line::raw(""),
             ];
+            let record_idx = hit.matched_record_idx.unwrap_or(sess.first_user_idx);
             if !rec.images.is_empty() {
                 lines.push(Line::raw(format!("images: {}", rec.images.len())));
                 for path in materialize_record_images(rec) {
@@ -3440,16 +4286,16 @@ impl App {
                 }
                 lines.push(Line::raw(""));
             }
-            lines.extend(render_preview_message_lines(
-                &rec.text,
-                query,
-                base_style,
-            ));
+            let mut line_record_indices = vec![Some(record_idx); lines.len()];
+            let rendered_lines = render_preview_message_lines(&rec.text, query, base_style);
+            line_record_indices.extend(std::iter::repeat_n(Some(record_idx), rendered_lines.len()));
+            lines.extend(rendered_lines);
 
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices,
             };
         }
 
@@ -3459,6 +4305,7 @@ impl App {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
 
@@ -3503,6 +4350,7 @@ impl App {
             )),
             Line::raw(""),
         ];
+        let mut line_record_indices = vec![None; lines.len()];
 
         let first_match_line = lines.len();
         let mut match_lines = Vec::new();
@@ -3524,7 +4372,7 @@ impl App {
             };
             let occurrence_count = record_match_occurrence_count(query, rec);
 
-            let section: Vec<Line<'static>> = {
+            let (section, section_record_indices): (Vec<Line<'static>>, Vec<Option<usize>>) = {
                 let mut section = vec![
                     Line::raw(format!("-- hit {}/{} --", i + 1, total_matches)),
                     Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
@@ -3541,25 +4389,28 @@ impl App {
                     Line::raw(format!("images: {}", rec.images.len())),
                     Line::raw(""),
                 ];
+                let mut section_record_indices = vec![Some(rec_idx); section.len()];
                 if !rec.images.is_empty() {
                     for path in materialize_record_images(rec) {
                         section.push(Line::raw(format!("image file: {path}")));
+                        section_record_indices.push(Some(rec_idx));
                     }
                     section.push(Line::raw(""));
+                    section_record_indices.push(Some(rec_idx));
                 }
                 for raw_line in rec.text.lines() {
                     let raw_line_index = section.len();
-                    section.extend(render_preview_message_lines(
-                        raw_line,
-                        query,
-                        base_style,
-                    ));
+                    let rendered_lines = render_preview_message_lines(raw_line, query, base_style);
+                    section_record_indices
+                        .extend(std::iter::repeat_n(Some(rec_idx), rendered_lines.len()));
+                    section.extend(rendered_lines);
                     if !search::find_match_ranges(query, raw_line).is_empty() {
                         match_lines.push(lines_used + raw_line_index);
                     }
                 }
                 section.push(Line::raw(""));
-                section
+                section_record_indices.push(Some(rec_idx));
+                (section, section_record_indices)
             };
 
             if lines_used.saturating_add(section.len()) > PREVIEW_MAX_LINES {
@@ -3569,6 +4420,7 @@ impl App {
 
             lines_used += section.len();
             lines.extend(section);
+            line_record_indices.extend(section_record_indices);
             shown_matches += 1;
         }
 
@@ -3589,6 +4441,7 @@ impl App {
             lines,
             first_match_line,
             match_lines,
+            line_record_indices,
         }
     }
 
@@ -3598,12 +4451,16 @@ impl App {
                 lines: vec![Line::raw("events disabled")],
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None],
             };
         };
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("log: {}", path.display())),
-            Line::raw(format!("buffer cap: {} MB", EVENT_BUFFER_MAX_BYTES / (1024 * 1024))),
+            Line::raw(format!(
+                "buffer cap: {} MB",
+                EVENT_BUFFER_MAX_BYTES / (1024 * 1024)
+            )),
         ];
         if let Ok(metadata) = fs::metadata(path) {
             lines.push(Line::raw(format!("bytes: {}", metadata.len())));
@@ -3613,10 +4470,12 @@ impl App {
         if buffered_records.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::raw("(no events yet)"));
+            let line_count = lines.len();
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
                 match_lines: Vec::new(),
+                line_record_indices: vec![None; line_count],
             };
         }
 
@@ -3709,7 +4568,9 @@ impl App {
         let mut match_lines = Vec::new();
         for record in buffered_records.iter().rev() {
             let rendered = format_telemetry_event_line(record);
-            if !filter_query.is_empty() && search::find_match_ranges(filter_query, &rendered).is_empty() {
+            if !filter_query.is_empty()
+                && search::find_match_ranges(filter_query, &rendered).is_empty()
+            {
                 continue;
             }
             if match_lines.is_empty() {
@@ -3725,11 +4586,107 @@ impl App {
             lines.push(Line::raw("(no matching events)"));
         }
 
+        let line_count = lines.len();
         PreviewDoc {
             lines,
             first_match_line,
             match_lines,
+            line_record_indices: vec![None; line_count],
         }
+    }
+
+    fn build_git_graph_doc(&mut self, preview_width: usize, preview_height: usize) -> GitPaneDoc {
+        let Some(git_match) = self.selected_git_match(preview_width, preview_height) else {
+            return GitPaneDoc {
+                lines: vec![
+                    Line::raw("git graph unavailable"),
+                    Line::raw("select a turn with a timestamp and git-backed cwd"),
+                ],
+            };
+        };
+        let anchor_ts = short_ts(
+            self.all
+                .get(git_match.anchor_record_idx)
+                .and_then(|rec| rec.timestamp.as_deref()),
+        );
+        let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
+            return GitPaneDoc {
+                lines: vec![Line::raw("failed to load git graph")],
+            };
+        };
+        let selected_commit = &repo.commits[git_match.selected_commit_idx];
+        let selected_graph_line = repo
+            .graph_line_commit_indices
+            .iter()
+            .position(|idx| *idx == Some(git_match.selected_commit_idx))
+            .unwrap_or(0);
+        let window_radius = preview_height.max(4);
+        let start = selected_graph_line.saturating_sub(window_radius);
+        let end = cmp::min(
+            repo.graph_lines.len(),
+            selected_graph_line + window_radius + 1,
+        );
+        let mut lines = vec![
+            Line::raw(format!("repo: {}", repo.repo_root.display())),
+            Line::raw(format!(
+                "anchor: {}  selected commit: {}  {}",
+                anchor_ts,
+                &selected_commit.hash[..selected_commit.hash.len().min(12)],
+                selected_commit.summary
+            )),
+            Line::raw(""),
+        ];
+        for (idx, line) in repo.graph_lines[start..end].iter().enumerate() {
+            let absolute = start + idx;
+            let style = if absolute == selected_graph_line {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![Span::styled(line.clone(), style)]));
+        }
+        GitPaneDoc { lines }
+    }
+
+    fn build_git_commit_doc(&mut self, preview_width: usize, preview_height: usize) -> GitPaneDoc {
+        let Some(git_match) = self.selected_git_match(preview_width, preview_height) else {
+            return GitPaneDoc {
+                lines: vec![Line::raw("commit preview unavailable")],
+            };
+        };
+        let (hash, summary) = {
+            let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
+                return GitPaneDoc {
+                    lines: vec![Line::raw("failed to load commit preview")],
+                };
+            };
+            let commit = &repo.commits[git_match.selected_commit_idx];
+            (commit.hash.clone(), commit.summary.clone())
+        };
+        let Ok(preview_lines) = self.git_commit_preview_lines(&git_match.repo_root, &hash) else {
+            return GitPaneDoc {
+                lines: vec![Line::raw("failed to render commit preview")],
+            };
+        };
+        let mut lines = vec![
+            Line::raw(format!("repo: {}", git_match.repo_root.display())),
+            Line::raw(format!(
+                "commit: {}  anchor epoch: {}  {}",
+                &hash[..hash.len().min(12)],
+                git_match.anchor_ts,
+                summary
+            )),
+            Line::raw(""),
+        ];
+        lines.extend(
+            preview_lines
+                .iter()
+                .map(|line| highlighted_line(line, "", Style::default())),
+        );
+        GitPaneDoc { lines }
     }
 
     fn emit_preview_perf_summary(&mut self, mode: &str, doc: &PreviewDoc, duration_ms: u128) {
@@ -3820,8 +4777,27 @@ impl App {
     }
 
     fn scroll_preview_lines(&mut self, delta: i32) {
+        if self.show_telemetry {
+            let cur = self.preview_scroll as i32;
+            self.preview_scroll = cmp::max(0, cur + delta) as usize;
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        match self.active_pane {
+            ActivePane::GitGraph => {
+                let cur = self.git_graph_scroll as i32;
+                self.git_graph_scroll = cmp::max(0, cur + delta) as usize;
+                return;
+            }
+            ActivePane::GitCommit => {
+                let cur = self.git_commit_scroll as i32;
+                self.git_commit_scroll = cmp::max(0, cur + delta) as usize;
+                return;
+            }
+            _ => {}
+        }
         if self.showing_session_browser() {
-            match self.session_browser_active_pane {
+            match self.active_turn_pane() {
                 SessionBrowserPane::Start => {
                     let cur = self.session_browser_start_scroll as i32;
                     self.session_browser_start_scroll = cmp::max(0, cur + delta) as usize;
@@ -3853,7 +4829,11 @@ impl App {
             return;
         }
 
-        let current_raw = preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, self.preview_scroll);
+        let current_raw = preview_raw_line_index_for_visual_offset(
+            &doc.lines,
+            preview_width,
+            self.preview_scroll,
+        );
         let target_raw = if dir >= 0 {
             doc.match_lines
                 .iter()
@@ -3948,13 +4928,15 @@ impl App {
 
     fn set_session_browser_active_pane(&mut self, pane: SessionBrowserPane) {
         self.session_browser_active_pane = pane;
+        self.active_pane = ActivePane::SessionBrowser(pane);
     }
 
     fn toggle_session_browser_active_pane(&mut self) {
-        self.session_browser_active_pane = match self.session_browser_active_pane {
+        let pane = match self.session_browser_active_pane {
             SessionBrowserPane::Start => SessionBrowserPane::End,
             SessionBrowserPane::End => SessionBrowserPane::Start,
         };
+        self.set_session_browser_active_pane(pane);
     }
 }
 
@@ -3973,7 +4955,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let displayed_query = app.displayed_query().to_string();
     let query = Paragraph::new(format!("> {}", displayed_query))
-        .block(Block::default().borders(Borders::ALL).title(app.query_title()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.query_title()),
+        )
         .style(Style::default().fg(Color::White));
     f.render_widget(query, root[0]);
     // Place the terminal cursor in the query bar (border + "> " prefix = 3 chars offset)
@@ -4088,8 +5074,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
             .split(root[2]);
 
-        let status = Paragraph::new(app.status_text())
-        .style(Style::default().fg(Color::Yellow));
+        let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(
@@ -4142,8 +5127,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
             .split(root[2]);
 
-        let status = Paragraph::new(app.status_text())
-        .style(Style::default().fg(Color::Yellow));
+        let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
@@ -4155,13 +5139,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
-        .split(root[1]);
+    let geometry = app_geometry(f.area(), app);
 
     // Results pane (manual windowing)
-    let results_area = main[0];
+    let results_area = geometry.results;
     let inner_height = results_area.height.saturating_sub(2) as usize; // borders
     let total = app.filtered.len();
 
@@ -4203,20 +5184,18 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let results = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(
-                "Results (sessions {}/{} turns {}/{})",
-                app.filtered.len(),
-                app.sessions.len(),
-                app.matched_turn_count(),
-                app.total_turn_count()
-            )),
+        Block::default().borders(Borders::ALL).title(format!(
+            "Results (sessions {}/{} turns {}/{})",
+            app.filtered.len(),
+            app.sessions.len(),
+            app.matched_turn_count(),
+            app.total_turn_count()
+        )),
     );
     f.render_widget(results, results_area);
 
     // Preview
-    let preview_area = main[1];
+    let preview_area = geometry.turn_preview;
     let preview_inner_height = preview_area.height.saturating_sub(2) as usize;
     let preview_inner_width = preview_area.width.saturating_sub(2) as usize;
     let preview_style = app
@@ -4231,25 +5210,78 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         Style::default()
     };
-    if app.showing_session_browser() {
+    if let Some(git_graph_area) = geometry.git_graph {
+        let graph_inner_height = git_graph_area.height.saturating_sub(2) as usize;
+        let graph_inner_width = git_graph_area.width.saturating_sub(2) as usize;
+        let graph_doc = app.build_git_graph_doc(graph_inner_width, preview_inner_height);
+        let graph_total_lines = preview_visual_line_count(&graph_doc.lines, graph_inner_width);
+        let graph_max_scroll = graph_total_lines.saturating_sub(graph_inner_height);
+        app.git_graph_scroll = cmp::min(app.git_graph_scroll, graph_max_scroll);
+        let border_style = if matches!(app.active_pane, ActivePane::GitGraph) {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let graph = Paragraph::new(Text::from(graph_doc.lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(app.git_graph_title()),
+            )
+            .scroll((app.git_graph_scroll as u16, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(graph, git_graph_area);
+    }
+
+    if let Some(git_commit_area) = geometry.git_commit {
+        let commit_inner_height = git_commit_area.height.saturating_sub(2) as usize;
+        let commit_inner_width = git_commit_area.width.saturating_sub(2) as usize;
+        let commit_doc = app.build_git_commit_doc(commit_inner_width, preview_inner_height);
+        let commit_total_lines = preview_visual_line_count(&commit_doc.lines, commit_inner_width);
+        let commit_max_scroll = commit_total_lines.saturating_sub(commit_inner_height);
+        app.git_commit_scroll = cmp::min(app.git_commit_scroll, commit_max_scroll);
+        let border_style = if matches!(app.active_pane, ActivePane::GitCommit) {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let commit = Paragraph::new(Text::from(commit_doc.lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(app.git_commit_title()),
+            )
+            .scroll((app.git_commit_scroll as u16, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(commit, git_commit_area);
+    }
+
+    let turn_anchor_record_idx = if app.git_graph_visible {
+        app.selected_anchor_record_idx(preview_inner_width, preview_inner_height)
+    } else {
+        None
+    };
+
+    if app.showing_session_browser() && !geometry.browser_single {
         let browser_started = Instant::now();
         let browser_doc = app.session_browser_doc();
         let browser_duration_ms = browser_started.elapsed().as_millis();
         app.emit_preview_perf_summary("session_browser", &browser_doc, browser_duration_ms);
-        let panes = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-            .split(preview_area);
-
         for (pane_kind, pane_area, title) in [
             (
                 SessionBrowserPane::Start,
-                panes[0],
+                geometry.turn_start.unwrap_or(preview_area),
                 app.preview_title("Start"),
             ),
             (
                 SessionBrowserPane::End,
-                panes[1],
+                geometry.turn_end.unwrap_or(preview_area),
                 app.preview_title("End"),
             ),
         ] {
@@ -4265,7 +5297,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 }
                 SessionBrowserPane::End => {
                     if app.preview_scroll_reset_pending {
-                        app.session_browser_end_scroll = pane_max_scroll;
+                        app.session_browser_end_scroll =
+                            pane_max_scroll.saturating_sub(pane_inner_height / 2);
                     } else {
                         app.session_browser_end_scroll =
                             cmp::min(app.session_browser_end_scroll, pane_max_scroll);
@@ -4273,30 +5306,55 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     app.session_browser_end_scroll
                 }
             };
-            let border_style = if app.session_browser_active_pane == pane_kind {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            let border_style = if app.active_turn_pane() == pane_kind {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 preview_border_style
             };
-            let pane = Paragraph::new(Text::from(browser_doc.lines.clone()))
-                .style(preview_style)
-                .block(
-                    Block::default()
-                        .style(preview_style)
-                        .border_style(border_style)
-                        .borders(Borders::ALL)
-                        .title(title),
-                )
-                .scroll((scroll as u16, 0))
-                .wrap(Wrap { trim: false });
+            let anchor_record_idx = if app.git_graph_visible {
+                let anchor_raw = preview_center_raw_line(
+                    &browser_doc.lines,
+                    pane_inner_width,
+                    scroll,
+                    pane_inner_height,
+                );
+                browser_doc
+                    .line_record_indices
+                    .get(anchor_raw)
+                    .and_then(|idx| *idx)
+            } else {
+                None
+            };
+            let pane = Paragraph::new(Text::from(with_anchor_indicator(
+                &browser_doc,
+                anchor_record_idx,
+            )))
+            .style(preview_style)
+            .block(
+                Block::default()
+                    .style(preview_style)
+                    .border_style(border_style)
+                    .borders(Borders::ALL)
+                    .title(title),
+            )
+            .scroll((scroll as u16, 0))
+            .wrap(Wrap { trim: false });
             f.render_widget(pane, pane_area);
         }
         app.preview_scroll_reset_pending = false;
     } else {
         let preview_started = Instant::now();
-        let preview_doc = app.build_preview_doc();
+        let preview_doc = if app.showing_session_browser() {
+            app.session_browser_doc()
+        } else {
+            app.build_preview_doc()
+        };
         let preview_duration_ms = preview_started.elapsed().as_millis();
-        let preview_mode = if query.is_empty() {
+        let preview_mode = if app.showing_session_browser() {
+            "session_browser_single"
+        } else if query.is_empty() {
             "empty_query"
         } else {
             "query_preview"
@@ -4312,7 +5370,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.preview_scroll_reset_pending = false;
         }
         let layout_started = Instant::now();
-        let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+        let preview_total_lines =
+            preview_visual_line_count(&preview_doc.lines, preview_inner_width);
         let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
         app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
         if app.log_group_enabled(LogGroup::Perf) {
@@ -4329,21 +5388,24 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 }),
             );
         }
-        let preview = Paragraph::new(Text::from(preview_doc.lines))
-            .style(preview_style)
-            .block(
-                Block::default()
-                    .style(preview_style)
-                    .border_style(preview_border_style)
-                    .borders(Borders::ALL)
-                    .title(if app.show_telemetry {
-                        app.events_title()
-                    } else {
-                        app.preview_title("Preview")
-                    }),
-            )
-            .scroll((app.preview_scroll as u16, 0))
-            .wrap(Wrap { trim: false });
+        let preview = Paragraph::new(Text::from(with_anchor_indicator(
+            &preview_doc,
+            turn_anchor_record_idx,
+        )))
+        .style(preview_style)
+        .block(
+            Block::default()
+                .style(preview_style)
+                .border_style(preview_border_style)
+                .borders(Borders::ALL)
+                .title(if app.showing_session_browser() {
+                    app.preview_title("Turns")
+                } else {
+                    app.preview_title("Preview")
+                }),
+        )
+        .scroll((app.preview_scroll as u16, 0))
+        .wrap(Wrap { trim: false });
         f.render_widget(preview, preview_area);
     }
 
@@ -4352,17 +5414,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
         .split(root[2]);
 
-    let status = Paragraph::new(app.status_text())
-    .style(Style::default().fg(Color::Yellow));
+    let status = Paragraph::new(app.status_text()).style(Style::default().fg(Color::Yellow));
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  ↑/↓: move  Ctrl+j/k: preview line  Ctrl+f/b: preview page  Ctrl+n/p: next/prev match  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
-        if app.showing_session_browser() {
-            "  Tab: switch start/end"
-        } else {
-            ""
-        },
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
+        if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
         app.displayed_query().trim()
     ))
     .style(Style::default().fg(Color::DarkGray));
@@ -4917,6 +5974,14 @@ mod tests {
             session_browser_start_scroll: 0,
             session_browser_end_scroll: usize::MAX,
             session_browser_active_pane: SessionBrowserPane::Start,
+            git_graph_scroll: 0,
+            git_commit_scroll: 0,
+            git_graph_visible: false,
+            git_commit_visible: false,
+            active_pane: ActivePane::Results,
+            active_split: None,
+            layout_state: LayoutState::new(),
+            dragged_split: None,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -4936,6 +6001,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
+            git_repo_cache: HashMap::new(),
+            git_commit_preview_cache: HashMap::new(),
         }
     }
 
@@ -5531,6 +6598,14 @@ mod tests {
             session_browser_start_scroll: 0,
             session_browser_end_scroll: usize::MAX,
             session_browser_active_pane: SessionBrowserPane::Start,
+            git_graph_scroll: 0,
+            git_commit_scroll: 0,
+            git_graph_visible: false,
+            git_commit_visible: false,
+            active_pane: ActivePane::Results,
+            active_split: None,
+            layout_state: LayoutState::new(),
+            dragged_split: None,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -5550,6 +6625,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
+            git_repo_cache: HashMap::new(),
+            git_commit_preview_cache: HashMap::new(),
         };
 
         app.update_results();
@@ -5614,6 +6691,14 @@ mod tests {
             session_browser_start_scroll: 0,
             session_browser_end_scroll: usize::MAX,
             session_browser_active_pane: SessionBrowserPane::Start,
+            git_graph_scroll: 0,
+            git_commit_scroll: 0,
+            git_graph_visible: false,
+            git_commit_visible: false,
+            active_pane: ActivePane::Results,
+            active_split: None,
+            layout_state: LayoutState::new(),
+            dragged_split: None,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -5633,6 +6718,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
+            git_repo_cache: HashMap::new(),
+            git_commit_preview_cache: HashMap::new(),
         };
 
         app.update_results();
@@ -5926,6 +7013,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_git_commit_line_extracts_hash_epoch_and_summary() {
+        let commit = parse_git_commit_line("abc123\t1712966400\tship git context panes").unwrap();
+        assert_eq!(commit.hash, "abc123");
+        assert_eq!(commit.epoch, 1_712_966_400);
+        assert_eq!(commit.summary, "ship git context panes");
+    }
+
+    #[test]
+    fn with_anchor_indicator_marks_first_anchor_line() {
+        let doc = PreviewDoc {
+            lines: vec![
+                Line::raw("header"),
+                Line::raw("turn 1"),
+                Line::raw("turn 2"),
+            ],
+            first_match_line: 0,
+            match_lines: Vec::new(),
+            line_record_indices: vec![None, Some(7), Some(8)],
+        };
+
+        let lines = with_anchor_indicator(&doc, Some(8));
+        let rendered = lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.starts_with("git anchor"));
+        assert!(rendered.contains("turn 2"));
+    }
+
+    #[test]
+    fn cycle_layout_preset_resets_ratios_to_new_default() {
+        let mut app = empty_app();
+        app.layout_state.results_pct = 33;
+        app.layout_state.git_pct = 33;
+        app.cycle_layout_preset();
+
+        assert_eq!(app.layout_state.preset, LayoutPreset::TurnsWide);
+        assert_eq!(app.layout_state.results_pct, 18);
+        assert_eq!(app.layout_state.git_pct, 22);
+    }
+
+    #[test]
     fn preview_scroll_line_movement_clamps_at_zero() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
@@ -6121,22 +7251,12 @@ mod tests {
         let (results_area, _) = app_panes(area);
         let sess = app.sessions.get(app.filtered[0].session_idx).unwrap();
         let expected_project = sess.project_slug.clone().unwrap();
-        let rendered = result_line(
-            sess,
-            None,
-            0,
-            "",
-            &app.ui_tags,
-            Style::default(),
-        )
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-        let project_offset = rendered
-            .find(&format!(" {} ", expected_project))
-            .unwrap() as u16
-            + 1;
+        let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let project_offset = rendered.find(&format!(" {} ", expected_project)).unwrap() as u16 + 1;
 
         route_mouse(
             &mut app,
@@ -6154,7 +7274,10 @@ mod tests {
         assert_eq!(app.active_tag_filters[0].kind, TagFilterKind::Project);
         assert_eq!(app.active_tag_filters[0].value, expected_project);
         assert_eq!(app.filtered.len(), 1);
-        assert_eq!(app.sessions[app.filtered[0].session_idx].project_slug, Some(expected_project));
+        assert_eq!(
+            app.sessions[app.filtered[0].session_idx].project_slug,
+            Some(expected_project)
+        );
     }
 
     #[test]
@@ -6358,6 +7481,14 @@ mod tests {
             session_browser_start_scroll: 0,
             session_browser_end_scroll: usize::MAX,
             session_browser_active_pane: SessionBrowserPane::Start,
+            git_graph_scroll: 0,
+            git_commit_scroll: 0,
+            git_graph_visible: false,
+            git_commit_visible: false,
+            active_pane: ActivePane::Results,
+            active_split: None,
+            layout_state: LayoutState::new(),
+            dragged_split: None,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -6377,6 +7508,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
+            git_repo_cache: HashMap::new(),
+            git_commit_preview_cache: HashMap::new(),
         };
 
         assert_eq!(
@@ -6426,11 +7559,7 @@ mod tests {
 
     #[test]
     fn preview_markdown_renders_headings_and_inline_code() {
-        let lines = render_preview_message_lines(
-            "# Heading with `code`",
-            "",
-            Style::default(),
-        );
+        let lines = render_preview_message_lines("# Heading with `code`", "", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(lines.len(), 1);
@@ -6442,11 +7571,8 @@ mod tests {
 
     #[test]
     fn preview_markdown_renders_links_without_losing_raw_text() {
-        let lines = render_preview_message_lines(
-            "[docs](https://example.com)",
-            "",
-            Style::default(),
-        );
+        let lines =
+            render_preview_message_lines("[docs](https://example.com)", "", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(line_text(&lines[0]), "[docs](https://example.com)");
@@ -6456,11 +7582,8 @@ mod tests {
 
     #[test]
     fn preview_markdown_highlights_tagged_rust_fences() {
-        let lines = render_preview_message_lines(
-            "```rust\nlet answer = 42;\n```",
-            "",
-            Style::default(),
-        );
+        let lines =
+            render_preview_message_lines("```rust\nlet answer = 42;\n```", "", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(lines.len(), 3);
@@ -6481,11 +7604,7 @@ mod tests {
 
     #[test]
     fn preview_markdown_uses_generic_style_for_untagged_fences() {
-        let lines = render_preview_message_lines(
-            "```\nplain text\n```",
-            "",
-            Style::default(),
-        );
+        let lines = render_preview_message_lines("```\nplain text\n```", "", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(lines.len(), 3);
@@ -6496,11 +7615,8 @@ mod tests {
 
     #[test]
     fn preview_markdown_query_highlight_overrides_code_style() {
-        let lines = render_preview_message_lines(
-            "```rust\nlet value = 42;\n```",
-            "42",
-            Style::default(),
-        );
+        let lines =
+            render_preview_message_lines("```rust\nlet value = 42;\n```", "42", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         let highlight = lines[1]
@@ -6508,16 +7624,15 @@ mod tests {
             .iter()
             .find(|span| span.content.as_ref() == "42")
             .unwrap();
-        assert_eq!(highlight.style, theme.code_number.patch(query_match_style_for(0)));
+        assert_eq!(
+            highlight.style,
+            theme.code_number.patch(query_match_style_for(0))
+        );
     }
 
     #[test]
     fn preview_markdown_renders_blockquotes_and_lists() {
-        let lines = render_preview_message_lines(
-            "> quoted\n- item",
-            "",
-            Style::default(),
-        );
+        let lines = render_preview_message_lines("> quoted\n- item", "", Style::default());
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(line_text(&lines[0]), "> quoted");
