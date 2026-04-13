@@ -2974,6 +2974,19 @@ impl App {
         format!("Events [{joined}]")
     }
 
+    fn selected_session_turn_count(&self) -> usize {
+        self.selected_hit()
+            .and_then(|hit| self.session_records.get(hit.session_idx))
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    fn preview_title(&self, label: &str) -> String {
+        let turns = self.selected_session_turn_count();
+        let turn_label = if turns == 1 { "turn" } else { "turns" };
+        format!("{label}  {turns} {turn_label}")
+    }
+
     fn status_text(&self) -> String {
         if let Some(status) = self.ui_status.as_deref() {
             return format!("status: {status}");
@@ -4229,8 +4242,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             .split(preview_area);
 
         for (pane_kind, pane_area, title) in [
-            (SessionBrowserPane::Start, panes[0], "Start"),
-            (SessionBrowserPane::End, panes[1], "End"),
+            (
+                SessionBrowserPane::Start,
+                panes[0],
+                app.preview_title("Start"),
+            ),
+            (
+                SessionBrowserPane::End,
+                panes[1],
+                app.preview_title("End"),
+            ),
         ] {
             let pane_inner_height = pane_area.height.saturating_sub(2) as usize;
             let pane_inner_width = pane_area.width.saturating_sub(2) as usize;
@@ -4318,7 +4339,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     .title(if app.show_telemetry {
                         app.events_title()
                     } else {
-                        "Preview".to_string()
+                        app.preview_title("Preview")
                     }),
             )
             .scroll((app.preview_scroll as u16, 0))
@@ -5870,6 +5891,38 @@ mod tests {
         assert!(app.show_telemetry);
         app.toggle_telemetry_view();
         assert!(!app.show_telemetry);
+    }
+
+    #[test]
+    fn preview_title_includes_selected_session_turn_count() {
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        assert_eq!(app.preview_title("Start"), "Start  3 turns");
+        assert_eq!(app.preview_title("Preview"), "Preview  3 turns");
     }
 
     #[test]
