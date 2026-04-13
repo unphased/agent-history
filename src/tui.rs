@@ -628,6 +628,18 @@ fn preview_raw_line_index_for_visual_offset(
     lines.len().saturating_sub(1)
 }
 
+fn preview_section_start_lines(line_record_indices: &[Option<usize>]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut last = None;
+    for (idx, record_idx) in line_record_indices.iter().copied().enumerate() {
+        if record_idx.is_some() && record_idx != last {
+            starts.push(idx);
+        }
+        last = record_idx;
+    }
+    starts
+}
+
 fn preview_center_raw_line(
     lines: &[Line<'_>],
     width: usize,
@@ -797,6 +809,11 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
         "log_path_info" => format!(
             "events log path={}",
             telemetry_metric_str(data, "path").unwrap_or("")
+        ),
+        "ui_session_started" => format!(
+            "================ agent-history ui started pid={} cwd={} ================",
+            telemetry_metric_u64(data, "pid").unwrap_or(0),
+            truncate_middle(telemetry_metric_str(data, "cwd").unwrap_or(""), 60)
         ),
         "log_group_toggle" => format!(
             "group={} enabled={} hotkey={} {}",
@@ -2520,6 +2537,15 @@ fn run_app(
                 "path": path.display().to_string(),
             }),
         );
+        app.emit_event(
+            "ui_session_started",
+            json!({
+                "pid": std::process::id(),
+                "cwd": env::current_dir()
+                    .map(|cwd| cwd.display().to_string())
+                    .unwrap_or_default(),
+            }),
+        );
     }
 
     loop {
@@ -2908,8 +2934,14 @@ fn handle_key(
         }
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
-        KeyCode::PageUp => app.page(-1),
-        KeyCode::PageDown => app.page(1),
+        KeyCode::PageUp => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_record(-1, preview_width);
+        }
+        KeyCode::PageDown => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_record(1, preview_width);
+        }
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
         _ => {}
@@ -4820,6 +4852,56 @@ impl App {
         self.scroll_preview_lines(delta);
     }
 
+    fn jump_preview_record(&mut self, dir: i32, preview_width: usize) {
+        if self.show_telemetry || preview_width == 0 {
+            return;
+        }
+
+        let (doc, current_scroll, in_session_browser) = if self.showing_session_browser() {
+            let scroll = match self.active_turn_pane() {
+                SessionBrowserPane::Start => self.session_browser_start_scroll,
+                SessionBrowserPane::End => self.session_browser_end_scroll,
+            };
+            (self.session_browser_doc(), scroll, true)
+        } else {
+            (self.build_preview_doc(), self.preview_scroll, false)
+        };
+
+        let starts = preview_section_start_lines(&doc.line_record_indices);
+        if starts.len() <= 1 {
+            return;
+        }
+
+        let current_raw =
+            preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, current_scroll);
+        let target_raw = if dir >= 0 {
+            starts
+                .iter()
+                .copied()
+                .find(|&line| line > current_raw)
+                .unwrap_or(starts[0])
+        } else {
+            starts
+                .iter()
+                .copied()
+                .rev()
+                .find(|&line| line < current_raw)
+                .unwrap_or(*starts.last().unwrap_or(&starts[0]))
+        };
+        let target_scroll =
+            preview_visual_line_offset(&doc.lines, target_raw, preview_width).saturating_sub(1);
+
+        if in_session_browser {
+            match self.active_turn_pane() {
+                SessionBrowserPane::Start => self.session_browser_start_scroll = target_scroll,
+                SessionBrowserPane::End => self.session_browser_end_scroll = target_scroll,
+            }
+        } else {
+            self.preview_scroll = target_scroll;
+        }
+        self.preview_scroll_reset_pending = false;
+    }
+
     fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
         if self.showing_session_browser() || self.show_telemetry || self.query.trim().is_empty() {
             return;
@@ -4864,14 +4946,6 @@ impl App {
         let next = cmp::min(max, cmp::max(0, cur + delta));
         self.selected = next as usize;
         self.reset_preview_scroll_to_match();
-    }
-
-    fn page(&mut self, dir: i32) {
-        if self.filtered.is_empty() {
-            return;
-        }
-        let delta = 10i32 * dir;
-        self.move_selection(delta);
     }
 
     fn select_first(&mut self) {
@@ -5418,7 +5492,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(status, footer[0]);
 
     let keys = Paragraph::new(format!(
-        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
+        "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  PgUp/PgDn: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
         if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
         app.displayed_query().trim()
     ))
@@ -6872,6 +6946,24 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_event_line_formats_ui_session_started_banner() {
+        let record = telemetry::EventRecord::new(
+            None,
+            "ui_session_started",
+            json!({
+                "pid": 4242,
+                "cwd": "/Users/slu/agent-history",
+            }),
+        );
+
+        let rendered = format_telemetry_event_line(&record);
+        assert!(rendered.contains("agent-history ui started"));
+        assert!(rendered.contains("pid=4242"));
+        assert!(rendered.contains("cwd=/Users/slu/agent-history"));
+        assert!(rendered.contains("================"));
+    }
+
+    #[test]
     fn build_opencode_session_pager_text_includes_whole_session() {
         let all = vec![
             test_record(MessageRecord {
@@ -7391,6 +7483,39 @@ mod tests {
 
         app.jump_preview_match(1, 80);
         assert!(app.preview_scroll > initial_scroll);
+    }
+
+    #[test]
+    fn jump_preview_record_moves_between_turns_in_session_browser() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        assert!(app.showing_session_browser());
+
+        app.jump_preview_record(1, 80);
+        assert!(app.session_browser_start_scroll > 0);
     }
 
     #[test]
