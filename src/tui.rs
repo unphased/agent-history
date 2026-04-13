@@ -2652,11 +2652,13 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_preview_page(-1);
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_record(-1, preview_width);
             return Ok(false);
         }
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_preview_page(1);
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_record(1, preview_width);
             return Ok(false);
         }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2935,12 +2937,12 @@ fn handle_key(
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::PageUp => {
-            let preview_width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_record(-1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(-1, preview_height);
         }
         KeyCode::PageDown => {
-            let preview_width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_record(1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(1, preview_height);
         }
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
@@ -3503,15 +3505,26 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     }
 }
 
-fn current_preview_inner_width(
+fn current_preview_area(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &App,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Rect> {
     let area = terminal.size().context("failed to get terminal size")?;
     let area: Rect = area.into();
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(app.footer_height()),
+            ]
+            .as_ref(),
+        )
+        .split(area);
     let geometry = app_geometry(area, app);
     let preview_area = if app.show_telemetry {
-        area
+        root[1]
     } else if let Some(area) = match app.active_pane {
         ActivePane::GitGraph => geometry.git_graph,
         ActivePane::GitCommit => geometry.git_commit,
@@ -3523,7 +3536,25 @@ fn current_preview_inner_width(
     } else {
         geometry.turn_preview
     };
-    Ok(preview_area.width.saturating_sub(2) as usize)
+    Ok(preview_area)
+}
+
+fn current_preview_inner_width(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+) -> anyhow::Result<usize> {
+    Ok(current_preview_area(terminal, app)?
+        .width
+        .saturating_sub(2) as usize)
+}
+
+fn current_preview_inner_height(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+) -> anyhow::Result<usize> {
+    Ok(current_preview_area(terminal, app)?
+        .height
+        .saturating_sub(2) as usize)
 }
 
 impl App {
@@ -4851,8 +4882,8 @@ impl App {
         self.preview_scroll_reset_pending = false;
     }
 
-    fn scroll_preview_page(&mut self, dir: i32) {
-        let delta = 10i32 * dir;
+    fn scroll_preview_page(&mut self, dir: i32, page_height: usize) {
+        let delta = cmp::max(1, page_height as i32 - 1) * dir;
         self.scroll_preview_lines(delta);
     }
 
@@ -4892,8 +4923,7 @@ impl App {
                 .find(|&line| line < current_raw)
                 .unwrap_or(*starts.last().unwrap_or(&starts[0]))
         };
-        let target_scroll =
-            preview_visual_line_offset(&doc.lines, target_raw, preview_width).saturating_sub(1);
+        let target_scroll = preview_visual_line_offset(&doc.lines, target_raw, preview_width);
 
         if in_session_browser {
             match self.active_turn_pane() {
@@ -5153,7 +5183,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.status_text(),
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
@@ -5199,7 +5229,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             root[2],
             app.status_text(),
             format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 app.displayed_query().trim()
             ),
         );
@@ -5481,7 +5511,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         root[2],
         app.status_text(),
         format!(
-            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  Ctrl+f/b: pane page  PgUp/PgDn: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
+            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  PgUp/PgDn: pane page  Ctrl+b/f: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
             if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
             app.displayed_query().trim()
         ),
@@ -7523,6 +7553,64 @@ mod tests {
 
         app.jump_preview_record(1, 80);
         assert!(app.session_browser_start_scroll > 0);
+    }
+
+    #[test]
+    fn jump_preview_record_aligns_target_turn_to_top_of_pane() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let doc = app.session_browser_doc();
+        let starts = preview_section_start_lines(&doc.line_record_indices);
+        app.session_browser_start_scroll = preview_visual_line_offset(&doc.lines, starts[0], 80);
+
+        app.jump_preview_record(1, 80);
+
+        assert_eq!(
+            app.session_browser_start_scroll,
+            preview_visual_line_offset(&doc.lines, starts[1], 80)
+        );
+    }
+
+    #[test]
+    fn scroll_preview_page_uses_provided_page_height() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        app.scroll_preview_page(1, 6);
+        assert_eq!(app.session_browser_start_scroll, 5);
+
+        app.scroll_preview_page(-1, 6);
+        assert_eq!(app.session_browser_start_scroll, 0);
     }
 
     #[test]
