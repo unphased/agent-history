@@ -2172,7 +2172,6 @@ struct App {
     cursor_pos: usize,
     telemetry_query: String,
     telemetry_cursor_pos: usize,
-    telemetry_search_active: bool,
     max_results: usize,
     active_tag_filters: Vec<TagFilter>,
 
@@ -2268,7 +2267,6 @@ fn run_app(
         cursor_pos: initial_cursor,
         telemetry_query: String::new(),
         telemetry_cursor_pos: 0,
-        telemetry_search_active: false,
         max_results: args.max_results,
         active_tag_filters: Vec::new(),
         all: Vec::new(),
@@ -2433,16 +2431,6 @@ fn handle_key(
             app.toggle_log_group(LogGroup::Remote);
             return Ok(false);
         }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry => {
-            app.telemetry_search_active = !app.telemetry_search_active;
-            app.set_ui_status(if app.telemetry_search_active {
-                "events search enabled"
-            } else {
-                "events search disabled"
-            });
-            app.reset_telemetry_search();
-            return Ok(false);
-        }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let width = current_preview_inner_width(terminal, app)?;
             app.jump_preview_match(1, width);
@@ -2454,7 +2442,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Backspace => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 if app.telemetry_cursor_pos > 0 {
                     let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
                     let prev_byte_pos =
@@ -2473,7 +2461,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Delete => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 let char_count = app.telemetry_query.chars().count();
                 if app.telemetry_cursor_pos < char_count {
                     let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
@@ -2494,7 +2482,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 app.telemetry_query.clear();
                 app.telemetry_cursor_pos = 0;
                 app.reset_telemetry_search();
@@ -2504,7 +2492,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Left => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     app.telemetry_cursor_pos =
                         prev_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
@@ -2519,7 +2507,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Right => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 let char_count = app.telemetry_query.chars().count();
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     app.telemetry_cursor_pos =
@@ -2538,7 +2526,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Home => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 app.telemetry_cursor_pos = 0;
             } else {
                 app.cursor_pos = 0;
@@ -2546,7 +2534,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::End => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 app.telemetry_cursor_pos = app.telemetry_query.chars().count();
             } else {
                 app.cursor_pos = app.query.chars().count();
@@ -2554,7 +2542,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 app.telemetry_cursor_pos = 0;
             } else {
                 app.cursor_pos = 0;
@@ -2562,7 +2550,7 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry && app.telemetry_search_active {
+            if app.show_telemetry {
                 app.telemetry_cursor_pos = app.telemetry_query.chars().count();
             } else {
                 app.cursor_pos = app.query.chars().count();
@@ -2573,7 +2561,7 @@ fn handle_key(
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
-                if app.show_telemetry && app.telemetry_search_active {
+                if app.show_telemetry {
                     let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
                     app.telemetry_query.insert(byte_pos, c);
                     app.telemetry_cursor_pos += 1;
@@ -3002,7 +2990,7 @@ impl App {
     }
 
     fn query_title(&self) -> String {
-        if self.show_telemetry && self.telemetry_search_active {
+        if self.show_telemetry {
             return "Events Search".to_string();
         }
         if self.active_tag_filters.is_empty() {
@@ -3023,7 +3011,7 @@ impl App {
     }
 
     fn displayed_query(&self) -> &str {
-        if self.show_telemetry && self.telemetry_search_active {
+        if self.show_telemetry {
             &self.telemetry_query
         } else {
             &self.query
@@ -3031,7 +3019,7 @@ impl App {
     }
 
     fn displayed_cursor_pos(&self) -> usize {
-        if self.show_telemetry && self.telemetry_search_active {
+        if self.show_telemetry {
             self.telemetry_cursor_pos
         } else {
             self.cursor_pos
@@ -3619,10 +3607,7 @@ impl App {
             };
         }
 
-        let filter_query = self
-            .telemetry_search_active
-            .then_some(self.telemetry_query.trim())
-            .unwrap_or("");
+        let filter_query = self.telemetry_query.trim();
         let find_data = |kind: &str| {
             buffered_records
                 .iter()
@@ -4149,8 +4134,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(status, footer[0]);
 
         let keys = Paragraph::new(format!(
-            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+s: search  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear{}  query: \"{}\"",
-            if app.telemetry_search_active { " search" } else { " query+tag filters" },
+            "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  Ctrl+f/b: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
             app.displayed_query().trim()
         ))
         .style(Style::default().fg(Color::DarkGray));
@@ -4899,7 +4883,6 @@ mod tests {
             cursor_pos: 0,
             telemetry_query: String::new(),
             telemetry_cursor_pos: 0,
-            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all: Vec::new(),
@@ -5514,7 +5497,6 @@ mod tests {
             cursor_pos: 0,
             telemetry_query: String::new(),
             telemetry_cursor_pos: 0,
-            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
@@ -5598,7 +5580,6 @@ mod tests {
             cursor_pos: 6,
             telemetry_query: String::new(),
             telemetry_cursor_pos: 0,
-            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
@@ -5725,7 +5706,6 @@ mod tests {
         app.telemetry_events
             .seed(telemetry::read_recent_records(&log, EVENT_BUFFER_MAX_BYTES));
         app.show_telemetry = true;
-        app.telemetry_search_active = true;
         app.telemetry_query = "refresh".to_string();
 
         let doc = app.build_preview_doc();
@@ -6301,7 +6281,6 @@ mod tests {
             cursor_pos: 0,
             telemetry_query: String::new(),
             telemetry_cursor_pos: 0,
-            telemetry_search_active: false,
             max_results: 0,
             active_tag_filters: Vec::new(),
             all,
