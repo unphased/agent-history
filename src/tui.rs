@@ -2979,7 +2979,6 @@ impl App {
             self.preview_scroll_reset_pending = true;
             return;
         }
-        self.preview_scroll = self.build_preview_doc().first_match_line.saturating_sub(2);
         self.preview_scroll_reset_pending = true;
     }
 
@@ -5125,7 +5124,8 @@ mod tests {
         app.update_results();
         let doc = app.build_preview_doc();
         assert_eq!(doc.first_match_line, 12);
-        assert_eq!(app.preview_scroll, 10);
+        assert_eq!(app.preview_scroll, 0);
+        assert!(app.preview_scroll_reset_pending);
     }
 
     #[test]
