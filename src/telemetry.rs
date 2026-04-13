@@ -66,7 +66,6 @@ impl TelemetrySink {
         self.file.flush().context("telemetry flush failed")?;
         Ok(())
     }
-
 }
 
 pub fn default_log_path() -> PathBuf {
@@ -131,7 +130,10 @@ mod tests {
         let grouped_json = serde_json::to_value(grouped).unwrap();
         let plain_json = serde_json::to_value(plain).unwrap();
 
-        assert_eq!(grouped_json.get("group").and_then(|value| value.as_str()), Some("perf"));
+        assert_eq!(
+            grouped_json.get("group").and_then(|value| value.as_str()),
+            Some("perf")
+        );
         assert!(plain_json.get("group").is_none());
     }
 }

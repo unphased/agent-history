@@ -619,7 +619,10 @@ fn source_from_db(value: i64) -> SourceKind {
     }
 }
 
-fn decode_message_record_row(row: &Row<'_>, origin_override: Option<&str>) -> rusqlite::Result<MessageRecord> {
+fn decode_message_record_row(
+    row: &Row<'_>,
+    origin_override: Option<&str>,
+) -> rusqlite::Result<MessageRecord> {
     Ok(MessageRecord {
         timestamp: row.get(0)?,
         role: role_from_db(row.get::<_, i64>(1)?),

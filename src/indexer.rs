@@ -182,16 +182,14 @@ pub fn export_records(args: ExportArgs) -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .map(search::CompiledQuery::new);
 
-    let emitted_snapshot = if !args.scan.no_cache
-        && !args.scan.rebuild_index
-        && cache_plan.db_path.exists()
-    {
-        let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
-        stream_export_records(&mut lock, &store, compiled_query.as_ref())?;
-        true
-    } else {
-        false
-    };
+    let emitted_snapshot =
+        if !args.scan.no_cache && !args.scan.rebuild_index && cache_plan.db_path.exists() {
+            let store = cache::CacheStore::open(&cache_plan.db_path, false)?;
+            stream_export_records(&mut lock, &store, compiled_query.as_ref())?;
+            true
+        } else {
+            false
+        };
 
     run_indexer_from_scan_args_with_cache_path(&args.scan, &tx, Some(cache_plan.db_path.clone()))?;
 
