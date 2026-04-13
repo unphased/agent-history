@@ -3876,7 +3876,7 @@ impl App {
     }
 
     fn footer_height(&self) -> u16 {
-        if self.status_text().is_empty() { 1 } else { 2 }
+        1
     }
 
     fn set_ui_status(&mut self, status: impl Into<String>) {
@@ -5584,22 +5584,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn render_footer(f: &mut ratatui::Frame, area: Rect, status_text: String, help_text: String) {
-    if status_text.is_empty() {
-        let keys = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(keys, area);
-        return;
-    }
-
-    let footer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
-        .split(area);
-
     let status = Paragraph::new(status_text).style(Style::default().fg(Color::Yellow));
-    f.render_widget(status, footer[0]);
-
     let keys = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(keys, footer[1]);
+    f.render_widget(keys, area);
+    f.render_widget(status, area);
 }
 
 fn open_in_pager(
