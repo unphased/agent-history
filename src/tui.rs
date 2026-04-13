@@ -603,6 +603,10 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
         "log_groups_help" => telemetry_metric_str(data, "summary")
             .unwrap_or("While Events is open, Ctrl+g toggles perf and Ctrl+r toggles remote logging.")
             .to_string(),
+        "log_path_info" => format!(
+            "events log path={}",
+            telemetry_metric_str(data, "path").unwrap_or("")
+        ),
         "log_group_toggle" => format!(
             "group={} enabled={} hotkey={} {}",
             telemetry_metric_str(data, "group").unwrap_or(""),
@@ -2293,6 +2297,15 @@ fn run_app(
         ui_tags: app_config.ui.tags,
         remotes,
     };
+
+    if let Some(path) = app.telemetry_log_path.as_ref() {
+        app.emit_event(
+            "log_path_info",
+            json!({
+                "path": path.display().to_string(),
+            }),
+        );
+    }
 
     loop {
         while let Ok(ev) = rx.try_recv() {
@@ -5546,6 +5559,43 @@ mod tests {
         assert!(rendered.contains("latest run events:"));
         assert!(rendered.contains("unit_reindexed: ms=55"));
         assert!(rendered.contains("parts=300"));
+    }
+
+    #[test]
+    fn telemetry_preview_doc_renders_log_path_info_event() {
+        let tmp = TempDir::new("agent-history-telemetry-log-path");
+        let log = tmp.path.join("events.jsonl");
+        fs::write(
+            &log,
+            format!(
+                "{{\"ts_ms\":1,\"kind\":\"log_path_info\",\"data\":{{\"path\":\"{}\"}}}}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+
+        let mut app = empty_app();
+        app.ready = true;
+        app.telemetry_log_path = Some(log.clone());
+        app.telemetry_events
+            .seed(telemetry::read_recent_records(&log, EVENT_BUFFER_MAX_BYTES));
+        app.show_telemetry = true;
+
+        let doc = app.build_preview_doc();
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("events log path="));
+        assert!(rendered.contains(&log.display().to_string()));
     }
 
     #[test]
