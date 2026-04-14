@@ -220,6 +220,18 @@ struct GitPaneDoc {
     lines: Vec<Line<'static>>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TerminalEventBatchStats {
+    raw_events: usize,
+    processed_events: usize,
+    queued_events: usize,
+    coalesced_mouse_moves: usize,
+    coalesced_resizes: usize,
+    key_events: usize,
+    mouse_events: usize,
+    resize_events: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaneGeometry {
     root: Rect,
@@ -241,6 +253,7 @@ const MIN_GIT_PCT: u16 = 16;
 const MIN_TURNS_PCT: u16 = 28;
 const MIN_GRAPH_PCT: u16 = 20;
 const MAX_GRAPH_PCT: u16 = 80;
+
 impl LayoutPreset {
     fn next(self) -> Self {
         match self {
@@ -2578,36 +2591,156 @@ fn run_app(
         );
     }
 
+    let mut dirty = true;
     loop {
+        let loop_started = Instant::now();
+        let mut indexer_events = 0usize;
         while let Ok(ev) = rx.try_recv() {
             handle_indexer_event(&mut app, ev);
+            indexer_events += 1;
+        }
+        if indexer_events > 0 {
+            dirty = true;
         }
 
-        sync_preview_bgcolor(&mut app);
-
-        terminal
-            .draw(|f| ui(f, &mut app))
-            .context("failed to render ui")?;
+        let mut draw_duration_ms = 0u128;
+        if dirty {
+            sync_preview_bgcolor(&mut app);
+            let draw_started = Instant::now();
+            terminal
+                .draw(|f| ui(f, &mut app))
+                .context("failed to render ui")?;
+            draw_duration_ms = draw_started.elapsed().as_millis();
+            dirty = false;
+        }
 
         if !event::poll(Duration::from_millis(50)).context("event poll failed")? {
+            emit_input_loop_perf(
+                &mut app,
+                TerminalEventBatchStats::default(),
+                indexer_events,
+                draw_duration_ms,
+                0,
+                loop_started.elapsed().as_millis(),
+            );
             continue;
         }
 
-        let ev = event::read().context("event read failed")?;
-        match ev {
-            Event::Key(key) => {
-                if handle_key(terminal, &mut app, key)? {
-                    break;
+        let mut terminal_events = vec![event::read().context("event read failed")?];
+        while event::poll(Duration::ZERO).context("event poll failed")? {
+            terminal_events.push(event::read().context("event read failed")?);
+        }
+        let (terminal_events, batch_stats) = coalesce_terminal_events(terminal_events);
+
+        let handle_started = Instant::now();
+        for ev in terminal_events {
+            match ev {
+                Event::Key(key) => {
+                    if handle_key(terminal, &mut app, key)? {
+                        return Ok(());
+                    }
+                    dirty = true;
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(terminal, &mut app, mouse)?;
+                    dirty = true;
+                }
+                Event::Resize(_, _) => {
+                    dirty = true;
+                }
+                _ => {}
             }
-            Event::Mouse(mouse) => {
-                handle_mouse(terminal, &mut app, mouse)?;
-            }
+        }
+        let handle_duration_ms = handle_started.elapsed().as_millis();
+        emit_input_loop_perf(
+            &mut app,
+            batch_stats,
+            indexer_events,
+            draw_duration_ms,
+            handle_duration_ms,
+            loop_started.elapsed().as_millis(),
+        );
+    }
+}
+
+fn coalesce_terminal_events(events: Vec<Event>) -> (Vec<Event>, TerminalEventBatchStats) {
+    let mut stats = TerminalEventBatchStats {
+        raw_events: events.len(),
+        queued_events: events.len().saturating_sub(1),
+        ..TerminalEventBatchStats::default()
+    };
+    let mut coalesced = Vec::with_capacity(events.len());
+
+    for event in events {
+        match &event {
+            Event::Key(_) => stats.key_events += 1,
+            Event::Mouse(_) => stats.mouse_events += 1,
+            Event::Resize(_, _) => stats.resize_events += 1,
             _ => {}
+        }
+
+        match event {
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if matches!(
+                    coalesced.last(),
+                    Some(Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Moved,
+                        ..
+                    }))
+                ) {
+                    coalesced.pop();
+                    stats.coalesced_mouse_moves += 1;
+                }
+                coalesced.push(Event::Mouse(mouse));
+            }
+            Event::Resize(cols, rows) => {
+                if matches!(coalesced.last(), Some(Event::Resize(_, _))) {
+                    coalesced.pop();
+                    stats.coalesced_resizes += 1;
+                }
+                coalesced.push(Event::Resize(cols, rows));
+            }
+            other => coalesced.push(other),
         }
     }
 
-    Ok(())
+    stats.processed_events = coalesced.len();
+    (coalesced, stats)
+}
+
+fn emit_input_loop_perf(
+    app: &mut App,
+    stats: TerminalEventBatchStats,
+    indexer_events: usize,
+    draw_duration_ms: u128,
+    handle_duration_ms: u128,
+    loop_duration_ms: u128,
+) {
+    if !app.log_group_enabled(LogGroup::Perf) {
+        return;
+    }
+    if stats.raw_events == 0 && indexer_events == 0 && draw_duration_ms == 0 {
+        return;
+    }
+
+    app.emit_group_event(
+        LogGroup::Perf,
+        "perf_input_loop",
+        json!({
+            "raw_events": stats.raw_events,
+            "processed_events": stats.processed_events,
+            "queued_events": stats.queued_events,
+            "coalesced_mouse_moves": stats.coalesced_mouse_moves,
+            "coalesced_resizes": stats.coalesced_resizes,
+            "key_events": stats.key_events,
+            "mouse_events": stats.mouse_events,
+            "resize_events": stats.resize_events,
+            "indexer_events": indexer_events,
+            "draw_duration_ms": draw_duration_ms,
+            "handle_duration_ms": handle_duration_ms,
+            "loop_duration_ms": loop_duration_ms,
+        }),
+    );
 }
 
 fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
@@ -6202,6 +6335,50 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn coalesce_terminal_events_merges_adjacent_mouse_moves_and_resizes() {
+        let events = vec![
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::empty(),
+            }),
+            Event::Resize(80, 24),
+            Event::Resize(100, 30),
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
+        ];
+
+        let (events, stats) = coalesce_terminal_events(events);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 2,
+                row: 2,
+                ..
+            })
+        ));
+        assert!(matches!(events[1], Event::Resize(100, 30)));
+        assert!(matches!(events[2], Event::Key(_)));
+        assert_eq!(stats.raw_events, 5);
+        assert_eq!(stats.processed_events, 3);
+        assert_eq!(stats.queued_events, 4);
+        assert_eq!(stats.coalesced_mouse_moves, 1);
+        assert_eq!(stats.coalesced_resizes, 1);
+        assert_eq!(stats.key_events, 1);
+        assert_eq!(stats.mouse_events, 2);
+        assert_eq!(stats.resize_events, 2);
     }
 
     #[test]
