@@ -3092,6 +3092,18 @@ fn parse_git_commit_line(line: &str) -> Option<GitCommitEntry> {
     })
 }
 
+fn selected_git_commit_idx(commits: &[GitCommitEntry], anchor_ts: i64) -> Option<usize> {
+    if commits.is_empty() {
+        return None;
+    }
+    Some(
+        commits
+            .iter()
+            .position(|commit| commit.epoch <= anchor_ts)
+            .unwrap_or_else(|| commits.len().saturating_sub(1)),
+    )
+}
+
 fn point_near_vertical_split(x: u16, rect: Rect) -> bool {
     rect.width > 0 && x == rect.x.saturating_sub(1)
 }
@@ -3744,17 +3756,7 @@ impl App {
         let repo_root = self.resolve_repo_root(cwd)?;
         let anchor_ts = parse_timestamp_epoch(rec.timestamp.as_deref()?)?;
         let repo = self.git_repo_context(&repo_root).ok()?;
-        if repo.commits.is_empty() {
-            return None;
-        }
-        let mut selected_commit_idx = repo
-            .commits
-            .iter()
-            .position(|commit| commit.epoch >= anchor_ts)
-            .unwrap_or_else(|| repo.commits.len().saturating_sub(1));
-        if selected_commit_idx >= repo.commits.len() {
-            selected_commit_idx = repo.commits.len().saturating_sub(1);
-        }
+        let selected_commit_idx = selected_git_commit_idx(&repo.commits, anchor_ts)?;
         Some(GitMatch {
             anchor_record_idx,
             repo_root,
@@ -7256,6 +7258,32 @@ mod tests {
         assert_eq!(commit.hash, "abc123");
         assert_eq!(commit.epoch, 1_712_966_400);
         assert_eq!(commit.summary, "ship git context panes");
+    }
+
+    #[test]
+    fn selected_git_commit_idx_chooses_first_commit_at_or_before_anchor() {
+        let commits = vec![
+            GitCommitEntry {
+                hash: "newest".to_string(),
+                epoch: 300,
+                summary: "newest".to_string(),
+            },
+            GitCommitEntry {
+                hash: "middle".to_string(),
+                epoch: 200,
+                summary: "middle".to_string(),
+            },
+            GitCommitEntry {
+                hash: "oldest".to_string(),
+                epoch: 100,
+                summary: "oldest".to_string(),
+            },
+        ];
+
+        assert_eq!(selected_git_commit_idx(&commits, 350), Some(0));
+        assert_eq!(selected_git_commit_idx(&commits, 250), Some(1));
+        assert_eq!(selected_git_commit_idx(&commits, 150), Some(2));
+        assert_eq!(selected_git_commit_idx(&commits, 50), Some(2));
     }
 
     #[test]
