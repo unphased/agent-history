@@ -240,8 +240,6 @@ const MIN_GIT_PCT: u16 = 16;
 const MIN_TURNS_PCT: u16 = 28;
 const MIN_GRAPH_PCT: u16 = 20;
 const MAX_GRAPH_PCT: u16 = 80;
-const BROWSE_SINGLE_PANE_SCREENFULS: usize = 5;
-
 impl LayoutPreset {
     fn next(self) -> Self {
         match self {
@@ -2639,18 +2637,6 @@ fn handle_key(
 
     // Accept query input even while indexing is still in progress.
     match key.code {
-        KeyCode::Tab if app.showing_session_browser() => {
-            app.toggle_session_browser_active_pane();
-            return Ok(false);
-        }
-        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_preview_lines(-1);
-            return Ok(false);
-        }
-        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_preview_lines(1);
-            return Ok(false);
-        }
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
             app.jump_preview_record(-1, preview_width);
@@ -3122,28 +3108,15 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
             .split(root);
-        let browser_single = app.is_single_session_browser(
-            main[1].width.saturating_sub(2) as usize,
-            main[1].height.saturating_sub(2) as usize,
-        );
-        let (turn_start, turn_end) = if app.showing_session_browser() && !browser_single {
-            let panes = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                .split(main[1]);
-            (Some(panes[0]), Some(panes[1]))
-        } else {
-            (None, None)
-        };
         return PaneGeometry {
             root,
             results: main[0],
             git_graph: None,
             git_commit: None,
             turn_preview: main[1],
-            turn_start,
-            turn_end,
-            browser_single,
+            turn_start: None,
+            turn_end: None,
+            browser_single: true,
         };
     }
 
@@ -3192,29 +3165,15 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         (Some(git_column), None)
     };
 
-    let browser_single = app.is_single_session_browser(
-        main[2].width.saturating_sub(2) as usize,
-        main[2].height.saturating_sub(2) as usize,
-    );
-    let (turn_start, turn_end) = if app.showing_session_browser() && !browser_single {
-        let panes = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-            .split(main[2]);
-        (Some(panes[0]), Some(panes[1]))
-    } else {
-        (None, None)
-    };
-
     PaneGeometry {
         root,
         results: main[0],
         git_graph,
         git_commit,
         turn_preview: main[2],
-        turn_start,
-        turn_end,
-        browser_single,
+        turn_start: None,
+        turn_end: None,
+        browser_single: true,
     }
 }
 
@@ -3559,22 +3518,6 @@ impl App {
             && self.selected_hit().is_some()
     }
 
-    fn active_turn_pane(&self) -> SessionBrowserPane {
-        match self.active_pane {
-            ActivePane::SessionBrowser(pane) => pane,
-            _ => self.session_browser_active_pane,
-        }
-    }
-
-    fn is_single_session_browser(&self, width: usize, height: usize) -> bool {
-        if !self.showing_session_browser() || width == 0 || height == 0 {
-            return false;
-        }
-        let doc = self.session_browser_doc();
-        let total_lines = preview_visual_line_count(&doc.lines, width);
-        total_lines <= height.saturating_mul(BROWSE_SINGLE_PANE_SCREENFULS)
-    }
-
     fn toggle_git_graph(&mut self) {
         self.git_graph_visible = !self.git_graph_visible;
         if !self.git_graph_visible {
@@ -3689,12 +3632,12 @@ impl App {
         }
         if self.showing_session_browser() {
             let doc = self.session_browser_doc();
-            let pane = self.active_turn_pane();
-            let scroll = match pane {
-                SessionBrowserPane::Start => self.session_browser_start_scroll,
-                SessionBrowserPane::End => self.session_browser_end_scroll,
-            };
-            let raw = preview_center_raw_line(&doc.lines, preview_width, scroll, preview_height);
+            let raw = preview_center_raw_line(
+                &doc.lines,
+                preview_width,
+                self.preview_scroll,
+                preview_height,
+            );
             return doc.line_record_indices.get(raw).and_then(|idx| *idx);
         }
 
@@ -4178,11 +4121,8 @@ impl App {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
-            if matches!(
-                self.active_pane,
-                ActivePane::SessionBrowser(_) | ActivePane::TurnPreview
-            ) {
-                self.active_pane = ActivePane::SessionBrowser(SessionBrowserPane::Start);
+            if !matches!(self.active_pane, ActivePane::GitGraph | ActivePane::GitCommit) {
+                self.active_pane = ActivePane::TurnPreview;
             }
             self.preview_scroll_reset_pending = true;
         } else {
@@ -4875,16 +4815,8 @@ impl App {
             _ => {}
         }
         if self.showing_session_browser() {
-            match self.active_turn_pane() {
-                SessionBrowserPane::Start => {
-                    let cur = self.session_browser_start_scroll as i32;
-                    self.session_browser_start_scroll = cmp::max(0, cur + delta) as usize;
-                }
-                SessionBrowserPane::End => {
-                    let cur = self.session_browser_end_scroll as i32;
-                    self.session_browser_end_scroll = cmp::max(0, cur + delta) as usize;
-                }
-            }
+            let cur = self.preview_scroll as i32;
+            self.preview_scroll = cmp::max(0, cur + delta) as usize;
             self.preview_scroll_reset_pending = false;
             return;
         }
@@ -4904,11 +4836,7 @@ impl App {
         }
 
         let (doc, current_scroll, in_session_browser) = if self.showing_session_browser() {
-            let scroll = match self.active_turn_pane() {
-                SessionBrowserPane::Start => self.session_browser_start_scroll,
-                SessionBrowserPane::End => self.session_browser_end_scroll,
-            };
-            (self.session_browser_doc(), scroll, true)
+            (self.session_browser_doc(), self.preview_scroll, true)
         } else {
             (self.build_preview_doc(), self.preview_scroll, false)
         };
@@ -4937,10 +4865,7 @@ impl App {
         let target_scroll = preview_visual_line_offset(&doc.lines, target_raw, preview_width);
 
         if in_session_browser {
-            match self.active_turn_pane() {
-                SessionBrowserPane::Start => self.session_browser_start_scroll = target_scroll,
-                SessionBrowserPane::End => self.session_browser_end_scroll = target_scroll,
-            }
+            self.preview_scroll = target_scroll;
         } else {
             self.preview_scroll = target_scroll;
         }
@@ -5048,14 +4973,6 @@ impl App {
     fn set_session_browser_active_pane(&mut self, pane: SessionBrowserPane) {
         self.session_browser_active_pane = pane;
         self.active_pane = ActivePane::SessionBrowser(pane);
-    }
-
-    fn toggle_session_browser_active_pane(&mut self) {
-        let pane = match self.session_browser_active_pane {
-            SessionBrowserPane::Start => SessionBrowserPane::End,
-            SessionBrowserPane::End => SessionBrowserPane::Start,
-        };
-        self.set_session_browser_active_pane(pane);
     }
 }
 
@@ -5194,7 +5111,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.status_text(),
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
@@ -5240,7 +5157,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             root[2],
             app.status_text(),
             format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 app.displayed_query().trim()
             ),
         );
@@ -5376,166 +5293,87 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         None
     };
 
-    if app.showing_session_browser() && !geometry.browser_single {
-        let browser_started = Instant::now();
-        let browser_doc = app.session_browser_doc();
-        let browser_duration_ms = browser_started.elapsed().as_millis();
-        app.emit_preview_perf_summary("session_browser", &browser_doc, browser_duration_ms);
-        for (pane_kind, pane_area, title) in [
-            (
-                SessionBrowserPane::Start,
-                geometry.turn_start.unwrap_or(preview_area),
-                app.preview_title("Start"),
-            ),
-            (
-                SessionBrowserPane::End,
-                geometry.turn_end.unwrap_or(preview_area),
-                app.preview_title("End"),
-            ),
-        ] {
-            let pane_inner_height = pane_area.height.saturating_sub(2) as usize;
-            let pane_inner_width = pane_area.width.saturating_sub(2) as usize;
-            let pane_total_lines = preview_visual_line_count(&browser_doc.lines, pane_inner_width);
-            let pane_max_scroll = pane_total_lines.saturating_sub(pane_inner_height);
-            let scroll = match pane_kind {
-                SessionBrowserPane::Start => {
-                    app.session_browser_start_scroll =
-                        cmp::min(app.session_browser_start_scroll, pane_max_scroll);
-                    app.session_browser_start_scroll
-                }
-                SessionBrowserPane::End => {
-                    if app.preview_scroll_reset_pending {
-                        app.session_browser_end_scroll =
-                            pane_max_scroll.saturating_sub(pane_inner_height / 2);
-                    } else {
-                        app.session_browser_end_scroll =
-                            cmp::min(app.session_browser_end_scroll, pane_max_scroll);
-                    }
-                    app.session_browser_end_scroll
-                }
-            };
-            let border_style = if app.active_turn_pane() == pane_kind {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                preview_border_style
-            };
-            let anchor_record_idx = if app.git_graph_visible {
-                let anchor_raw = preview_center_raw_line(
-                    &browser_doc.lines,
-                    pane_inner_width,
-                    scroll,
-                    pane_inner_height,
-                );
-                browser_doc
-                    .line_record_indices
-                    .get(anchor_raw)
-                    .and_then(|idx| *idx)
-            } else {
-                None
-            };
-            let pane = Paragraph::new(Text::from(with_anchor_indicator(
-                &browser_doc,
-                anchor_record_idx,
-            )))
-            .style(preview_style)
-            .block(
-                Block::default()
-                    .style(preview_style)
-                    .border_style(border_style)
-                    .borders(Borders::ALL)
-                    .title(title),
-            )
-            .scroll((scroll as u16, 0))
-            .wrap(Wrap { trim: false });
-            f.render_widget(pane, pane_area);
-        }
-        app.preview_scroll_reset_pending = false;
+    let preview_started = Instant::now();
+    let preview_doc = if app.showing_session_browser() {
+        app.session_browser_doc()
     } else {
-        let preview_started = Instant::now();
-        let preview_doc = if app.showing_session_browser() {
-            app.session_browser_doc()
-        } else {
-            app.build_preview_doc()
-        };
-        let preview_duration_ms = preview_started.elapsed().as_millis();
-        let preview_mode = if app.showing_session_browser() {
-            "session_browser_single"
-        } else if query.is_empty() {
-            "empty_query"
-        } else {
-            "query_preview"
-        };
-        app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
-        if app.preview_scroll_reset_pending {
-            let first_match_visual_line = preview_visual_line_offset(
-                &preview_doc.lines,
-                preview_doc.first_match_line,
-                preview_inner_width,
-            );
-            app.preview_scroll = first_match_visual_line.saturating_sub(2);
-            app.preview_scroll_reset_pending = false;
-        }
-        let layout_started = Instant::now();
-        let preview_total_lines =
-            preview_visual_line_count(&preview_doc.lines, preview_inner_width);
-        let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
-        app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
-        if app.log_group_enabled(LogGroup::Perf) {
-            app.emit_group_event(
-                LogGroup::Perf,
-                "perf_preview_phase",
-                json!({
-                    "mode": preview_mode,
-                    "phase": "visual_layout",
-                    "duration_ms": layout_started.elapsed().as_millis(),
-                    "records": 0,
-                    "lines": preview_total_lines,
-                    "bytes": 0,
-                }),
-            );
-        }
-        let preview_title = if !app.showing_session_browser() && !query.is_empty() {
-            let current_record_idx = {
-                let raw = preview_center_raw_line(
-                    &preview_doc.lines,
-                    preview_inner_width,
-                    app.preview_scroll,
-                    preview_inner_height,
-                );
-                preview_doc.line_record_indices.get(raw).and_then(|idx| *idx)
-            };
-            app.query_preview_title("Preview", current_record_idx)
-        } else if app.showing_session_browser() {
-            app.preview_title("Turns")
-        } else {
-            app.preview_title("Preview")
-        };
-        let preview = Paragraph::new(Text::from(with_anchor_indicator(
-            &preview_doc,
-            turn_anchor_record_idx,
-        )))
-        .style(preview_style)
-        .block(
-            Block::default()
-                .style(preview_style)
-                .border_style(preview_border_style)
-                .borders(Borders::ALL)
-                .title(preview_title),
-        )
-        .scroll((app.preview_scroll as u16, 0))
-        .wrap(Wrap { trim: false });
-        f.render_widget(preview, preview_area);
+        app.build_preview_doc()
+    };
+    let preview_duration_ms = preview_started.elapsed().as_millis();
+    let preview_mode = if app.showing_session_browser() {
+        "session_browser_single"
+    } else if query.is_empty() {
+        "empty_query"
+    } else {
+        "query_preview"
+    };
+    app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
+    if app.preview_scroll_reset_pending {
+        let first_match_visual_line = preview_visual_line_offset(
+            &preview_doc.lines,
+            preview_doc.first_match_line,
+            preview_inner_width,
+        );
+        app.preview_scroll = first_match_visual_line.saturating_sub(2);
+        app.preview_scroll_reset_pending = false;
     }
+    let layout_started = Instant::now();
+    let preview_total_lines =
+        preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+    let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
+    app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
+    if app.log_group_enabled(LogGroup::Perf) {
+        app.emit_group_event(
+            LogGroup::Perf,
+            "perf_preview_phase",
+            json!({
+                "mode": preview_mode,
+                "phase": "visual_layout",
+                "duration_ms": layout_started.elapsed().as_millis(),
+                "records": 0,
+                "lines": preview_total_lines,
+                "bytes": 0,
+            }),
+        );
+    }
+    let preview_title = if !app.showing_session_browser() && !query.is_empty() {
+        let current_record_idx = {
+            let raw = preview_center_raw_line(
+                &preview_doc.lines,
+                preview_inner_width,
+                app.preview_scroll,
+                preview_inner_height,
+            );
+            preview_doc.line_record_indices.get(raw).and_then(|idx| *idx)
+        };
+        app.query_preview_title("Preview", current_record_idx)
+    } else if app.showing_session_browser() {
+        app.preview_title("Turns")
+    } else {
+        app.preview_title("Preview")
+    };
+    let preview = Paragraph::new(Text::from(with_anchor_indicator(
+        &preview_doc,
+        turn_anchor_record_idx,
+    )))
+    .style(preview_style)
+    .block(
+        Block::default()
+            .style(preview_style)
+            .border_style(preview_border_style)
+            .borders(Borders::ALL)
+            .title(preview_title),
+    )
+    .scroll((app.preview_scroll as u16, 0))
+    .wrap(Wrap { trim: false });
+    f.render_widget(preview, preview_area);
 
     render_footer(
         f,
         root[2],
         app.status_text(),
         format!(
-            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  Ctrl+j/k: pane line  PgUp/PgDn: pane page  Ctrl+b/f: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll{}  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
-            if app.showing_session_browser() && !geometry.browser_single { "  Tab: switch start/end" } else { "" },
+            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  PgUp/PgDn: pane page  Ctrl+b/f: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
             app.displayed_query().trim()
         ),
     );
@@ -7284,7 +7122,7 @@ mod tests {
         );
 
         assert_eq!(app.session_browser_active_pane, SessionBrowserPane::Start);
-        assert_eq!(app.session_browser_start_scroll, 3);
+        assert_eq!(app.preview_scroll, 3);
         assert_eq!(app.selected, 0);
     }
 
@@ -7608,7 +7446,7 @@ mod tests {
         assert!(app.showing_session_browser());
 
         app.jump_preview_record(1, 80);
-        assert!(app.session_browser_start_scroll > 0);
+        assert!(app.preview_scroll > 0);
     }
 
     #[test]
@@ -7640,12 +7478,12 @@ mod tests {
         app.update_results();
         let doc = app.session_browser_doc();
         let starts = preview_section_start_lines(&doc.line_record_indices);
-        app.session_browser_start_scroll = preview_visual_line_offset(&doc.lines, starts[0], 80);
+        app.preview_scroll = preview_visual_line_offset(&doc.lines, starts[0], 80);
 
         app.jump_preview_record(1, 80);
 
         assert_eq!(
-            app.session_browser_start_scroll,
+            app.preview_scroll,
             preview_visual_line_offset(&doc.lines, starts[1], 80)
         );
     }
@@ -7663,10 +7501,10 @@ mod tests {
         app.update_results();
 
         app.scroll_preview_page(1, 6);
-        assert_eq!(app.session_browser_start_scroll, 5);
+        assert_eq!(app.preview_scroll, 5);
 
         app.scroll_preview_page(-1, 6);
-        assert_eq!(app.session_browser_start_scroll, 0);
+        assert_eq!(app.preview_scroll, 0);
     }
 
     #[test]
