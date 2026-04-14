@@ -3317,28 +3317,6 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         )
         .split(area)[0];
 
-    if app.show_telemetry || !app.git_graph_visible {
-        let main = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
-            .split(root);
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
-            .split(main[0]);
-        return PaneGeometry {
-            root,
-            query: left[0],
-            results: left[1],
-            git_graph: None,
-            git_commit: None,
-            turn_preview: main[1],
-            turn_start: None,
-            turn_end: None,
-            browser_single: true,
-        };
-    }
-
     let mut results_pct = app.layout_state.results_pct.clamp(MIN_RESULTS_PCT, 100);
     let max_results = 100 - MIN_GIT_PCT - MIN_TURNS_PCT;
     results_pct = results_pct.min(max_results);
@@ -3357,43 +3335,48 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
         .split(main[0]);
     let left_body = left[1];
-    let max_git = 100 - MIN_TURNS_PCT;
-    let git_pct = app.layout_state.git_pct.clamp(MIN_GIT_PCT, max_git);
-    let left_panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(100 - git_pct),
-                Constraint::Percentage(git_pct),
-            ]
-            .as_ref(),
-        )
-        .split(left_body);
-    let git_column = left_panes[1];
-    let (git_graph, git_commit) = if app.git_commit_visible {
-        let graph_pct = app
-            .layout_state
-            .graph_pct
-            .clamp(MIN_GRAPH_PCT, MAX_GRAPH_PCT);
-        let panes = Layout::default()
+    let (results, git_graph, git_commit) = if app.show_telemetry || !app.git_graph_visible {
+        (left_body, None, None)
+    } else {
+        let max_git = 100 - MIN_TURNS_PCT;
+        let git_pct = app.layout_state.git_pct.clamp(MIN_GIT_PCT, max_git);
+        let left_panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Percentage(graph_pct),
-                    Constraint::Percentage(100 - graph_pct),
+                    Constraint::Percentage(100 - git_pct),
+                    Constraint::Percentage(git_pct),
                 ]
                 .as_ref(),
             )
-            .split(git_column);
-        (Some(panes[0]), Some(panes[1]))
-    } else {
-        (Some(git_column), None)
+            .split(left_body);
+        let git_column = left_panes[1];
+        let (git_graph, git_commit) = if app.git_commit_visible {
+            let graph_pct = app
+                .layout_state
+                .graph_pct
+                .clamp(MIN_GRAPH_PCT, MAX_GRAPH_PCT);
+            let panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(
+                    [
+                        Constraint::Percentage(graph_pct),
+                        Constraint::Percentage(100 - graph_pct),
+                    ]
+                    .as_ref(),
+                )
+                .split(git_column);
+            (Some(panes[0]), Some(panes[1]))
+        } else {
+            (Some(git_column), None)
+        };
+        (left_panes[0], git_graph, git_commit)
     };
 
     PaneGeometry {
         root,
         query: left[0],
-        results: left_panes[0],
+        results,
         git_graph,
         git_commit,
         turn_preview: main[1],
@@ -3401,22 +3384,6 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         turn_end: None,
         browser_single: true,
     }
-}
-
-fn app_panes(area: Rect) -> (Rect, Rect) {
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
-        .split(area)[0];
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
-        .split(root);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
-        .split(main[0]);
-    (left[1], main[1])
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
@@ -3523,7 +3490,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(_) => {
             app.dragged_split = None;
-            if !app.show_telemetry && app.git_graph_visible {
+            if !app.show_telemetry {
                 if point_near_vertical_split(mouse.column, geometry.turn_preview) {
                     app.active_split = Some(ActiveSplit::ResultsGit);
                     app.dragged_split = Some(ActiveSplit::ResultsGit);
@@ -7554,6 +7521,53 @@ mod tests {
     }
 
     #[test]
+    fn app_geometry_keeps_main_split_width_when_git_visibility_toggles() {
+        let mut app = empty_app();
+        app.layout_state.results_pct = 33;
+        let area = Rect::new(0, 0, 100, 30);
+
+        let hidden = app_geometry(area, &app);
+        app.git_graph_visible = true;
+        let shown = app_geometry(area, &app);
+
+        assert_eq!(hidden.results.width, shown.results.width);
+        assert_eq!(hidden.turn_preview.width, shown.turn_preview.width);
+    }
+
+    #[test]
+    fn mouse_drag_can_resize_main_split_when_git_is_hidden() {
+        let mut app = empty_app();
+        app.ready = true;
+        app.layout_state.results_pct = 20;
+        let area = Rect::new(0, 0, 100, 30);
+        let geometry = app_geometry(area, &app);
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: geometry.turn_preview.x.saturating_sub(1),
+                row: geometry.turn_preview.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 40,
+                row: geometry.turn_preview.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.dragged_split, Some(ActiveSplit::ResultsGit));
+        assert_eq!(app.layout_state.results_pct, 40);
+    }
+
+    #[test]
     fn preview_scroll_line_movement_clamps_at_zero() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
@@ -7745,8 +7759,8 @@ mod tests {
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
 
-        let area = Rect::new(0, 0, 100, 30);
-        let (results_area, _) = app_panes(area);
+        let area = Rect::new(0, 0, 240, 30);
+        let results_area = app_geometry(area, &app).results;
         let sess = app.sessions.get(app.filtered[0].session_idx).unwrap();
         let expected_project = sess.project_slug.clone().unwrap();
         let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
