@@ -638,6 +638,28 @@ fn preview_section_start_lines(line_record_indices: &[Option<usize>]) -> Vec<usi
     starts
 }
 
+fn preview_selected_section_start_line(
+    doc: &PreviewDoc,
+    width: usize,
+    scroll: usize,
+) -> Option<usize> {
+    let starts = preview_section_start_lines(&doc.line_record_indices);
+    if starts.is_empty() {
+        return None;
+    }
+    starts
+        .iter()
+        .copied()
+        .take_while(|&line| preview_visual_line_offset(&doc.lines, line, width) <= scroll)
+        .last()
+        .or_else(|| starts.first().copied())
+}
+
+fn preview_selected_record_idx(doc: &PreviewDoc, width: usize, scroll: usize) -> Option<usize> {
+    let raw = preview_selected_section_start_line(doc, width, scroll)?;
+    doc.line_record_indices.get(raw).and_then(|idx| *idx)
+}
+
 fn preview_center_raw_line(
     lines: &[Line<'_>],
     width: usize,
@@ -3090,6 +3112,36 @@ fn with_anchor_indicator(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> 
     lines
 }
 
+fn with_selected_preview_line(
+    doc: &PreviewDoc,
+    selected_record_idx: Option<usize>,
+    anchor_record_idx: Option<usize>,
+) -> Vec<Line<'static>> {
+    let mut lines = with_anchor_indicator(doc, anchor_record_idx);
+    let Some(selected_record_idx) = selected_record_idx else {
+        return lines;
+    };
+    let Some(line_idx) = doc
+        .line_record_indices
+        .iter()
+        .position(|record_idx| *record_idx == Some(selected_record_idx))
+    else {
+        return lines;
+    };
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    lines[line_idx] = Line::from(
+        lines[line_idx]
+            .spans
+            .iter()
+            .cloned()
+            .map(|span| Span::styled(span.content, span.style.patch(selected_style)))
+            .collect::<Vec<_>>(),
+    );
+    lines
+}
+
 fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -3632,6 +3684,11 @@ impl App {
         }
         if self.showing_session_browser() {
             let doc = self.session_browser_doc();
+            return preview_selected_record_idx(&doc, preview_width, self.preview_scroll);
+        }
+
+        let doc = self.build_preview_doc();
+        if self.query.trim().is_empty() {
             let raw = preview_center_raw_line(
                 &doc.lines,
                 preview_width,
@@ -3640,15 +3697,7 @@ impl App {
             );
             return doc.line_record_indices.get(raw).and_then(|idx| *idx);
         }
-
-        let doc = self.build_preview_doc();
-        let raw = preview_center_raw_line(
-            &doc.lines,
-            preview_width,
-            self.preview_scroll,
-            preview_height,
-        );
-        doc.line_record_indices.get(raw).and_then(|idx| *idx)
+        preview_selected_record_idx(&doc, preview_width, self.preview_scroll)
     }
 
     fn resolve_repo_root(&self, cwd: &str) -> Option<PathBuf> {
@@ -3805,6 +3854,16 @@ impl App {
             return self.preview_title(label);
         };
         format!("{label}  turn {turn_idx}/{total_turns}")
+    }
+
+    fn turns_preview_title(&self, record_idx: Option<usize>) -> String {
+        let Some(record_idx) = record_idx else {
+            return self.preview_title("Turns");
+        };
+        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx) else {
+            return self.preview_title("Turns");
+        };
+        format!("Turns  turn {turn_idx}/{total_turns}")
     }
 
     fn git_graph_title(&self) -> String {
@@ -5346,24 +5405,21 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             }),
         );
     }
+    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
+        preview_selected_record_idx(&preview_doc, preview_inner_width, app.preview_scroll)
+    } else {
+        None
+    };
     let preview_title = if !app.showing_session_browser() && !query.is_empty() {
-        let current_record_idx = {
-            let raw = preview_center_raw_line(
-                &preview_doc.lines,
-                preview_inner_width,
-                app.preview_scroll,
-                preview_inner_height,
-            );
-            preview_doc.line_record_indices.get(raw).and_then(|idx| *idx)
-        };
-        app.query_preview_title("Preview", current_record_idx)
+        app.query_preview_title("Preview", selected_preview_record_idx)
     } else if app.showing_session_browser() {
-        app.preview_title("Turns")
+        app.turns_preview_title(selected_preview_record_idx)
     } else {
         app.preview_title("Preview")
     };
-    let preview = Paragraph::new(Text::from(with_anchor_indicator(
+    let preview = Paragraph::new(Text::from(with_selected_preview_line(
         &preview_doc,
+        selected_preview_record_idx,
         turn_anchor_record_idx,
     )))
     .style(preview_style)
@@ -7043,6 +7099,60 @@ mod tests {
             app.query_preview_title("Preview", matched_record_idx),
             "Preview  turn 2/3"
         );
+    }
+
+    #[test]
+    fn turns_preview_title_uses_selected_turn_position() {
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        assert_eq!(
+            app.turns_preview_title(Some(1)),
+            "Turns  turn 2/3"
+        );
+    }
+
+    #[test]
+    fn preview_selected_record_idx_uses_last_section_start_at_or_before_scroll() {
+        let doc = PreviewDoc {
+            lines: vec![
+                Line::raw("header"),
+                Line::raw("turn 1"),
+                Line::raw("line 1"),
+                Line::raw("turn 2"),
+                Line::raw("line 2"),
+            ],
+            first_match_line: 0,
+            match_lines: Vec::new(),
+            line_record_indices: vec![None, Some(10), Some(10), Some(20), Some(20)],
+        };
+
+        assert_eq!(preview_selected_record_idx(&doc, 80, 0), Some(10));
+        assert_eq!(preview_selected_record_idx(&doc, 80, 2), Some(10));
+        assert_eq!(preview_selected_record_idx(&doc, 80, 3), Some(20));
     }
 
     #[test]
