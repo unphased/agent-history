@@ -412,10 +412,33 @@ fn sync_remotes_from_args_with_cache_path(
         .and_then(|path| telemetry::TelemetrySink::open(path).ok());
     for remote in remotes {
         let started = Instant::now();
+        let target = match remote.user.as_deref() {
+            Some(user) => format!("{user}@{}", remote.host),
+            None => remote.host.clone(),
+        };
+        let remote_cmd = remote
+            .command
+            .clone()
+            .unwrap_or_else(|| "agent-history".to_string());
+        let remote_cache_path = remote
+            .cache_path
+            .as_deref()
+            .unwrap_or(cache::default_remote_cache_path())
+            .to_string();
+        let refresh_cmd = shell_command_string("ssh", &[&target, &remote_cmd, "refresh"]);
+        let rsync_src = format!("{target}:{remote_cache_path}");
+        let local_db = cache::remote_db_path_for(cache_path, &remote.name);
+        let rsync_cmd =
+            shell_command_string("rsync", &["-az", &rsync_src, local_db.to_string_lossy().as_ref()]);
         let record = telemetry::EventRecord::new(
             None,
             "remote_sync_started",
-            json!({"remote_name": remote.name, "host": remote.host}),
+            json!({
+                "remote_name": remote.name,
+                "host": remote.host,
+                "refresh_cmd": refresh_cmd,
+                "rsync_cmd": rsync_cmd,
+            }),
         );
         if let Some(sink) = telemetry.as_mut() {
             let _ = sink.emit_record(&record);
@@ -549,6 +572,26 @@ fn refresh_and_rsync_remote(
     }
 
     Ok(local_db)
+}
+
+fn shell_escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg
+        .bytes()
+        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'_' | b'.' | b'-' | b'@'))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+fn shell_command_string(program: &str, args: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_escape_arg(program));
+    parts.extend(args.iter().map(|arg| shell_escape_arg(arg)));
+    parts.join(" ")
 }
 
 fn remote_refresh_subcommand_unsupported(stderr: &str) -> bool {

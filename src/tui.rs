@@ -861,9 +861,12 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
             telemetry_metric_u64(data, "bytes").unwrap_or(0)
         ),
         "remote_sync_started" => format!(
-            "remote={} host={} started",
+            "remote={} host={} started refresh_cmd={} rsync_cmd={}",
             telemetry_metric_str(data, "remote_name").unwrap_or(""),
             telemetry_metric_str(data, "host").unwrap_or("")
+            ,
+            truncate_middle(telemetry_metric_str(data, "refresh_cmd").unwrap_or(""), 80),
+            truncate_middle(telemetry_metric_str(data, "rsync_cmd").unwrap_or(""), 80)
         ),
         "remote_sync_finished" => format!(
             "remote={} host={} ms={} records={} sessions={}",
