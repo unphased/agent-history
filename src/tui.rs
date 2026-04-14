@@ -5558,7 +5558,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     render_footer(
         f,
-        root[2],
+        root[1],
         app.status_text(),
         format!(
             "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  PgUp/PgDn: pane page  Ctrl+b/f: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
