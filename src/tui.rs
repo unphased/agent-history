@@ -4846,8 +4846,18 @@ impl App {
             return;
         }
 
-        let current_raw =
-            preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, current_scroll);
+        let current_raw = if in_session_browser {
+            starts
+                .iter()
+                .copied()
+                .take_while(|&line| {
+                    preview_visual_line_offset(&doc.lines, line, preview_width) <= current_scroll
+                })
+                .last()
+                .unwrap_or(starts[0])
+        } else {
+            preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, current_scroll)
+        };
         let target_raw = if dir >= 0 {
             starts
                 .iter()
@@ -7485,6 +7495,45 @@ mod tests {
         assert_eq!(
             app.preview_scroll,
             preview_visual_line_offset(&doc.lines, starts[1], 80)
+        );
+    }
+
+    #[test]
+    fn jump_preview_record_wraps_forward_from_last_turn_to_first() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let doc = app.session_browser_doc();
+        let starts = preview_section_start_lines(&doc.line_record_indices);
+        app.preview_scroll = preview_visual_line_offset(&doc.lines, *starts.last().unwrap(), 80);
+
+        app.jump_preview_record(1, 80);
+
+        assert_eq!(
+            app.preview_scroll,
+            preview_visual_line_offset(&doc.lines, starts[0], 80)
         );
     }
 
