@@ -6081,6 +6081,7 @@ fn run_with_tui_suspended<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -6184,6 +6185,23 @@ mod tests {
     fn ready_app_with_indexed_data(all: Vec<MessageRecord>) -> App {
         let (sessions, session_records) = build_session_index(&all);
         ready_app_with_data(all, sessions, session_records)
+    }
+
+    #[test]
+    fn ui_ready_non_telemetry_renders_without_panicking() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
     }
 
     #[test]
