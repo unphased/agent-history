@@ -722,7 +722,6 @@ fn log_group_label(group: LogGroup) -> &'static str {
 fn log_group_toggle_key(group: LogGroup) -> &'static str {
     match group {
         LogGroup::Perf => "Ctrl+g",
-        LogGroup::Remote => "Ctrl+r",
     }
 }
 
@@ -802,9 +801,7 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
             telemetry_metric_u64(data, "sessions").unwrap_or(0)
         ),
         "log_groups_help" => telemetry_metric_str(data, "summary")
-            .unwrap_or(
-                "While Events is open, Ctrl+g toggles perf and Ctrl+r toggles remote logging.",
-            )
+            .unwrap_or("While Events is open, Ctrl+g toggles perf logging.")
             .to_string(),
         "log_path_info" => format!(
             "events log path={}",
@@ -2681,12 +2678,6 @@ fn handle_key(
             if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
         {
             app.toggle_log_group(LogGroup::Perf);
-            return Ok(false);
-        }
-        KeyCode::Char('r')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
-        {
-            app.toggle_log_group(LogGroup::Remote);
             return Ok(false);
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -5019,7 +5010,7 @@ impl App {
             self.emit_event(
                 "log_groups_help",
                 json!({
-                    "summary": "While Events is open, Ctrl+g toggles perf logging and Ctrl+r toggles remote logging.",
+                    "summary": "While Events is open, Ctrl+g toggles perf logging.",
                 }),
             );
             self.log_groups_help_emitted = true;
@@ -5200,7 +5191,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.status_text(),
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
@@ -5246,7 +5237,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             root[2],
             app.status_text(),
             format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+r: remote  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+j/k: scroll line  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 app.displayed_query().trim()
             ),
         );

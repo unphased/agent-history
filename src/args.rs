@@ -4,14 +4,12 @@ use std::path::PathBuf;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
 pub enum LogGroup {
     Perf,
-    Remote,
 }
 
 impl LogGroup {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Perf => "perf",
-            Self::Remote => "remote",
         }
     }
 }

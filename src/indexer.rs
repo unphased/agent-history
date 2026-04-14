@@ -1,5 +1,5 @@
 use crate::{
-    args::{ExportArgs, ExportFormat, LogGroup, RefreshArgs, RunArgs, ScanArgs},
+    args::{ExportArgs, ExportFormat, RefreshArgs, RunArgs, ScanArgs},
     cache, config, search, telemetry,
 };
 use anyhow::Context as _;
@@ -407,23 +407,20 @@ fn sync_remotes_from_args_with_cache_path(
             .clone()
             .unwrap_or_else(telemetry::default_log_path)
     });
-    let remote_logging_enabled = args.log_groups.contains(&LogGroup::Remote);
     let mut telemetry = telemetry_path
         .as_ref()
         .and_then(|path| telemetry::TelemetrySink::open(path).ok());
     for remote in remotes {
         let started = Instant::now();
-        if remote_logging_enabled {
-            let record = telemetry::EventRecord::new(
-                Some(LogGroup::Remote.as_str()),
-                "remote_sync_started",
-                json!({"remote_name": remote.name, "host": remote.host}),
-            );
-            if let Some(sink) = telemetry.as_mut() {
-                let _ = sink.emit_record(&record);
-            }
-            tx.send(IndexerEvent::Telemetry { record }).ok();
+        let record = telemetry::EventRecord::new(
+            None,
+            "remote_sync_started",
+            json!({"remote_name": remote.name, "host": remote.host}),
+        );
+        if let Some(sink) = telemetry.as_mut() {
+            let _ = sink.emit_record(&record);
         }
+        tx.send(IndexerEvent::Telemetry { record }).ok();
         match refresh_and_rsync_remote(&remote, cache_path) {
             Ok(local_db) => {
                 let records =
@@ -441,25 +438,23 @@ fn sync_remotes_from_args_with_cache_path(
                     count_sessions(&records) as i64,
                 )?;
                 let all = cache::load_all_with_remotes(&store)?;
-                if remote_logging_enabled {
-                    let record = telemetry::EventRecord::new(
-                        Some(LogGroup::Remote.as_str()),
-                        "remote_sync_finished",
-                        json!({
-                            "remote_name": remote.name,
-                            "host": remote.host,
-                            "duration_ms": started.elapsed().as_millis(),
-                            "records": records.len(),
-                            "sessions": count_sessions(&records),
-                            "machine_id": machine_id,
-                            "machine_name": machine_name,
-                        }),
-                    );
-                    if let Some(sink) = telemetry.as_mut() {
-                        let _ = sink.emit_record(&record);
-                    }
-                    tx.send(IndexerEvent::Telemetry { record }).ok();
+                let record = telemetry::EventRecord::new(
+                    None,
+                    "remote_sync_finished",
+                    json!({
+                        "remote_name": remote.name,
+                        "host": remote.host,
+                        "duration_ms": started.elapsed().as_millis(),
+                        "records": records.len(),
+                        "sessions": count_sessions(&records),
+                        "machine_id": machine_id,
+                        "machine_name": machine_name,
+                    }),
+                );
+                if let Some(sink) = telemetry.as_mut() {
+                    let _ = sink.emit_record(&record);
                 }
+                tx.send(IndexerEvent::Telemetry { record }).ok();
                 tx.send(IndexerEvent::Loaded { records: all }).ok();
             }
             Err(err) => {
@@ -471,22 +466,20 @@ fn sync_remotes_from_args_with_cache_path(
                     &err_string,
                     started.elapsed().as_millis() as i64,
                 )?;
-                if remote_logging_enabled {
-                    let record = telemetry::EventRecord::new(
-                        Some(LogGroup::Remote.as_str()),
-                        "remote_sync_failed",
-                        json!({
-                            "remote_name": remote.name,
-                            "host": remote.host,
-                            "duration_ms": started.elapsed().as_millis(),
-                            "error": err_string,
-                        }),
-                    );
-                    if let Some(sink) = telemetry.as_mut() {
-                        let _ = sink.emit_record(&record);
-                    }
-                    tx.send(IndexerEvent::Telemetry { record }).ok();
+                let record = telemetry::EventRecord::new(
+                    None,
+                    "remote_sync_failed",
+                    json!({
+                        "remote_name": remote.name,
+                        "host": remote.host,
+                        "duration_ms": started.elapsed().as_millis(),
+                        "error": err_string,
+                    }),
+                );
+                if let Some(sink) = telemetry.as_mut() {
+                    let _ = sink.emit_record(&record);
                 }
+                tx.send(IndexerEvent::Telemetry { record }).ok();
                 tx.send(IndexerEvent::Warn {
                     message: format!("remote sync failed for {}: {err}", remote.name),
                 })
