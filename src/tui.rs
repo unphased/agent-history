@@ -223,6 +223,7 @@ struct GitPaneDoc {
 #[derive(Debug, Clone, Copy)]
 struct PaneGeometry {
     root: Rect,
+    query: Rect,
     results: Rect,
     git_graph: Option<Rect>,
     git_commit: Option<Rect>,
@@ -3092,6 +3093,12 @@ fn parse_git_commit_line(line: &str) -> Option<GitCommitEntry> {
     })
 }
 
+fn parse_git_graph_hash_field(field: &str) -> Option<&str> {
+    field.split_whitespace().find(|token| {
+        token.len() >= 7 && token.chars().all(|ch| ch.is_ascii_hexdigit())
+    })
+}
+
 fn selected_git_commit_idx(commits: &[GitCommitEntry], anchor_ts: i64) -> Option<usize> {
     if commits.is_empty() {
         return None;
@@ -3170,22 +3177,26 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Length(3),
                 Constraint::Min(1),
                 Constraint::Length(app.footer_height()),
             ]
             .as_ref(),
         )
-        .split(area)[1];
+        .split(area)[0];
 
     if app.show_telemetry || !app.git_graph_visible {
         let main = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
             .split(root);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
+            .split(main[0]);
         return PaneGeometry {
             root,
-            results: main[0],
+            query: left[0],
+            results: left[1],
             git_graph: None,
             git_commit: None,
             turn_preview: main[1],
@@ -3198,28 +3209,34 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
     let mut results_pct = app.layout_state.results_pct.clamp(MIN_RESULTS_PCT, 100);
     let max_results = 100 - MIN_GIT_PCT - MIN_TURNS_PCT;
     results_pct = results_pct.min(max_results);
-    let remaining = 100 - results_pct;
-    let mut git_pct = app
-        .layout_state
-        .git_pct
-        .clamp(MIN_GIT_PCT, remaining - MIN_TURNS_PCT);
-    let turns_pct = remaining - git_pct;
-    if turns_pct < MIN_TURNS_PCT {
-        git_pct = remaining - MIN_TURNS_PCT;
-    }
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(
             [
                 Constraint::Percentage(results_pct),
-                Constraint::Percentage(git_pct),
-                Constraint::Percentage(100 - results_pct - git_pct),
+                Constraint::Percentage(100 - results_pct),
             ]
             .as_ref(),
         )
         .split(root);
-
-    let git_column = main[1];
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
+        .split(main[0]);
+    let left_body = left[1];
+    let max_git = 100 - MIN_TURNS_PCT;
+    let git_pct = app.layout_state.git_pct.clamp(MIN_GIT_PCT, max_git);
+    let left_panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage(100 - git_pct),
+                Constraint::Percentage(git_pct),
+            ]
+            .as_ref(),
+        )
+        .split(left_body);
+    let git_column = left_panes[1];
     let (git_graph, git_commit) = if app.git_commit_visible {
         let graph_pct = app
             .layout_state
@@ -3242,10 +3259,11 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
 
     PaneGeometry {
         root,
-        results: main[0],
+        query: left[0],
+        results: left_panes[0],
         git_graph,
         git_commit,
-        turn_preview: main[2],
+        turn_preview: main[1],
         turn_start: None,
         turn_end: None,
         browser_single: true,
@@ -3255,20 +3273,17 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
 fn app_panes(area: Rect) -> (Rect, Rect) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ]
-            .as_ref(),
-        )
-        .split(area);
+        .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
+        .split(area)[0];
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
-        .split(root[1]);
-    (main[0], main[1])
+        .split(root);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)].as_ref())
+        .split(main[0]);
+    (left[1], main[1])
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
@@ -3376,19 +3391,19 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
         MouseEventKind::Down(_) => {
             app.dragged_split = None;
             if !app.show_telemetry && app.git_graph_visible {
-                if let Some(git_graph) = geometry.git_graph {
-                    if point_near_vertical_split(mouse.column, git_graph) {
-                        app.active_split = Some(ActiveSplit::ResultsGit);
-                        app.dragged_split = Some(ActiveSplit::ResultsGit);
-                    } else if point_near_vertical_split(mouse.column, geometry.turn_preview) {
-                        app.active_split = Some(ActiveSplit::GitTurns);
-                        app.dragged_split = Some(ActiveSplit::GitTurns);
-                    } else if let Some(git_commit) = geometry.git_commit
-                        && point_near_horizontal_split(mouse.row, git_commit)
-                    {
-                        app.active_split = Some(ActiveSplit::GitColumnVertical);
-                        app.dragged_split = Some(ActiveSplit::GitColumnVertical);
-                    }
+                if point_near_vertical_split(mouse.column, geometry.turn_preview) {
+                    app.active_split = Some(ActiveSplit::ResultsGit);
+                    app.dragged_split = Some(ActiveSplit::ResultsGit);
+                } else if let Some(git_split_rect) = geometry.git_graph.or(geometry.git_commit)
+                    && point_near_horizontal_split(mouse.row, git_split_rect)
+                {
+                    app.active_split = Some(ActiveSplit::GitTurns);
+                    app.dragged_split = Some(ActiveSplit::GitTurns);
+                } else if let Some(git_commit) = geometry.git_commit
+                    && point_near_horizontal_split(mouse.row, git_commit)
+                {
+                    app.active_split = Some(ActiveSplit::GitColumnVertical);
+                    app.dragged_split = Some(ActiveSplit::GitColumnVertical);
                 }
             }
             if !app.show_telemetry {
@@ -3520,26 +3535,26 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(split) = app.dragged_split {
                 match split {
-                    ActiveSplit::ResultsGit | ActiveSplit::GitTurns => {
+                    ActiveSplit::ResultsGit => {
                         let total = geometry.root.width.max(1);
                         let rel = mouse.column.saturating_sub(geometry.root.x) as u32;
                         let pct = ((rel * 100) / total as u32) as i16;
-                        match split {
-                            ActiveSplit::ResultsGit => {
-                                app.layout_state.results_pct = pct.clamp(
-                                    MIN_RESULTS_PCT as i16,
-                                    (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
-                                )
-                                    as u16;
-                            }
-                            ActiveSplit::GitTurns => {
-                                let base = app.layout_state.results_pct as i16;
-                                let git_pct = pct - base;
-                                let max_git = 100 - app.layout_state.results_pct - MIN_TURNS_PCT;
-                                app.layout_state.git_pct =
-                                    git_pct.clamp(MIN_GIT_PCT as i16, max_git as i16) as u16;
-                            }
-                            _ => {}
+                        app.layout_state.results_pct = pct.clamp(
+                            MIN_RESULTS_PCT as i16,
+                            (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
+                        ) as u16;
+                    }
+                    ActiveSplit::GitTurns => {
+                        let git_split_rect = geometry.git_graph.or(geometry.git_commit);
+                        if let Some(git_split_rect) = git_split_rect {
+                            let total =
+                                geometry.results.height.saturating_add(git_split_rect.height).max(1);
+                            let rel = mouse.row.saturating_sub(geometry.results.y) as u32;
+                            let results_pct = ((rel * 100) / total as u32) as i16;
+                            let git_pct = 100 - results_pct;
+                            let max_git = 100 - MIN_TURNS_PCT;
+                            app.layout_state.git_pct =
+                                git_pct.clamp(MIN_GIT_PCT as i16, max_git as i16) as u16;
                         }
                     }
                     ActiveSplit::GitColumnVertical => {
@@ -3568,20 +3583,14 @@ fn current_preview_area(
 ) -> anyhow::Result<Rect> {
     let area = terminal.size().context("failed to get terminal size")?;
     let area: Rect = area.into();
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(app.footer_height()),
-            ]
-            .as_ref(),
-        )
-        .split(area);
     let geometry = app_geometry(area, app);
     let preview_area = if app.show_telemetry {
-        root[1]
+        Rect::new(
+            geometry.root.x,
+            geometry.root.y + 1,
+            geometry.root.width,
+            geometry.root.height.saturating_sub(1),
+        )
     } else if let Some(area) = match app.active_pane {
         ActivePane::GitGraph => geometry.git_graph,
         ActivePane::GitCommit => geometry.git_commit,
@@ -3843,7 +3852,7 @@ impl App {
             let mut graph_line_commit_indices = Vec::new();
             for line in String::from_utf8_lossy(&graph_output.stdout).lines() {
                 let mut parts = line.splitn(2, '\t');
-                let hash = parts.next().unwrap_or("").trim();
+                let hash = parse_git_graph_hash_field(parts.next().unwrap_or("")).unwrap_or("");
                 let display = parts.next().unwrap_or(line).to_string();
                 let commit_idx = commits.iter().position(|commit| commit.hash == hash);
                 graph_lines.push(display);
@@ -3987,12 +3996,12 @@ impl App {
         self.ui_status = Some(status.into());
     }
 
-    fn query_title(&self) -> String {
+    fn query_prompt_prefix(&self) -> String {
         if self.show_telemetry {
-            return "Events Search".to_string();
+            return "events> ".to_string();
         }
         if self.active_tag_filters.is_empty() {
-            return "Query".to_string();
+            return "> ".to_string();
         }
 
         let filters = self
@@ -4005,7 +4014,7 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("  ");
-        format!("Query  [{filters}]")
+        format!("[{filters}]> ")
     }
 
     fn displayed_query(&self) -> &str {
@@ -5144,7 +5153,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Length(3),
                 Constraint::Min(1),
                 Constraint::Length(app.footer_height()),
             ]
@@ -5153,20 +5161,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let displayed_query = app.displayed_query().to_string();
-    let query = Paragraph::new(format!("> {}", displayed_query))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.query_title()),
-        )
-        .style(Style::default().fg(Color::White));
-    f.render_widget(query, root[0]);
-    // Place the terminal cursor in the query bar (border + "> " prefix = 3 chars offset)
-    let cursor_x = root[0].x + 1 + 2 + app.displayed_cursor_pos() as u16;
-    let cursor_y = root[0].y + 1;
-    f.set_cursor_position((cursor_x, cursor_y));
-
     if !app.ready {
+        let query_prefix = app.query_prompt_prefix();
+        let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
+            .style(Style::default().fg(Color::White));
+        f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
+        let cursor_x = root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+        let cursor_y = root[0].y;
+        f.set_cursor_position((cursor_x, cursor_y));
+
         let status_height: u16 = if app.show_telemetry { 6 } else { 3 };
         let main = Layout::default()
             .direction(Direction::Vertical)
@@ -5175,7 +5178,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             } else {
                 vec![Constraint::Length(3), Constraint::Min(1)]
             })
-            .split(root[1]);
+            .split(Rect::new(
+                root[0].x,
+                root[0].y + 1,
+                root[0].width,
+                root[0].height.saturating_sub(1),
+            ));
 
         let pct = if app.indexing.total_files == 0 {
             0u16
@@ -5270,7 +5278,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
         render_footer(
             f,
-            root[2],
+            root[1],
             app.status_text(),
             if app.show_telemetry {
                 format!(
@@ -5285,7 +5293,20 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     if app.show_telemetry {
-        let telemetry_area = root[1];
+        let query_prefix = app.query_prompt_prefix();
+        let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
+            .style(Style::default().fg(Color::White));
+        f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
+        let cursor_x = root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+        let cursor_y = root[0].y;
+        f.set_cursor_position((cursor_x, cursor_y));
+
+        let telemetry_area = Rect::new(
+            root[0].x,
+            root[0].y + 1,
+            root[0].width,
+            root[0].height.saturating_sub(1),
+        );
         let telemetry_inner_height = telemetry_area.height.saturating_sub(2) as usize;
         let telemetry_inner_width = telemetry_area.width.saturating_sub(2) as usize;
         let telemetry_doc = app.build_preview_doc();
@@ -5317,7 +5338,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
         render_footer(
             f,
-            root[2],
+            root[1],
             app.status_text(),
             format!(
                 "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
@@ -5328,6 +5349,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let geometry = app_geometry(f.area(), app);
+    let query_prefix = app.query_prompt_prefix();
+    let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
+        .style(Style::default().fg(Color::White));
+    f.render_widget(query, geometry.query);
+    let cursor_x = geometry.query.x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+    let cursor_y = geometry.query.y;
+    f.set_cursor_position((cursor_x, cursor_y));
 
     // Results pane (manual windowing)
     let results_area = geometry.results;
@@ -7258,6 +7286,15 @@ mod tests {
         assert_eq!(commit.hash, "abc123");
         assert_eq!(commit.epoch, 1_712_966_400);
         assert_eq!(commit.summary, "ship git context panes");
+    }
+
+    #[test]
+    fn parse_git_graph_hash_field_extracts_hash_after_graph_prefix() {
+        assert_eq!(
+            parse_git_graph_hash_field("*   898f62e0e9983baf7aaf9d420c9c71ddfaec0bf3"),
+            Some("898f62e0e9983baf7aaf9d420c9c71ddfaec0bf3")
+        );
+        assert_eq!(parse_git_graph_hash_field("|\\  "), None);
     }
 
     #[test]
