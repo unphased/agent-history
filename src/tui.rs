@@ -749,6 +749,31 @@ fn preview_section_record_indices(doc: &PreviewDoc) -> Vec<usize> {
         .collect()
 }
 
+fn preview_record_visual_bounds(
+    doc: &PreviewDoc,
+    width: usize,
+    record_idx: usize,
+) -> Option<(usize, usize)> {
+    if width == 0 {
+        return None;
+    }
+    let start_raw = doc
+        .line_record_indices
+        .iter()
+        .position(|line_record_idx| *line_record_idx == Some(record_idx))?;
+    let end_raw = doc
+        .line_record_indices
+        .iter()
+        .skip(start_raw)
+        .take_while(|line_record_idx| **line_record_idx == Some(record_idx))
+        .count()
+        .saturating_add(start_raw);
+    Some((
+        preview_visual_line_offset(&doc.lines, start_raw, width),
+        preview_visual_line_offset(&doc.lines, end_raw, width),
+    ))
+}
+
 fn preview_center_raw_line(
     lines: &[Line<'_>],
     width: usize,
@@ -3858,6 +3883,23 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 {
                     app.set_session_browser_active_pane(SessionBrowserPane::End);
                 } else if point_in_rect(mouse.column, mouse.row, geometry.turn_preview) {
+                    let preview_doc = if app.showing_session_browser() {
+                        app.session_browser_doc()
+                    } else {
+                        app.build_preview_doc()
+                    };
+                    let preview_width = preview_area.width.saturating_sub(2) as usize;
+                    let preview_height = preview_area.height.saturating_sub(2) as usize;
+                    if let Some(record_idx) =
+                        app.hovered_preview_record_idx(&preview_doc, preview_area, mouse)
+                    {
+                        app.select_preview_record_full_reveal_if_possible(
+                            &preview_doc,
+                            preview_width,
+                            preview_height,
+                            record_idx,
+                        );
+                    }
                     app.input_mode = InputMode::PreviewNav;
                 } else if point_in_rect(mouse.column, mouse.row, results_area) {
                     app.input_mode = InputMode::SessionSearch;
@@ -4212,6 +4254,38 @@ impl App {
             self.preview_scroll = target_offset.saturating_sub(preview_height.saturating_sub(1));
         } else {
             self.selected_preview_record_idx = Some(record_idx);
+        }
+        self.preview_scroll_reset_pending = false;
+    }
+
+    fn select_preview_record_full_reveal_if_possible(
+        &mut self,
+        doc: &PreviewDoc,
+        preview_width: usize,
+        preview_height: usize,
+        record_idx: usize,
+    ) {
+        if preview_width == 0 || preview_height == 0 {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let Some((section_start, section_end)) =
+            preview_record_visual_bounds(doc, preview_width, record_idx)
+        else {
+            self.preview_scroll_reset_pending = false;
+            return;
+        };
+        self.selected_preview_record_idx = Some(record_idx);
+        let section_height = section_end.saturating_sub(section_start);
+        if section_height <= preview_height {
+            let viewport_start = self.preview_scroll;
+            let viewport_end = viewport_start.saturating_add(preview_height);
+            if section_start < viewport_start {
+                self.preview_scroll = section_start;
+            } else if section_end > viewport_end {
+                self.preview_scroll = section_end.saturating_sub(preview_height);
+            }
         }
         self.preview_scroll_reset_pending = false;
     }
@@ -9159,6 +9233,64 @@ mod tests {
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn clicking_preview_turn_reveals_entire_turn_when_it_fits() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "line one\nline two",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let area = Rect::new(0, 0, 100, 10);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let doc = app.session_browser_doc();
+        let (second_start, second_end) = preview_record_visual_bounds(&doc, preview_width, 1)
+            .expect("expected second preview record bounds");
+        let second_height = second_end.saturating_sub(second_start);
+        assert!(second_height <= preview_height);
+
+        app.preview_scroll = second_start.saturating_add(1);
+        let click_row = preview_area.y + 1;
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: preview_area.x + 2,
+                row: click_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.preview_scroll, second_start);
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
     }
 
     #[test]
