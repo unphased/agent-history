@@ -3681,10 +3681,7 @@ fn with_preview_record_highlights(
             &mut lines,
             doc,
             selected_record_idx,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().bg(Color::Gray),
         );
     }
     lines
@@ -9426,11 +9423,8 @@ mod tests {
             .position(|record_idx| *record_idx == Some(2))
             .expect("expected hovered record line");
 
-        assert_eq!(
-            lines[second_line_idx].spans[0].style.bg,
-            Some(Color::Yellow)
-        );
-        assert_eq!(lines[second_line_idx].spans[0].style.fg, Some(Color::Black));
+        assert_eq!(lines[second_line_idx].spans[0].style.bg, Some(Color::Gray));
+        assert_eq!(lines[second_line_idx].spans[0].style.fg, None);
         assert_eq!(
             lines[third_line_idx].spans[0].style.bg,
             Some(Color::DarkGray)
