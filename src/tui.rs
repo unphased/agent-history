@@ -79,6 +79,7 @@ struct SessionSummary {
     origin: String,
     remote_desync_label: Option<String>,
     project_slug: Option<String>,
+    project_key: Option<String>,
     first_user_idx: usize,
     last_ts: Option<String>,
     cwd: Option<String>,
@@ -92,6 +93,7 @@ struct SessionAgg<'a> {
     last_ts: Option<&'a str>,
     cwd: Option<&'a str>,
     project_slug: Option<&'a str>,
+    project_key: Option<&'a str>,
     machine_id: Option<&'a str>,
     machine_name: Option<&'a str>,
     origin: Option<&'a str>,
@@ -457,10 +459,13 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
             entry.cwd = Some(cwd);
         }
         if entry.project_slug.is_none()
+            && let Some(project_key) = rec.project_key.as_deref()
+            && !project_key.trim().is_empty()
             && let Some(project_slug) = rec.project_slug.as_deref()
             && !project_slug.trim().is_empty()
         {
             entry.project_slug = Some(project_slug);
+            entry.project_key = Some(project_key);
         }
         if entry.machine_id.is_none() && !rec.machine_id.trim().is_empty() {
             entry.machine_id = Some(&rec.machine_id);
@@ -494,6 +499,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 origin: key.origin.to_string(),
                 remote_desync_label: None,
                 project_slug: agg.project_slug.map(|s| s.to_string()),
+                project_key: agg.project_key.map(|s| s.to_string()),
                 first_user_idx,
                 last_ts: agg.last_ts.map(|s| s.to_string()),
                 cwd: agg.cwd.map(|s| s.to_string()),
@@ -1291,6 +1297,7 @@ fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
         });
     }
     if tags.show_project
+        && let Some(project_key) = sess.project_key.as_deref().filter(|s| !s.trim().is_empty())
         && let Some(project) = sess
             .project_slug
             .as_deref()
@@ -1299,7 +1306,7 @@ fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
         specs.push(SessionTagSpec {
             filter: TagFilter {
                 kind: TagFilterKind::Project,
-                value: project.to_string(),
+                value: project_key.to_string(),
             },
             content: format!(" {project} "),
             style: tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
@@ -1323,8 +1330,8 @@ fn result_line_text(
     hit_count: usize,
 ) -> String {
     let ts = short_ts(sess.last_ts.as_deref());
-    let dir_prefix = match sess.project_slug.as_deref() {
-        Some(project) if project == sess.dir => String::new(),
+    let dir_prefix = match (sess.project_key.as_deref(), sess.project_slug.as_deref()) {
+        (Some(_), Some(project)) if project == sess.dir => String::new(),
         _ => format!("[{}] ", sess.dir),
     };
     let prefix = format!("{ts} {dir_prefix}{}", sess.first_line);
@@ -5049,6 +5056,18 @@ impl App {
         }
     }
 
+    fn project_filter_label(&self, project_key: &str) -> String {
+        self.sessions
+            .iter()
+            .find_map(|sess| {
+                (sess.project_key.as_deref() == Some(project_key))
+                    .then(|| sess.project_slug.as_deref())
+                    .flatten()
+            })
+            .unwrap_or(project_key)
+            .to_string()
+    }
+
     fn query_prompt_prefix(&self) -> String {
         if self.show_telemetry {
             return "events❯ ".to_string();
@@ -5063,7 +5082,9 @@ impl App {
             .map(|filter| match filter.kind {
                 TagFilterKind::Provider => format!("provider={}", filter.value),
                 TagFilterKind::Host => format!("host={}", filter.value),
-                TagFilterKind::Project => format!("project={}", filter.value),
+                TagFilterKind::Project => {
+                    format!("project={}", self.project_filter_label(&filter.value))
+                }
             })
             .collect::<Vec<_>>()
             .join("  ");
@@ -5125,7 +5146,7 @@ impl App {
                 }
                 TagFilterKind::Host => sess.machine_name == filter.value,
                 TagFilterKind::Project => {
-                    sess.project_slug.as_deref() == Some(filter.value.as_str())
+                    sess.project_key.as_deref() == Some(filter.value.as_str())
                 }
             })
     }
@@ -5393,7 +5414,10 @@ impl App {
                 sess.project_slug.as_deref().unwrap_or("")
             )),
             Line::raw(format!("source: {}", source_label(sess.source))),
-            Line::raw(format!("turns: {} (showing all, filter paused)", record_idxs.len())),
+            Line::raw(format!(
+                "turns: {} (showing all, filter paused)",
+                record_idxs.len()
+            )),
             Line::raw(""),
         ];
         line_record_indices.resize(lines.len(), None);
@@ -7568,6 +7592,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7606,6 +7631,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7625,6 +7651,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7677,6 +7704,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7713,6 +7741,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7742,6 +7771,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7775,6 +7805,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -7934,6 +7965,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -8457,6 +8489,7 @@ mod tests {
                 machine_id: String::new(),
                 machine_name: String::new(),
                 project_slug: None,
+                project_key: None,
                 git_repo_root: None,
                 git_remotes: HashMap::new(),
                 origin: String::new(),
@@ -8476,6 +8509,7 @@ mod tests {
                 machine_id: String::new(),
                 machine_name: String::new(),
                 project_slug: None,
+                project_key: None,
                 git_repo_root: None,
                 git_remotes: HashMap::new(),
                 origin: String::new(),
@@ -8532,6 +8566,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -8752,6 +8787,7 @@ mod tests {
             machine_id: "remote-host".to_string(),
             machine_name: "remote-host".to_string(),
             project_slug: Some("project".to_string()),
+            project_key: Some("/home/slu/project/.git".to_string()),
             git_repo_root: Some("/home/slu/project".to_string()),
             git_remotes: HashMap::new(),
             origin: "remote".to_string(),
@@ -8798,6 +8834,7 @@ mod tests {
             machine_id: "remote-host".to_string(),
             machine_name: "remote-host".to_string(),
             project_slug: Some("instrumenter".to_string()),
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: "remote".to_string(),
@@ -9134,6 +9171,7 @@ mod tests {
         );
         alpha.cwd = Some("/tmp/alpha".to_string());
         alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
 
         let mut beta = mr(
             Some("2026-02-10T00:00:02Z"),
@@ -9144,6 +9182,7 @@ mod tests {
         );
         beta.cwd = Some("/tmp/beta".to_string());
         beta.project_slug = Some("beta".to_string());
+        beta.project_key = Some("/tmp/repos/beta/.git".to_string());
 
         let all = vec![alpha, beta];
         let mut app = ready_app_with_indexed_data(all);
@@ -9153,6 +9192,7 @@ mod tests {
         let results_area = app_geometry(area, &app).results;
         let sess = app.sessions.get(app.filtered[0].session_idx).unwrap();
         let expected_project = sess.project_slug.clone().unwrap();
+        let expected_project_key = sess.project_key.clone().unwrap();
         let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
             .spans
             .iter()
@@ -9174,7 +9214,7 @@ mod tests {
         assert_eq!(app.query, "");
         assert_eq!(app.active_tag_filters.len(), 1);
         assert_eq!(app.active_tag_filters[0].kind, TagFilterKind::Project);
-        assert_eq!(app.active_tag_filters[0].value, expected_project);
+        assert_eq!(app.active_tag_filters[0].value, expected_project_key);
         assert_eq!(app.filtered.len(), 1);
         assert_eq!(
             app.sessions[app.filtered[0].session_idx].project_slug,
@@ -9198,6 +9238,7 @@ mod tests {
             origin: "local".to_string(),
             remote_desync_label: None,
             project_slug: Some("proj".to_string()),
+            project_key: Some("/tmp/proj/.git".to_string()),
         };
         let rec = test_record(MessageRecord {
             timestamp: None,
@@ -9213,6 +9254,7 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            project_key: None,
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: String::new(),
@@ -9721,6 +9763,7 @@ mod tests {
             origin: "remote".to_string(),
             remote_desync_label: None,
             project_slug: Some("proj".to_string()),
+            project_key: Some("/tmp/proj/.git".to_string()),
         };
 
         let line = result_line(
@@ -10052,6 +10095,7 @@ mod tests {
             origin: "local".to_string(),
             remote_desync_label: None,
             project_slug: None,
+            project_key: None,
         };
 
         let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
@@ -10078,6 +10122,7 @@ mod tests {
             origin: "local".to_string(),
             remote_desync_label: None,
             project_slug: None,
+            project_key: None,
         };
         let tags = config::UiTagConfig {
             show_provider: false,
@@ -10108,6 +10153,7 @@ mod tests {
             origin: "local".to_string(),
             remote_desync_label: None,
             project_slug: None,
+            project_key: None,
         };
 
         let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
@@ -10134,6 +10180,7 @@ mod tests {
             origin: "workstation".to_string(),
             remote_desync_label: None,
             project_slug: None,
+            project_key: None,
         };
 
         let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
@@ -10160,6 +10207,7 @@ mod tests {
             origin: "workstation".to_string(),
             remote_desync_label: Some("desync 3h".to_string()),
             project_slug: None,
+            project_key: None,
         };
 
         let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
@@ -10168,6 +10216,33 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Mini desync 3h"));
+    }
+
+    #[test]
+    fn session_tag_spans_hide_project_tag_without_project_key() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: None,
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: Some("/tmp/proj".to_string()),
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "local".to_string(),
+            machine_name: "MBP".to_string(),
+            origin: "local".to_string(),
+            remote_desync_label: None,
+            project_slug: Some("proj".to_string()),
+            project_key: None,
+        };
+
+        let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(!rendered.contains(" proj "));
     }
 
     #[test]

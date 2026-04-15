@@ -84,6 +84,8 @@ pub struct MessageRecord {
     pub machine_id: String,
     pub machine_name: String,
     pub project_slug: Option<String>,
+    #[serde(default)]
+    pub project_key: Option<String>,
     pub git_repo_root: Option<String>,
     #[serde(default)]
     pub git_remotes: HashMap<String, String>,
@@ -140,6 +142,8 @@ struct FileContext {
 #[derive(Debug, Clone, Default)]
 struct GitRepoMetadata {
     repo_root: Option<String>,
+    project_slug: Option<String>,
+    project_key: Option<String>,
     remotes: HashMap<String, String>,
 }
 
@@ -1218,7 +1222,6 @@ fn attach_machine_metadata(
     for rec in records {
         rec.machine_id = machine.id.clone();
         rec.machine_name = machine.name.clone();
-        rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd_owned);
         let git_metadata = rec
             .cwd
             .as_deref()
@@ -1230,6 +1233,8 @@ fn attach_machine_metadata(
                     .clone()
             })
             .unwrap_or_default();
+        rec.project_slug = git_metadata.project_slug;
+        rec.project_key = git_metadata.project_key;
         rec.git_repo_root = git_metadata.repo_root;
         rec.git_remotes = git_metadata.remotes;
         rec.origin = origin.to_string();
@@ -1241,12 +1246,14 @@ fn blank_record_metadata() -> (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     HashMap<String, String>,
     String,
 ) {
     (
         String::new(),
         String::new(),
+        None,
         None,
         None,
         HashMap::new(),
@@ -1261,6 +1268,41 @@ fn dir_name_from_cwd_owned(cwd: &str) -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(cwd)
         .to_string()
+}
+
+fn shared_repo_label_from_common_dir(common_dir: &str) -> Option<String> {
+    let path = Path::new(common_dir);
+    let file_name = path.file_name().and_then(|s| s.to_str())?;
+    let label = if file_name == ".git" {
+        dir_name_from_cwd_owned(path.parent()?.to_string_lossy().as_ref())
+    } else {
+        file_name.to_string()
+    };
+    (!label.trim().is_empty()).then_some(label)
+}
+
+fn absolute_git_common_dir(cwd: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common_dir.is_empty() {
+        return None;
+    }
+    let path = Path::new(&common_dir);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(cwd).join(path)
+    };
+    Some(absolute.to_string_lossy().to_string())
 }
 
 fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
@@ -1278,6 +1320,18 @@ fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
     if repo_root.is_empty() {
         return GitRepoMetadata::default();
     }
+    let Some(project_key) = absolute_git_common_dir(cwd) else {
+        return GitRepoMetadata {
+            repo_root: Some(repo_root),
+            ..GitRepoMetadata::default()
+        };
+    };
+    let Some(project_slug) = shared_repo_label_from_common_dir(&project_key) else {
+        return GitRepoMetadata {
+            repo_root: Some(repo_root),
+            ..GitRepoMetadata::default()
+        };
+    };
 
     let remotes_output = match Command::new("git")
         .arg("-C")
@@ -1291,6 +1345,8 @@ fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
         _ => {
             return GitRepoMetadata {
                 repo_root: Some(repo_root),
+                project_slug: Some(project_slug),
+                project_key: Some(project_key),
                 remotes: HashMap::new(),
             };
         }
@@ -1315,6 +1371,8 @@ fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
 
     GitRepoMetadata {
         repo_root: Some(repo_root),
+        project_slug: Some(project_slug),
+        project_key: Some(project_key),
         remotes,
     }
 }
@@ -1994,8 +2052,15 @@ fn index_opencode_session_file(
             })
             .or_else(|| session_ts.clone());
         let phase = message.mode.clone().or(message.agent.clone());
-        let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
-            blank_record_metadata();
+        let (
+            machine_id,
+            machine_name,
+            project_slug,
+            project_key,
+            git_repo_root,
+            git_remotes,
+            origin,
+        ) = blank_record_metadata();
 
         out.push(MessageRecord {
             timestamp,
@@ -2011,6 +2076,7 @@ fn index_opencode_session_file(
             machine_id,
             machine_name,
             project_slug,
+            project_key,
             git_repo_root,
             git_remotes,
             origin,
@@ -2023,8 +2089,15 @@ fn index_opencode_session_file(
         && let Some(title) = fallback_title
     {
         telemetry.used_title_fallback = true;
-        let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
-            blank_record_metadata();
+        let (
+            machine_id,
+            machine_name,
+            project_slug,
+            project_key,
+            git_repo_root,
+            git_remotes,
+            origin,
+        ) = blank_record_metadata();
         out.push(MessageRecord {
             timestamp: session_ts,
             role: Role::User,
@@ -2039,6 +2112,7 @@ fn index_opencode_session_file(
             machine_id,
             machine_name,
             project_slug,
+            project_key,
             git_repo_root,
             git_remotes,
             origin,
@@ -2397,7 +2471,7 @@ fn extract_codex_session_record(
 
     let text = extract_content_text(payload)?;
     let images = extract_codex_content_images(payload);
-    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+    let (machine_id, machine_name, project_slug, project_key, git_repo_root, git_remotes, origin) =
         blank_record_metadata();
 
     Some(MessageRecord {
@@ -2414,6 +2488,7 @@ fn extract_codex_session_record(
         machine_id,
         machine_name,
         project_slug,
+        project_key,
         git_repo_root,
         git_remotes,
         origin,
@@ -2453,7 +2528,7 @@ fn extract_claude_project_record(
     let cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
 
     let text = extract_claude_message_text(message)?;
-    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+    let (machine_id, machine_name, project_slug, project_key, git_repo_root, git_remotes, origin) =
         blank_record_metadata();
 
     Some(MessageRecord {
@@ -2470,6 +2545,7 @@ fn extract_claude_project_record(
         machine_id,
         machine_name,
         project_slug,
+        project_key,
         git_repo_root,
         git_remotes,
         origin,
@@ -2547,7 +2623,7 @@ fn extract_codex_history_record(
     let ts = h.ts?;
     let session_id = h.session_id?;
     let text = h.text?;
-    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+    let (machine_id, machine_name, project_slug, project_key, git_repo_root, git_remotes, origin) =
         blank_record_metadata();
 
     Some(MessageRecord {
@@ -2564,6 +2640,7 @@ fn extract_codex_history_record(
         machine_id,
         machine_name,
         project_slug,
+        project_key,
         git_repo_root,
         git_remotes,
         origin,
@@ -2668,6 +2745,7 @@ mod tests {
             machine_id: "mbp".to_string(),
             machine_name: "MacBook Pro".to_string(),
             project_slug: Some("proj".to_string()),
+            project_key: Some("/tmp/project/.git".to_string()),
             git_repo_root: None,
             git_remotes: HashMap::new(),
             origin: "local".to_string(),
@@ -2707,6 +2785,7 @@ mod tests {
                 machine_id: "local".to_string(),
                 machine_name: "local".to_string(),
                 project_slug: None,
+                project_key: None,
                 git_repo_root: None,
                 git_remotes: HashMap::new(),
                 origin: "local".to_string(),
@@ -2726,6 +2805,7 @@ mod tests {
                 machine_id: "local".to_string(),
                 machine_name: "local".to_string(),
                 project_slug: None,
+                project_key: None,
                 git_repo_root: None,
                 git_remotes: HashMap::new(),
                 origin: "local".to_string(),
@@ -3459,6 +3539,18 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, IndexerEvent::Done { records } if records.is_empty()))
+        );
+    }
+
+    #[test]
+    fn shared_repo_label_uses_parent_of_common_git_dir() {
+        assert_eq!(
+            shared_repo_label_from_common_dir("/tmp/work/repo/.git"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            shared_repo_label_from_common_dir("/tmp/work/repo/.git/modules/lib"),
+            Some("lib".to_string())
         );
     }
 }

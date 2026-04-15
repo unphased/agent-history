@@ -322,6 +322,7 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "local".to_string(),
             project_slug: Some("tizze".to_string()),
+            project_key: Some("/home/tizze/.git".to_string()),
             git_repo_root: None,
             git_remotes: std::collections::HashMap::new(),
             origin: "local".to_string(),
