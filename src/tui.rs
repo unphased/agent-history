@@ -1129,6 +1129,8 @@ const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
 const REMOTE_DESYNC_TAG_BG: Color = Color::Rgb(104, 54, 92);
 const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
+const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
+const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
 const QUERY_MATCH_FG: Color = Color::Black;
 
 const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
@@ -3673,7 +3675,7 @@ fn with_preview_record_highlights(
             &mut lines,
             doc,
             hovered_record_idx,
-            Style::default().bg(Color::DarkGray),
+            Style::default().bg(PREVIEW_HOVER_BG),
         );
     }
     if let Some(selected_record_idx) = selected_record_idx {
@@ -3681,7 +3683,7 @@ fn with_preview_record_highlights(
             &mut lines,
             doc,
             selected_record_idx,
-            Style::default().bg(Color::Gray),
+            Style::default().bg(PREVIEW_SELECTED_BG),
         );
     }
     lines
@@ -9423,11 +9425,14 @@ mod tests {
             .position(|record_idx| *record_idx == Some(2))
             .expect("expected hovered record line");
 
-        assert_eq!(lines[second_line_idx].spans[0].style.bg, Some(Color::Gray));
+        assert_eq!(
+            lines[second_line_idx].spans[0].style.bg,
+            Some(PREVIEW_SELECTED_BG)
+        );
         assert_eq!(lines[second_line_idx].spans[0].style.fg, None);
         assert_eq!(
             lines[third_line_idx].spans[0].style.bg,
-            Some(Color::DarkGray)
+            Some(PREVIEW_HOVER_BG)
         );
     }
 
