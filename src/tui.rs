@@ -2622,6 +2622,7 @@ struct App {
     last_git_graph_anchor: Option<(PathBuf, usize)>,
     git_graph_visible: bool,
     git_commit_visible: bool,
+    preview_show_all_turns: bool,
     input_mode: InputMode,
     active_split: Option<ActiveSplit>,
     layout_state: LayoutState,
@@ -2736,6 +2737,7 @@ fn run_app(
         last_git_graph_anchor: None,
         git_graph_visible: false,
         git_commit_visible: false,
+        preview_show_all_turns: false,
         input_mode: InputMode::SessionSearch,
         active_split: None,
         layout_state: LayoutState::from_ui_state(&ui_state.layout),
@@ -3046,6 +3048,17 @@ fn handle_key(
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cycle_layout_preset();
+            return Ok(false);
+        }
+        KeyCode::Char('s')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.show_telemetry =>
+        {
+            app.preview_show_all_turns = !app.preview_show_all_turns;
+            app.set_ui_status(if app.preview_show_all_turns {
+                "preview: showing all turns"
+            } else {
+                "preview: showing matched turns only"
+            });
             return Ok(false);
         }
         KeyCode::Char('r')
@@ -4954,11 +4967,11 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Backspace/Delete: edit  Ctrl+u: clear  query: \"{}\"",
+                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+s: all turns  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
-                "Tab/Shift+Tab: focus  Esc: search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc: search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+s: all turns  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
             }
             InputMode::GitGraph => {
                 "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
@@ -5269,6 +5282,107 @@ impl App {
         self.git_commit_scroll = 0;
     }
 
+    fn build_all_turns_preview_doc(&self, query: &str) -> PreviewDoc {
+        let Some(hit) = self.selected_hit() else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+                match_lines: Vec::new(),
+                line_record_indices: vec![None],
+            };
+        };
+        let Some(sess) = self.sessions.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+                match_lines: Vec::new(),
+                line_record_indices: vec![None],
+            };
+        };
+        let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
+            return PreviewDoc {
+                lines: vec![Line::raw("(no match)")],
+                first_match_line: 0,
+                match_lines: Vec::new(),
+                line_record_indices: vec![None],
+            };
+        };
+
+        let base_style = Style::default();
+        let compiled = search::CompiledQuery::new(query);
+        let mut line_record_indices = Vec::new();
+
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::raw(format!("session id: {}", sess.session_id)),
+            Line::raw(format!(
+                "account: {}",
+                sess.account.as_deref().unwrap_or("")
+            )),
+            Line::raw(format!("host: {}", sess.machine_name)),
+            Line::raw(format!("machine id: {}", sess.machine_id)),
+            Line::raw(format!("origin: {}", sess.origin)),
+            Line::raw(format!(
+                "project: {}",
+                sess.project_slug.as_deref().unwrap_or("")
+            )),
+            Line::raw(format!("source: {}", source_label(sess.source))),
+            Line::raw(format!("turns: {} (showing all, filter paused)", record_idxs.len())),
+            Line::raw(""),
+        ];
+        line_record_indices.resize(lines.len(), None);
+
+        let mut first_match_line = 0;
+        let mut match_lines = Vec::new();
+
+        for (pos, &idx) in record_idxs.iter().enumerate() {
+            let Some(rec) = self.all.get(idx) else {
+                continue;
+            };
+            let role = match rec.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+                Role::Unknown => "unknown",
+            };
+            let is_match = compiled.matches_record(rec);
+
+            let turn_line = lines.len();
+            lines.push(Line::raw(format!(
+                "turn {}   {}   role: {role}   phase: {}{}",
+                pos + 1,
+                short_ts(rec.timestamp.as_deref()),
+                rec.phase.as_deref().unwrap_or(""),
+                if is_match { "   [match]" } else { "" }
+            )));
+            line_record_indices.push(Some(idx));
+            if is_match {
+                if first_match_line == 0 {
+                    first_match_line = turn_line;
+                }
+                match_lines.push(turn_line);
+            }
+            lines.push(Line::raw(format!(
+                "file: {}:{}",
+                rec.file.display(),
+                rec.line
+            )));
+            line_record_indices.push(Some(idx));
+            let rendered_lines = render_preview_message_lines(&rec.text, query, base_style);
+            line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_lines.len()));
+            lines.extend(rendered_lines);
+            lines.push(Line::raw(""));
+            line_record_indices.push(Some(idx));
+        }
+
+        PreviewDoc {
+            lines,
+            first_match_line,
+            match_lines,
+            line_record_indices,
+        }
+    }
+
     fn session_browser_doc(&self) -> PreviewDoc {
         let Some(hit) = self.selected_hit() else {
             return PreviewDoc {
@@ -5372,6 +5486,10 @@ impl App {
 
         let query = self.query.trim();
         let base_style = Style::default();
+
+        if self.preview_show_all_turns && !query.is_empty() {
+            return self.build_all_turns_preview_doc(query);
+        }
 
         let Some(hit) = self.selected_hit() else {
             return PreviewDoc {
@@ -5744,7 +5862,13 @@ impl App {
         }
     }
 
-    fn build_git_graph_doc(&mut self, preview_width: usize, preview_height: usize) -> GitPaneDoc {
+    fn build_git_graph_doc(
+        &mut self,
+        preview_width: usize,
+        preview_height: usize,
+        graph_pane_width: usize,
+        graph_pane_height: usize,
+    ) -> GitPaneDoc {
         let git_match = match self.selected_git_view_state(preview_width, preview_height) {
             GitViewState::Available(git_match) => git_match,
             GitViewState::RemoteUnavailable(unavailable) => {
@@ -5848,15 +5972,17 @@ impl App {
                 lines,
             )
         };
-        if self.last_git_graph_anchor.as_ref() != Some(&anchor_key) && preview_height > 0 {
-            let target_line = graph_offset.saturating_add(anchor_key.1);
+        if self.last_git_graph_anchor.as_ref() != Some(&anchor_key) && graph_pane_height > 0 {
+            let target_raw = graph_offset.saturating_add(anchor_key.1);
+            let target_visual =
+                preview_visual_line_offset(&lines, target_raw, graph_pane_width.max(1));
             let viewport_start = self.git_graph_scroll;
-            let viewport_end = viewport_start.saturating_add(preview_height);
-            if target_line < viewport_start {
-                self.git_graph_scroll = target_line;
-            } else if target_line >= viewport_end {
+            let viewport_end = viewport_start.saturating_add(graph_pane_height);
+            if target_visual < viewport_start {
+                self.git_graph_scroll = target_visual;
+            } else if target_visual >= viewport_end {
                 self.git_graph_scroll =
-                    target_line.saturating_sub(preview_height.saturating_sub(1));
+                    target_visual.saturating_sub(graph_pane_height.saturating_sub(1));
             }
         }
         self.last_git_graph_anchor = Some(anchor_key);
@@ -6530,7 +6656,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     if let Some(git_graph_area) = geometry.git_graph {
         let graph_inner_height = git_graph_area.height.saturating_sub(2) as usize;
         let graph_inner_width = git_graph_area.width.saturating_sub(2) as usize;
-        let graph_doc = app.build_git_graph_doc(graph_inner_width, preview_inner_height);
+        let graph_doc = app.build_git_graph_doc(
+            graph_inner_width,
+            preview_inner_height,
+            graph_inner_width,
+            graph_inner_height,
+        );
         let graph_total_lines = preview_visual_line_count(&graph_doc.lines, graph_inner_width);
         let graph_max_scroll = graph_total_lines.saturating_sub(graph_inner_height);
         app.git_graph_scroll = cmp::min(app.git_graph_scroll, graph_max_scroll);
@@ -7228,6 +7359,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
+            preview_show_all_turns: false,
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -7936,6 +8068,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
+            preview_show_all_turns: false,
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -8036,6 +8169,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
+            preview_show_all_turns: false,
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -8558,7 +8692,7 @@ mod tests {
         app.git_commit_visible = true;
         app.update_results();
 
-        let doc = app.build_git_graph_doc(80, 20);
+        let doc = app.build_git_graph_doc(80, 20, 80, 20);
         let rendered = doc
             .lines
             .iter()
@@ -8604,7 +8738,7 @@ mod tests {
         app.git_commit_visible = true;
         app.update_results();
 
-        let doc = app.build_git_graph_doc(80, 20);
+        let doc = app.build_git_graph_doc(80, 20, 80, 20);
         let rendered = doc
             .lines
             .iter()
@@ -9600,6 +9734,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
+            preview_show_all_turns: false,
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
