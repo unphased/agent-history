@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -13,6 +13,20 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub remotes: Vec<RemoteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct UiState {
+    #[serde(default)]
+    pub layout: UiLayoutState,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct UiLayoutState {
+    pub preset: Option<String>,
+    pub results_pct: Option<u16>,
+    pub git_pct: Option<u16>,
+    pub graph_pct: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -99,6 +113,41 @@ pub fn default_config_path() -> PathBuf {
     home.join(".config/agent-history/config.toml")
 }
 
+pub fn load_ui_state(path: Option<&Path>) -> anyhow::Result<UiState> {
+    let path = path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_ui_state_path);
+    if !path.exists() {
+        return Ok(UiState::default());
+    }
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("ui state read failed: {}", path.display()))?;
+    let state: UiState = toml::from_str(&body)
+        .with_context(|| format!("ui state parse failed: {}", path.display()))?;
+    Ok(state)
+}
+
+pub fn save_ui_state(path: &Path, state: &UiState) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("ui state directory creation failed: {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(state).context("ui state encode failed")?;
+    fs::write(path, body).with_context(|| format!("ui state write failed: {}", path.display()))?;
+    Ok(())
+}
+
+pub fn default_ui_state_path() -> PathBuf {
+    if let Some(path) = env::var_os("AGENT_HISTORY_UI_STATE") {
+        return PathBuf::from(path);
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/state/agent-history/ui-state.toml")
+}
+
 fn detected_hostname() -> String {
     hostname::get()
         .ok()
@@ -136,5 +185,32 @@ mod tests {
         let id = cfg.machine_identity();
         assert_eq!(id.id, "mbp");
         assert_eq!(id.name, "MacBook Pro");
+    }
+
+    #[test]
+    fn default_ui_state_path_uses_agent_history_state_dir() {
+        assert!(default_ui_state_path().ends_with("agent-history/ui-state.toml"));
+    }
+
+    #[test]
+    fn save_and_load_ui_state_round_trip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-history-ui-state-{}.toml",
+            std::process::id()
+        ));
+        let state = UiState {
+            layout: UiLayoutState {
+                preset: Some("git-wide".to_string()),
+                results_pct: Some(21),
+                git_pct: Some(31),
+                graph_pct: Some(67),
+            },
+        };
+
+        save_ui_state(&tmp, &state).unwrap();
+        let loaded = load_ui_state(Some(&tmp)).unwrap();
+        let _ = fs::remove_file(&tmp);
+
+        assert_eq!(loaded, state);
     }
 }

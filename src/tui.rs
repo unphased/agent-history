@@ -281,6 +281,15 @@ const MIN_GRAPH_PCT: u16 = 20;
 const MAX_GRAPH_PCT: u16 = 80;
 
 impl LayoutPreset {
+    fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "turns-wide" => Some(Self::TurnsWide),
+            "git-wide" => Some(Self::GitWide),
+            _ => None,
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             Self::Balanced => Self::TurnsWide,
@@ -307,6 +316,39 @@ impl LayoutState {
             results_pct: ratios.results_pct,
             git_pct: ratios.git_pct,
             graph_pct: ratios.graph_pct,
+        }
+    }
+
+    fn from_ui_state(saved: &config::UiLayoutState) -> Self {
+        let preset = saved
+            .preset
+            .as_deref()
+            .and_then(LayoutPreset::from_label)
+            .unwrap_or(LayoutPreset::Balanced);
+        let ratios = preset.default_ratios();
+        Self {
+            preset,
+            results_pct: saved
+                .results_pct
+                .unwrap_or(ratios.results_pct)
+                .clamp(MIN_RESULTS_PCT, 100 - MIN_TURNS_PCT),
+            git_pct: saved
+                .git_pct
+                .unwrap_or(ratios.git_pct)
+                .clamp(MIN_GIT_PCT, 100 - MIN_TURNS_PCT),
+            graph_pct: saved
+                .graph_pct
+                .unwrap_or(ratios.graph_pct)
+                .clamp(MIN_GRAPH_PCT, MAX_GRAPH_PCT),
+        }
+    }
+
+    fn to_ui_state(self) -> config::UiLayoutState {
+        config::UiLayoutState {
+            preset: Some(self.preset.label().to_string()),
+            results_pct: Some(self.results_pct),
+            git_pct: Some(self.git_pct),
+            graph_pct: Some(self.graph_pct),
         }
     }
 
@@ -2579,6 +2621,8 @@ struct App {
     preview_bgcolor_cache: HashMap<String, Option<Color>>,
     remote_sync_states: HashMap<String, cache::RemoteSyncStatus>,
     ui_tags: config::UiTagConfig,
+    ui_state_path: PathBuf,
+    layout_state_dirty: bool,
     remotes: HashMap<String, config::RemoteConfig>,
     git_repo_cache: HashMap<PathBuf, GitRepoContext>,
     git_commit_preview_cache: HashMap<(PathBuf, String), Vec<String>>,
@@ -2618,6 +2662,8 @@ fn run_app(
     args: RunArgs,
 ) -> anyhow::Result<()> {
     let app_config = config::load_config(args.scan.config.as_deref()).unwrap_or_default();
+    let ui_state_path = config::default_ui_state_path();
+    let ui_state = config::load_ui_state(Some(&ui_state_path)).unwrap_or_default();
     let remotes = app_config
         .remotes
         .iter()
@@ -2664,7 +2710,7 @@ fn run_app(
         git_commit_visible: false,
         active_pane: ActivePane::Results,
         active_split: None,
-        layout_state: LayoutState::new(),
+        layout_state: LayoutState::from_ui_state(&ui_state.layout),
         dragged_split: None,
         last_query: String::new(),
         last_results: Vec::new(),
@@ -2685,6 +2731,8 @@ fn run_app(
         preview_bgcolor_cache: HashMap::new(),
         remote_sync_states: HashMap::new(),
         ui_tags: app_config.ui.tags,
+        ui_state_path,
+        layout_state_dirty: false,
         remotes,
         git_repo_cache: HashMap::new(),
         git_commit_preview_cache: HashMap::new(),
@@ -2755,6 +2803,7 @@ fn run_app(
             match ev {
                 Event::Key(key) => {
                     if handle_key(terminal, &mut app, key)? {
+                        app.persist_ui_state_if_dirty()?;
                         return Ok(());
                     }
                     dirty = true;
@@ -2769,6 +2818,7 @@ fn run_app(
                 _ => {}
             }
         }
+        app.persist_ui_state_if_dirty()?;
         let handle_duration_ms = handle_started.elapsed().as_millis();
         emit_input_loop_perf(
             &mut app,
@@ -3812,6 +3862,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                         };
                         app.layout_state.results_pct =
                             pct.clamp(MIN_RESULTS_PCT as i16, max_results as i16) as u16;
+                        app.layout_state_dirty = true;
                     }
                     ActiveSplit::GitTurns => {
                         let git_split_rect = geometry.git_graph.or(geometry.git_commit);
@@ -3827,6 +3878,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             let max_git = 100 - MIN_TURNS_PCT;
                             app.layout_state.git_pct =
                                 git_pct.clamp(MIN_GIT_PCT as i16, max_git as i16) as u16;
+                            app.layout_state_dirty = true;
                         }
                     }
                     ActiveSplit::GitColumnVertical => {
@@ -3837,6 +3889,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             let pct = ((rel * 100) / total.max(1) as u32) as i16;
                             app.layout_state.graph_pct =
                                 pct.clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16) as u16;
+                            app.layout_state_dirty = true;
                         }
                     }
                 }
@@ -4024,6 +4077,7 @@ impl App {
     fn cycle_layout_preset(&mut self) {
         self.layout_state.preset = self.layout_state.preset.next();
         self.layout_state.reset_to_preset();
+        self.layout_state_dirty = true;
         self.set_ui_status(format!(
             "layout preset {}",
             self.layout_state.preset.label()
@@ -4048,19 +4102,34 @@ impl App {
                 let next = (self.layout_state.results_pct as i16 + delta)
                     .clamp(MIN_RESULTS_PCT as i16, max_results as i16);
                 self.layout_state.results_pct = next as u16;
+                self.layout_state_dirty = true;
             }
             ActiveSplit::GitTurns => {
                 let max_git = 100 - self.layout_state.results_pct - MIN_TURNS_PCT;
                 let next = (self.layout_state.git_pct as i16 + delta)
                     .clamp(MIN_GIT_PCT as i16, max_git as i16);
                 self.layout_state.git_pct = next as u16;
+                self.layout_state_dirty = true;
             }
             ActiveSplit::GitColumnVertical => {
                 let next = (self.layout_state.graph_pct as i16 + delta)
                     .clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16);
                 self.layout_state.graph_pct = next as u16;
+                self.layout_state_dirty = true;
             }
         }
+    }
+
+    fn persist_ui_state_if_dirty(&mut self) -> anyhow::Result<()> {
+        if !self.layout_state_dirty {
+            return Ok(());
+        }
+        let state = config::UiState {
+            layout: self.layout_state.to_ui_state(),
+        };
+        config::save_ui_state(&self.ui_state_path, &state)?;
+        self.layout_state_dirty = false;
+        Ok(())
     }
 
     fn log_group_enabled(&self, group: LogGroup) -> bool {
@@ -6786,6 +6855,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
+            ui_state_path: config::default_ui_state_path(),
+            layout_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -7490,6 +7561,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
+            ui_state_path: config::default_ui_state_path(),
+            layout_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -7586,6 +7659,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
+            ui_state_path: config::default_ui_state_path(),
+            layout_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -8180,6 +8255,44 @@ mod tests {
         assert_eq!(app.layout_state.preset, LayoutPreset::TurnsWide);
         assert_eq!(app.layout_state.results_pct, 18);
         assert_eq!(app.layout_state.git_pct, 22);
+    }
+
+    #[test]
+    fn layout_state_restores_saved_ratios_and_preset() {
+        let state = LayoutState::from_ui_state(&config::UiLayoutState {
+            preset: Some("git-wide".to_string()),
+            results_pct: Some(23),
+            git_pct: Some(35),
+            graph_pct: Some(72),
+        });
+
+        assert_eq!(state.preset, LayoutPreset::GitWide);
+        assert_eq!(state.results_pct, 23);
+        assert_eq!(state.git_pct, 35);
+        assert_eq!(state.graph_pct, 72);
+    }
+
+    #[test]
+    fn persist_ui_state_if_dirty_writes_current_layout() {
+        let tmp = TempDir::new("agent-history-ui-state");
+        let mut app = empty_app();
+        app.ui_state_path = tmp.path.join("ui-state.toml");
+        app.layout_state = LayoutState {
+            preset: LayoutPreset::TurnsWide,
+            results_pct: 27,
+            git_pct: 24,
+            graph_pct: 61,
+        };
+        app.layout_state_dirty = true;
+
+        app.persist_ui_state_if_dirty().unwrap();
+
+        let state = config::load_ui_state(Some(&app.ui_state_path)).unwrap();
+        assert_eq!(state.layout.preset.as_deref(), Some("turns-wide"));
+        assert_eq!(state.layout.results_pct, Some(27));
+        assert_eq!(state.layout.git_pct, Some(24));
+        assert_eq!(state.layout.graph_pct, Some(61));
+        assert!(!app.layout_state_dirty);
     }
 
     #[test]
@@ -8883,6 +8996,8 @@ mod tests {
             preview_bgcolor_cache: HashMap::new(),
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
+            ui_state_path: config::default_ui_state_path(),
+            layout_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
