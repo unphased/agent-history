@@ -163,10 +163,9 @@ enum LayoutPreset {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActivePane {
-    Results,
-    TurnPreview,
-    SessionBrowser(SessionBrowserPane),
+enum InputMode {
+    SessionSearch,
+    PreviewNav,
     GitGraph,
     GitCommit,
 }
@@ -2596,7 +2595,7 @@ struct App {
     git_commit_scroll: usize,
     git_graph_visible: bool,
     git_commit_visible: bool,
-    active_pane: ActivePane,
+    input_mode: InputMode,
     active_split: Option<ActiveSplit>,
     layout_state: LayoutState,
     dragged_split: Option<ActiveSplit>,
@@ -2708,7 +2707,7 @@ fn run_app(
         git_commit_scroll: 0,
         git_graph_visible: false,
         git_commit_visible: false,
-        active_pane: ActivePane::Results,
+        input_mode: InputMode::SessionSearch,
         active_split: None,
         layout_state: LayoutState::from_ui_state(&ui_state.layout),
         dragged_split: None,
@@ -2967,10 +2966,16 @@ fn handle_key(
     }
 
     if key.code == KeyCode::Esc {
-        return Ok(true);
+        if app.show_telemetry {
+            return Ok(true);
+        }
+        if matches!(app.input_mode, InputMode::SessionSearch) {
+            return Ok(false);
+        }
+        app.input_mode = InputMode::SessionSearch;
+        return Ok(false);
     }
 
-    // Accept query input even while indexing is still in progress.
     match key.code {
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
@@ -3181,6 +3186,151 @@ fn handle_key(
         _ => {}
     }
 
+    let text_input_active =
+        app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch);
+
+    // Accept query input even while indexing is still in progress.
+    match key.code {
+        KeyCode::Backspace => {
+            if app.show_telemetry {
+                if app.telemetry_cursor_pos > 0 {
+                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                    let prev_byte_pos =
+                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos - 1);
+                    app.telemetry_query
+                        .replace_range(prev_byte_pos..byte_pos, "");
+                    app.telemetry_cursor_pos -= 1;
+                    app.reset_telemetry_search();
+                }
+            } else if text_input_active && app.cursor_pos > 0 {
+                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                let prev_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos - 1);
+                app.query.replace_range(prev_byte_pos..byte_pos, "");
+                app.cursor_pos -= 1;
+                app.update_results();
+            }
+            return Ok(false);
+        }
+        KeyCode::Delete => {
+            if app.show_telemetry {
+                let char_count = app.telemetry_query.chars().count();
+                if app.telemetry_cursor_pos < char_count {
+                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                    let next_byte_pos =
+                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos + 1);
+                    app.telemetry_query
+                        .replace_range(byte_pos..next_byte_pos, "");
+                    app.reset_telemetry_search();
+                }
+            } else if text_input_active {
+                let char_count = app.query.chars().count();
+                if app.cursor_pos < char_count {
+                    let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                    let next_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos + 1);
+                    app.query.replace_range(byte_pos..next_byte_pos, "");
+                }
+                app.update_results();
+            }
+            return Ok(false);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.show_telemetry {
+                app.telemetry_query.clear();
+                app.telemetry_cursor_pos = 0;
+                app.reset_telemetry_search();
+            } else if text_input_active {
+                app.clear_query_and_filters();
+            }
+            return Ok(false);
+        }
+        KeyCode::Left => {
+            if app.show_telemetry {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.telemetry_cursor_pos =
+                        prev_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
+                } else {
+                    app.telemetry_cursor_pos = app.telemetry_cursor_pos.saturating_sub(1);
+                }
+            } else if text_input_active {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.cursor_pos = prev_word_boundary(&app.query, app.cursor_pos);
+                } else {
+                    app.cursor_pos = app.cursor_pos.saturating_sub(1);
+                }
+            }
+            return Ok(false);
+        }
+        KeyCode::Right => {
+            if app.show_telemetry {
+                let char_count = app.telemetry_query.chars().count();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.telemetry_cursor_pos =
+                        next_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
+                } else if app.telemetry_cursor_pos < char_count {
+                    app.telemetry_cursor_pos += 1;
+                }
+            } else if text_input_active {
+                let char_count = app.query.chars().count();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.cursor_pos = next_word_boundary(&app.query, app.cursor_pos);
+                } else if app.cursor_pos < char_count {
+                    app.cursor_pos += 1;
+                }
+            }
+            return Ok(false);
+        }
+        KeyCode::Home => {
+            if app.show_telemetry {
+                app.telemetry_cursor_pos = 0;
+            } else if text_input_active {
+                app.cursor_pos = 0;
+            }
+            return Ok(false);
+        }
+        KeyCode::End => {
+            if app.show_telemetry {
+                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
+            } else if text_input_active {
+                app.cursor_pos = app.query.chars().count();
+            }
+            return Ok(false);
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.show_telemetry {
+                app.telemetry_cursor_pos = 0;
+            } else if text_input_active {
+                app.cursor_pos = 0;
+            }
+            return Ok(false);
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.show_telemetry {
+                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
+            } else if text_input_active {
+                app.cursor_pos = app.query.chars().count();
+            }
+            return Ok(false);
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if app.show_telemetry {
+                let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
+                app.telemetry_query.insert(byte_pos, c);
+                app.telemetry_cursor_pos += 1;
+                app.reset_telemetry_search();
+            } else if text_input_active {
+                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
+                app.query.insert(byte_pos, c);
+                app.cursor_pos += 1;
+                app.update_results();
+            }
+            return Ok(false);
+        }
+        _ => {}
+    }
+
     if !app.ready {
         return Ok(false);
     }
@@ -3249,20 +3399,34 @@ fn handle_key(
                 }
             }
         }
-        KeyCode::Up => app.move_selection(-1),
-        KeyCode::Down => app.move_selection(1),
-        KeyCode::PageUp => {
+        KeyCode::Up if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
+            app.move_selection(-1)
+        }
+        KeyCode::Down
+            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
+        {
+            app.move_selection(1)
+        }
+        KeyCode::PageUp
+            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
+        {
             let preview_width = current_preview_inner_width(terminal, app)?;
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.scroll_preview_page(-1, preview_height, preview_width);
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown
+            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
+        {
             let preview_width = current_preview_inner_width(terminal, app)?;
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.scroll_preview_page(1, preview_height, preview_width);
         }
-        KeyCode::Home => app.select_first(),
-        KeyCode::End => app.select_last(),
+        KeyCode::Home if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
+            app.select_first()
+        }
+        KeyCode::End if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
+            app.select_last()
+        }
         _ => {}
     }
 
@@ -3725,11 +3889,11 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 if let Some(git_graph) = geometry.git_graph
                     && point_in_rect(mouse.column, mouse.row, git_graph)
                 {
-                    app.active_pane = ActivePane::GitGraph;
+                    app.input_mode = InputMode::GitGraph;
                 } else if let Some(git_commit) = geometry.git_commit
                     && point_in_rect(mouse.column, mouse.row, git_commit)
                 {
-                    app.active_pane = ActivePane::GitCommit;
+                    app.input_mode = InputMode::GitCommit;
                 } else if let Some(turn_start) = geometry.turn_start
                     && point_in_rect(mouse.column, mouse.row, turn_start)
                 {
@@ -3739,9 +3903,9 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 {
                     app.set_session_browser_active_pane(SessionBrowserPane::End);
                 } else if point_in_rect(mouse.column, mouse.row, geometry.turn_preview) {
-                    app.active_pane = ActivePane::TurnPreview;
+                    app.input_mode = InputMode::PreviewNav;
                 } else if point_in_rect(mouse.column, mouse.row, results_area) {
-                    app.active_pane = ActivePane::Results;
+                    app.input_mode = InputMode::SessionSearch;
                 }
             }
         }
@@ -3760,7 +3924,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     if preview_width > 0 {
                         app.preview_scroll_reset_pending = false;
                     }
-                    app.active_pane = ActivePane::TurnPreview;
+                    app.input_mode = InputMode::PreviewNav;
                 }
             }
         }
@@ -3768,14 +3932,14 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
             if let Some(git_graph) = geometry.git_graph
                 && point_in_rect(mouse.column, mouse.row, git_graph)
             {
-                app.active_pane = ActivePane::GitGraph;
+                app.input_mode = InputMode::GitGraph;
                 app.git_graph_scroll = app
                     .git_graph_scroll
                     .saturating_sub(preview_line_step as usize);
             } else if let Some(git_commit) = geometry.git_commit
                 && point_in_rect(mouse.column, mouse.row, git_commit)
             {
-                app.active_pane = ActivePane::GitCommit;
+                app.input_mode = InputMode::GitCommit;
                 app.git_commit_scroll = app
                     .git_commit_scroll
                     .saturating_sub(preview_line_step as usize);
@@ -3810,14 +3974,14 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
             if let Some(git_graph) = geometry.git_graph
                 && point_in_rect(mouse.column, mouse.row, git_graph)
             {
-                app.active_pane = ActivePane::GitGraph;
+                app.input_mode = InputMode::GitGraph;
                 app.git_graph_scroll = app
                     .git_graph_scroll
                     .saturating_add(preview_line_step as usize);
             } else if let Some(git_commit) = geometry.git_commit
                 && point_in_rect(mouse.column, mouse.row, git_commit)
             {
-                app.active_pane = ActivePane::GitCommit;
+                app.input_mode = InputMode::GitCommit;
                 app.git_commit_scroll = app
                     .git_commit_scroll
                     .saturating_add(preview_line_step as usize);
@@ -3916,11 +4080,9 @@ fn current_preview_area(
             geometry.root.width,
             geometry.root.height.saturating_sub(1),
         )
-    } else if let Some(area) = match app.active_pane {
-        ActivePane::GitGraph => geometry.git_graph,
-        ActivePane::GitCommit => geometry.git_commit,
-        ActivePane::SessionBrowser(SessionBrowserPane::Start) => geometry.turn_start,
-        ActivePane::SessionBrowser(SessionBrowserPane::End) => geometry.turn_end,
+    } else if let Some(area) = match app.input_mode {
+        InputMode::GitGraph => geometry.git_graph,
+        InputMode::GitCommit => geometry.git_commit,
         _ => Some(geometry.turn_preview),
     } {
         area
@@ -4053,9 +4215,11 @@ impl App {
         self.git_graph_visible = !self.git_graph_visible;
         if !self.git_graph_visible {
             self.git_commit_visible = false;
-            self.active_pane = ActivePane::TurnPreview;
+            if matches!(self.input_mode, InputMode::GitGraph | InputMode::GitCommit) {
+                self.input_mode = InputMode::PreviewNav;
+            }
         } else {
-            self.active_pane = ActivePane::GitGraph;
+            self.input_mode = InputMode::GitGraph;
         }
         self.active_split = None;
         self.dragged_split = None;
@@ -4064,13 +4228,16 @@ impl App {
 
     fn toggle_git_commit(&mut self) {
         if !self.git_graph_visible {
+            self.git_graph_visible = true;
+            self.git_commit_visible = true;
+            self.input_mode = InputMode::GitCommit;
             return;
         }
         self.git_commit_visible = !self.git_commit_visible;
         if self.git_commit_visible {
-            self.active_pane = ActivePane::GitCommit;
-        } else if matches!(self.active_pane, ActivePane::GitCommit) {
-            self.active_pane = ActivePane::GitGraph;
+            self.input_mode = InputMode::GitCommit;
+        } else if matches!(self.input_mode, InputMode::GitCommit) {
+            self.input_mode = InputMode::GitGraph;
         }
     }
 
@@ -4891,20 +5058,14 @@ impl App {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
-            if !matches!(
-                self.active_pane,
-                ActivePane::GitGraph | ActivePane::GitCommit
-            ) {
-                self.active_pane = ActivePane::TurnPreview;
+            if !matches!(self.input_mode, InputMode::GitGraph | InputMode::GitCommit) {
+                self.input_mode = InputMode::PreviewNav;
             }
             self.preview_scroll_reset_pending = true;
         } else {
             self.preview_scroll_reset_pending = true;
-            if !matches!(
-                self.active_pane,
-                ActivePane::GitGraph | ActivePane::GitCommit
-            ) {
-                self.active_pane = ActivePane::TurnPreview;
+            if !matches!(self.input_mode, InputMode::GitGraph | InputMode::GitCommit) {
+                self.input_mode = InputMode::PreviewNav;
             }
         }
         self.git_graph_scroll = 0;
@@ -5681,13 +5842,13 @@ impl App {
             self.preview_scroll_reset_pending = false;
             return;
         }
-        match self.active_pane {
-            ActivePane::GitGraph => {
+        match self.input_mode {
+            InputMode::GitGraph => {
                 let cur = self.git_graph_scroll as i32;
                 self.git_graph_scroll = cmp::max(0, cur + delta) as usize;
                 return;
             }
-            ActivePane::GitCommit => {
+            InputMode::GitCommit => {
                 let cur = self.git_commit_scroll as i32;
                 self.git_commit_scroll = cmp::max(0, cur + delta) as usize;
                 return;
@@ -5847,7 +6008,7 @@ impl App {
 
     fn set_session_browser_active_pane(&mut self, pane: SessionBrowserPane) {
         self.session_browser_active_pane = pane;
-        self.active_pane = ActivePane::SessionBrowser(pane);
+        self.input_mode = InputMode::PreviewNav;
     }
 }
 
@@ -6133,7 +6294,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let graph_total_lines = preview_visual_line_count(&graph_doc.lines, graph_inner_width);
         let graph_max_scroll = graph_total_lines.saturating_sub(graph_inner_height);
         app.git_graph_scroll = cmp::min(app.git_graph_scroll, graph_max_scroll);
-        let border_style = if matches!(app.active_pane, ActivePane::GitGraph) {
+        let border_style = if matches!(app.input_mode, InputMode::GitGraph) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -6159,7 +6320,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let commit_total_lines = preview_visual_line_count(&commit_doc.lines, commit_inner_width);
         let commit_max_scroll = commit_total_lines.saturating_sub(commit_inner_height);
         app.git_commit_scroll = cmp::min(app.git_commit_scroll, commit_max_scroll);
-        let border_style = if matches!(app.active_pane, ActivePane::GitCommit) {
+        let border_style = if matches!(app.input_mode, InputMode::GitCommit) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -6832,7 +6993,7 @@ mod tests {
             git_commit_scroll: 0,
             git_graph_visible: false,
             git_commit_visible: false,
-            active_pane: ActivePane::Results,
+            input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
@@ -7538,7 +7699,7 @@ mod tests {
             git_commit_scroll: 0,
             git_graph_visible: false,
             git_commit_visible: false,
-            active_pane: ActivePane::Results,
+            input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
@@ -7636,7 +7797,7 @@ mod tests {
             git_commit_scroll: 0,
             git_graph_visible: false,
             git_commit_visible: false,
-            active_pane: ActivePane::Results,
+            input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
@@ -8973,7 +9134,7 @@ mod tests {
             git_commit_scroll: 0,
             git_graph_visible: false,
             git_commit_visible: false,
-            active_pane: ActivePane::Results,
+            input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
