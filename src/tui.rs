@@ -212,9 +212,12 @@ struct GitMatch {
 
 #[derive(Debug, Clone)]
 struct RemoteGitUnavailable {
+    reason: String,
     remote_repo_root: Option<String>,
+    remote_cwd: Option<String>,
     search_root: PathBuf,
     candidate_count: usize,
+    candidate_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -3848,6 +3851,33 @@ fn current_preview_inner_height(
 }
 
 impl App {
+    fn find_local_repo_candidates(&mut self, search_root: &Path, basename: &str) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for entry in WalkDir::new(search_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy() != basename {
+                continue;
+            }
+            let path = entry.into_path();
+            let Some(repo_root) = self.resolve_repo_root(&path.to_string_lossy()) else {
+                continue;
+            };
+            if !candidates
+                .iter()
+                .any(|candidate: &PathBuf| candidate == &repo_root)
+            {
+                candidates.push(repo_root);
+            }
+        }
+        candidates
+    }
+
     fn refresh_remote_sync_states(&mut self) {
         let states = self
             .cache_path
@@ -4109,17 +4139,32 @@ impl App {
             });
         }
 
+        let search_root = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let cwd_basename = rec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| Path::new(cwd).file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string);
         let Some(remote_repo_root) = rec
             .git_repo_root
             .as_deref()
             .filter(|root| !root.trim().is_empty())
         else {
+            let candidate_paths = cwd_basename
+                .as_deref()
+                .map(|basename| self.find_local_repo_candidates(&search_root, basename))
+                .unwrap_or_default();
             return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                reason: "remote cache is missing git repo metadata".to_string(),
                 remote_repo_root: None,
-                search_root: env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("~")),
-                candidate_count: 0,
+                remote_cwd: rec.cwd.clone(),
+                search_root,
+                candidate_count: candidate_paths.len(),
+                candidate_paths,
             });
         };
         let basename = Path::new(remote_repo_root)
@@ -4128,16 +4173,14 @@ impl App {
             .filter(|name| !name.trim().is_empty());
         let Some(basename) = basename else {
             return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                reason: "remote repo metadata had no usable basename".to_string(),
                 remote_repo_root: Some(remote_repo_root.to_string()),
-                search_root: env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("~")),
+                remote_cwd: rec.cwd.clone(),
+                search_root,
                 candidate_count: 0,
+                candidate_paths: Vec::new(),
             });
         };
-        let search_root = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"));
         let expected_remotes = rec
             .git_remotes
             .values()
@@ -4145,10 +4188,14 @@ impl App {
             .filter(|url| !url.is_empty())
             .collect::<std::collections::HashSet<_>>();
         if expected_remotes.is_empty() {
+            let candidate_paths = self.find_local_repo_candidates(&search_root, basename);
             return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                reason: "remote cache is missing git remote URLs for validation".to_string(),
                 remote_repo_root: Some(remote_repo_root.to_string()),
+                remote_cwd: rec.cwd.clone(),
                 search_root,
-                candidate_count: 0,
+                candidate_count: candidate_paths.len(),
+                candidate_paths,
             });
         }
         let mut normalized_remotes = expected_remotes.iter().cloned().collect::<Vec<_>>();
@@ -4169,22 +4216,8 @@ impl App {
             };
         }
         let mut candidates = Vec::new();
-
-        for entry in WalkDir::new(&search_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_dir() {
-                continue;
-            }
-            if entry.file_name().to_string_lossy() != basename {
-                continue;
-            }
-            let path = entry.into_path();
-            let Some(repo_root) = self.resolve_repo_root(&path.to_string_lossy()) else {
-                continue;
-            };
+        let candidate_paths = self.find_local_repo_candidates(&search_root, basename);
+        for repo_root in candidate_paths.iter().cloned() {
             let Ok(repo) = self.git_repo_context(&repo_root) else {
                 continue;
             };
@@ -4202,12 +4235,7 @@ impl App {
             {
                 continue;
             }
-            if !candidates
-                .iter()
-                .any(|candidate: &PathBuf| candidate == &repo_root)
-            {
-                candidates.push(repo_root);
-            }
+            candidates.push(repo_root);
         }
 
         if candidates.len() == 1 {
@@ -4224,9 +4252,12 @@ impl App {
         }
 
         let unavailable = RemoteGitUnavailable {
+            reason: "no local repo matched the remote URL set".to_string(),
             remote_repo_root: Some(remote_repo_root.to_string()),
+            remote_cwd: rec.cwd.clone(),
             search_root,
             candidate_count: candidates.len(),
+            candidate_paths,
         };
         self.remote_git_lookup_cache
             .insert(cache_key, RemoteGitLookup::Unavailable(unavailable.clone()));
@@ -5236,20 +5267,42 @@ impl App {
         let git_match = match self.selected_git_view_state(preview_width, preview_height) {
             GitViewState::Available(git_match) => git_match,
             GitViewState::RemoteUnavailable(unavailable) => {
-                return GitPaneDoc {
-                    lines: vec![
-                        Line::raw("git: no validated local repo match"),
-                        Line::raw(format!(
-                            "remote repo: {}",
-                            unavailable
-                                .remote_repo_root
-                                .as_deref()
-                                .unwrap_or("(missing)")
-                        )),
-                        Line::raw(format!("searched: {}", unavailable.search_root.display())),
-                        Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
-                    ],
-                };
+                let mut lines = vec![
+                    Line::raw("git: remote fallback unavailable"),
+                    Line::raw(format!("reason: {}", unavailable.reason)),
+                ];
+                if let Some(remote_cwd) = unavailable.remote_cwd.as_deref() {
+                    lines.push(Line::raw(format!("remote cwd: {remote_cwd}")));
+                }
+                lines.push(Line::raw(format!(
+                    "remote repo: {}",
+                    unavailable
+                        .remote_repo_root
+                        .as_deref()
+                        .unwrap_or("(missing)")
+                )));
+                lines.push(Line::raw(format!(
+                    "searched: {}",
+                    unavailable.search_root.display()
+                )));
+                lines.push(Line::raw(format!(
+                    "local repo candidates: {}",
+                    unavailable.candidate_paths.len()
+                )));
+                for candidate in unavailable.candidate_paths.iter().take(6) {
+                    lines.push(Line::raw(format!("candidate: {}", candidate.display())));
+                }
+                if unavailable.candidate_paths.len() > 6 {
+                    lines.push(Line::raw(format!(
+                        "candidate: … {} more",
+                        unavailable.candidate_paths.len() - 6
+                    )));
+                }
+                lines.push(Line::raw(format!(
+                    "validated matches: {}",
+                    unavailable.candidate_count
+                )));
+                return GitPaneDoc { lines };
             }
             GitViewState::Unavailable => {
                 return GitPaneDoc {
@@ -5317,20 +5370,42 @@ impl App {
         let git_match = match self.selected_git_view_state(preview_width, preview_height) {
             GitViewState::Available(git_match) => git_match,
             GitViewState::RemoteUnavailable(unavailable) => {
-                return GitPaneDoc {
-                    lines: vec![
-                        Line::raw("git commit preview unavailable"),
-                        Line::raw(format!(
-                            "remote repo: {}",
-                            unavailable
-                                .remote_repo_root
-                                .as_deref()
-                                .unwrap_or("(missing)")
-                        )),
-                        Line::raw(format!("searched: {}", unavailable.search_root.display())),
-                        Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
-                    ],
-                };
+                let mut lines = vec![
+                    Line::raw("git commit preview unavailable"),
+                    Line::raw(format!("reason: {}", unavailable.reason)),
+                ];
+                if let Some(remote_cwd) = unavailable.remote_cwd.as_deref() {
+                    lines.push(Line::raw(format!("remote cwd: {remote_cwd}")));
+                }
+                lines.push(Line::raw(format!(
+                    "remote repo: {}",
+                    unavailable
+                        .remote_repo_root
+                        .as_deref()
+                        .unwrap_or("(missing)")
+                )));
+                lines.push(Line::raw(format!(
+                    "searched: {}",
+                    unavailable.search_root.display()
+                )));
+                lines.push(Line::raw(format!(
+                    "local repo candidates: {}",
+                    unavailable.candidate_paths.len()
+                )));
+                for candidate in unavailable.candidate_paths.iter().take(6) {
+                    lines.push(Line::raw(format!("candidate: {}", candidate.display())));
+                }
+                if unavailable.candidate_paths.len() > 6 {
+                    lines.push(Line::raw(format!(
+                        "candidate: … {} more",
+                        unavailable.candidate_paths.len() - 6
+                    )));
+                }
+                lines.push(Line::raw(format!(
+                    "validated matches: {}",
+                    unavailable.candidate_count
+                )));
+                return GitPaneDoc { lines };
             }
             GitViewState::Unavailable => {
                 return GitPaneDoc {
@@ -7964,9 +8039,55 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("git: no validated local repo match"));
+        assert!(rendered.contains("git: remote fallback unavailable"));
+        assert!(
+            rendered.contains("reason: remote cache is missing git remote URLs for validation")
+        );
         assert!(rendered.contains("remote repo: /home/slu/project"));
-        assert!(rendered.contains("matching repos: 0"));
+        assert!(rendered.contains("validated matches: 0"));
+    }
+
+    #[test]
+    fn remote_git_doc_explains_missing_remote_repo_metadata() {
+        let mut app = ready_app_with_indexed_data(vec![MessageRecord {
+            timestamp: Some("2026-04-14T17:15:00Z".to_string()),
+            role: Role::User,
+            text: "remote turn".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("remote-session".to_string()),
+            account: None,
+            cwd: Some("/home/slu/instrumenter".to_string()),
+            phase: None,
+            images: Vec::new(),
+            machine_id: "remote-host".to_string(),
+            machine_name: "remote-host".to_string(),
+            project_slug: Some("instrumenter".to_string()),
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
+            origin: "remote".to_string(),
+            source: SourceKind::CodexSessionJsonl,
+        }]);
+        app.git_graph_visible = true;
+        app.git_commit_visible = true;
+        app.update_results();
+
+        let doc = app.build_git_graph_doc(80, 20);
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("reason: remote cache is missing git repo metadata"));
+        assert!(rendered.contains("remote cwd: /home/slu/instrumenter"));
+        assert!(rendered.contains("remote repo: (missing)"));
     }
 
     #[test]
