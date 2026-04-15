@@ -2976,15 +2976,31 @@ fn handle_key(
         return Ok(false);
     }
 
+    if !app.show_telemetry {
+        match key.code {
+            KeyCode::Tab => {
+                app.input_mode = app.next_input_mode();
+                return Ok(false);
+            }
+            KeyCode::BackTab => {
+                app.input_mode = app.prev_input_mode();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_record(-1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.jump_preview_record(-1, preview_width, preview_height);
             return Ok(false);
         }
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_record(1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.jump_preview_record(1, preview_width, preview_height);
             return Ok(false);
         }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3398,6 +3414,34 @@ fn handle_key(
                     }
                 }
             }
+        }
+        KeyCode::Char('k') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.jump_preview_record(-1, preview_width, preview_height);
+        }
+        KeyCode::Char('j') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.jump_preview_record(1, preview_width, preview_height);
+        }
+        KeyCode::Up if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.scroll_preview_lines(-1, preview_width);
+        }
+        KeyCode::Down if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.scroll_preview_lines(1, preview_width);
+        }
+        KeyCode::PageUp if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(-1, preview_height, preview_width);
+        }
+        KeyCode::PageDown if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(1, preview_height, preview_width);
         }
         KeyCode::Up if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
             app.move_selection(-1)
@@ -4109,6 +4153,52 @@ fn current_preview_inner_height(
 }
 
 impl App {
+    fn next_input_mode(&self) -> InputMode {
+        match self.input_mode {
+            InputMode::SessionSearch => {
+                if self.git_graph_visible {
+                    InputMode::GitGraph
+                } else {
+                    InputMode::PreviewNav
+                }
+            }
+            InputMode::GitGraph => {
+                if self.git_commit_visible {
+                    InputMode::GitCommit
+                } else {
+                    InputMode::PreviewNav
+                }
+            }
+            InputMode::GitCommit => InputMode::PreviewNav,
+            InputMode::PreviewNav => InputMode::SessionSearch,
+        }
+    }
+
+    fn prev_input_mode(&self) -> InputMode {
+        match self.input_mode {
+            InputMode::SessionSearch => {
+                if self.git_commit_visible {
+                    InputMode::GitCommit
+                } else if self.git_graph_visible {
+                    InputMode::GitGraph
+                } else {
+                    InputMode::PreviewNav
+                }
+            }
+            InputMode::PreviewNav => {
+                if self.git_commit_visible {
+                    InputMode::GitCommit
+                } else if self.git_graph_visible {
+                    InputMode::GitGraph
+                } else {
+                    InputMode::SessionSearch
+                }
+            }
+            InputMode::GitCommit => InputMode::GitGraph,
+            InputMode::GitGraph => InputMode::SessionSearch,
+        }
+    }
+
     fn find_local_repo_candidate(&self, search_root: &Path, basename: &str) -> Option<PathBuf> {
         let basename = basename.trim();
         if basename.is_empty() {
@@ -4167,6 +4257,41 @@ impl App {
                 .position(|line_record_idx| *line_record_idx == Some(record_idx))
         {
             self.preview_scroll = preview_visual_line_offset(&doc.lines, raw_line, preview_width);
+        }
+        self.preview_scroll_reset_pending = false;
+    }
+
+    fn select_preview_record_minimal_reveal(
+        &mut self,
+        doc: &PreviewDoc,
+        preview_width: usize,
+        preview_height: usize,
+        record_idx: usize,
+    ) {
+        if preview_width == 0 || preview_height == 0 {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let Some(raw_line) = doc
+            .line_record_indices
+            .iter()
+            .position(|line_record_idx| *line_record_idx == Some(record_idx))
+        else {
+            self.preview_scroll_reset_pending = false;
+            return;
+        };
+        let target_offset = preview_visual_line_offset(&doc.lines, raw_line, preview_width);
+        let viewport_start = self.preview_scroll;
+        let viewport_end = viewport_start.saturating_add(preview_height);
+        if target_offset < viewport_start {
+            self.select_preview_record(doc, preview_width, record_idx, true);
+            return;
+        } else if target_offset >= viewport_end {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll = target_offset.saturating_sub(preview_height.saturating_sub(1));
+        } else {
+            self.selected_preview_record_idx = Some(record_idx);
         }
         self.preview_scroll_reset_pending = false;
     }
@@ -5058,15 +5183,9 @@ impl App {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
-            if !matches!(self.input_mode, InputMode::GitGraph | InputMode::GitCommit) {
-                self.input_mode = InputMode::PreviewNav;
-            }
             self.preview_scroll_reset_pending = true;
         } else {
             self.preview_scroll_reset_pending = true;
-            if !matches!(self.input_mode, InputMode::GitGraph | InputMode::GitCommit) {
-                self.input_mode = InputMode::PreviewNav;
-            }
         }
         self.git_graph_scroll = 0;
         self.git_commit_scroll = 0;
@@ -5873,8 +5992,8 @@ impl App {
         self.scroll_preview_lines(delta, preview_width);
     }
 
-    fn jump_preview_record(&mut self, dir: i32, preview_width: usize) {
-        if self.show_telemetry || preview_width == 0 {
+    fn jump_preview_record(&mut self, dir: i32, preview_width: usize, preview_height: usize) {
+        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
             return;
         }
 
@@ -5905,7 +6024,12 @@ impl App {
                 .checked_sub(1)
                 .unwrap_or(section_records.len() - 1)
         };
-        self.select_preview_record(&doc, preview_width, section_records[target_pos], true);
+        self.select_preview_record_minimal_reveal(
+            &doc,
+            preview_width,
+            preview_height,
+            section_records[target_pos],
+        );
     }
 
     fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
@@ -8885,12 +9009,12 @@ mod tests {
         app.update_results();
         assert!(app.showing_session_browser());
 
-        app.jump_preview_record(1, 80);
+        app.jump_preview_record(1, 80, 6);
         assert!(app.preview_scroll > 0);
     }
 
     #[test]
-    fn jump_preview_record_aligns_target_turn_to_top_of_pane() {
+    fn jump_preview_record_minimally_reveals_target_turn() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:01Z"),
@@ -8919,12 +9043,14 @@ mod tests {
         let doc = app.session_browser_doc();
         let starts = preview_section_start_lines(&doc.line_record_indices);
         app.preview_scroll = preview_visual_line_offset(&doc.lines, starts[0], 80);
+        let preview_height = 3;
 
-        app.jump_preview_record(1, 80);
+        app.jump_preview_record(1, 80, preview_height);
 
         assert_eq!(
             app.preview_scroll,
             preview_visual_line_offset(&doc.lines, starts[1], 80)
+                .saturating_sub(preview_height.saturating_sub(1))
         );
     }
 
@@ -8960,7 +9086,7 @@ mod tests {
         app.preview_scroll = preview_visual_line_offset(&doc.lines, *starts.last().unwrap(), 80);
         app.sync_selected_preview_record_from_scroll(80);
 
-        app.jump_preview_record(1, 80);
+        app.jump_preview_record(1, 80, 6);
 
         assert_eq!(
             app.preview_scroll,
