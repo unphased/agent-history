@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct RemoteSyncStatus {
@@ -122,7 +122,7 @@ impl CacheStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin \
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, git_repo_root, git_remotes_json, origin \
                  FROM message_records WHERE unit_key IN ({placeholders}) ORDER BY unit_key, ord"
             );
             let mut stmt = self
@@ -146,7 +146,12 @@ impl CacheStore {
                     machine_id: row.get(11)?,
                     machine_name: row.get(12)?,
                     project_slug: row.get(13)?,
-                    origin: row.get(14)?,
+                    git_repo_root: row.get(14)?,
+                    git_remotes: serde_json::from_str::<HashMap<String, String>>(
+                        &row.get::<_, String>(15)?,
+                    )
+                    .unwrap_or_default(),
+                    origin: row.get(16)?,
                 })
             })?;
             for row in rows {
@@ -164,7 +169,7 @@ impl CacheStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
+                "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, git_repo_root, git_remotes_json, origin
                  FROM message_records WHERE origin = ?1 ORDER BY unit_key, ord",
             )
             .context("cache origin record query failed")?;
@@ -199,8 +204,8 @@ impl CacheStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO message_records (
-                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, origin
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                        unit_key, ord, timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, git_repo_root, git_remotes_json, origin
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 )
                 .context("cache record statement failed")?;
 
@@ -222,6 +227,8 @@ impl CacheStore {
                     rec.machine_id,
                     rec.machine_name,
                     rec.project_slug,
+                    rec.git_repo_root,
+                    serde_json::to_string(&rec.git_remotes).unwrap_or_else(|_| "{}".to_string()),
                     rec.origin,
                 ])
                 .context("cache record insert failed")?;
@@ -383,6 +390,8 @@ impl CacheStore {
                     machine_id TEXT NOT NULL DEFAULT '',
                     machine_name TEXT NOT NULL DEFAULT '',
                     project_slug TEXT,
+                    git_repo_root TEXT,
+                    git_remotes_json TEXT NOT NULL DEFAULT '{}',
                     origin TEXT NOT NULL DEFAULT 'local',
                     PRIMARY KEY (unit_key, ord),
                     FOREIGN KEY (unit_key) REFERENCES source_units(unit_key) ON DELETE CASCADE
@@ -401,7 +410,7 @@ impl CacheStore {
                  );
                  CREATE INDEX IF NOT EXISTS idx_message_records_session_id ON message_records(session_id);
                  CREATE INDEX IF NOT EXISTS idx_message_records_origin ON message_records(origin);
-                 PRAGMA user_version = 4;",
+                 PRAGMA user_version = 5;",
             )
             .context("cache schema create failed")?;
 
@@ -458,17 +467,16 @@ pub fn load_records_from_remote_db(
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap_or(0);
-    if version != SCHEMA_VERSION {
+    if version != 4 && version != SCHEMA_VERSION {
         anyhow::bail!(
-            "remote cache schema mismatch: expected {SCHEMA_VERSION}, got {version} ({})",
+            "remote cache schema mismatch: expected 4 or {SCHEMA_VERSION}, got {version} ({})",
             db_path.display()
         );
     }
 
     let mut stmt = conn
         .prepare(
-            "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug
-             FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord",
+            &remote_message_records_query(version, false),
         )
         .context("remote cache record query failed")?;
     let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
@@ -529,17 +537,16 @@ pub fn stream_records_from_remote_db(
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap_or(0);
-    if version != SCHEMA_VERSION {
+    if version != 4 && version != SCHEMA_VERSION {
         anyhow::bail!(
-            "remote cache schema mismatch: expected {SCHEMA_VERSION}, got {version} ({})",
+            "remote cache schema mismatch: expected 4 or {SCHEMA_VERSION}, got {version} ({})",
             db_path.display()
         );
     }
 
     let mut stmt = conn
         .prepare(
-            "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug
-             FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord",
+            &remote_message_records_query(version, false),
         )
         .context("remote cache record query failed")?;
     let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
@@ -639,11 +646,23 @@ fn decode_message_record_row(
         machine_id: row.get(11)?,
         machine_name: row.get(12)?,
         project_slug: row.get(13)?,
+        git_repo_root: row.get(14)?,
+        git_remotes: serde_json::from_str::<HashMap<String, String>>(&row.get::<_, String>(15)?)
+            .unwrap_or_default(),
         origin: match origin_override {
             Some(origin) => origin.to_string(),
-            None => row.get(14)?,
+            None => row.get(16)?,
         },
     })
+}
+
+fn remote_message_records_query(version: i64, include_origin: bool) -> String {
+    match (version, include_origin) {
+        (4, false) => "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, NULL AS git_repo_root, '{}' AS git_remotes_json FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord".to_string(),
+        (4, true) => "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, NULL AS git_repo_root, '{}' AS git_remotes_json, origin FROM message_records ORDER BY unit_key, ord".to_string(),
+        (_, false) => "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, git_repo_root, git_remotes_json FROM message_records WHERE origin = 'local' ORDER BY unit_key, ord".to_string(),
+        (_, true) => "SELECT timestamp, role, text, file, line, session_id, account, cwd, phase, images_json, source, machine_id, machine_name, project_slug, git_repo_root, git_remotes_json, origin FROM message_records ORDER BY unit_key, ord".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -692,6 +711,8 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "local".to_string(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: "local".to_string(),
             source: SourceKind::CodexSessionJsonl,
         };

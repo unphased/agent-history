@@ -37,6 +37,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -205,12 +206,34 @@ struct GitMatch {
     repo_root: PathBuf,
     anchor_ts: i64,
     selected_commit_idx: usize,
+    guessed_from_remote: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteGitUnavailable {
+    remote_repo_root: Option<String>,
+    search_root: PathBuf,
+    candidate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum GitViewState {
+    Available(GitMatch),
+    RemoteUnavailable(RemoteGitUnavailable),
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+enum RemoteGitLookup {
+    Resolved(PathBuf),
+    Unavailable(RemoteGitUnavailable),
 }
 
 #[derive(Debug, Clone)]
 struct GitRepoContext {
     repo_root: PathBuf,
     commits: Vec<GitCommitEntry>,
+    remotes: HashMap<String, String>,
     graph_lines: Vec<String>,
     graph_line_commit_indices: Vec<Option<usize>>,
 }
@@ -2467,6 +2490,7 @@ struct App {
     remotes: HashMap<String, config::RemoteConfig>,
     git_repo_cache: HashMap<PathBuf, GitRepoContext>,
     git_commit_preview_cache: HashMap<(PathBuf, String), Vec<String>>,
+    remote_git_lookup_cache: HashMap<String, RemoteGitLookup>,
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -2571,6 +2595,7 @@ fn run_app(
         remotes,
         git_repo_cache: HashMap::new(),
         git_commit_preview_cache: HashMap::new(),
+        remote_git_lookup_cache: HashMap::new(),
     };
 
     if let Some(path) = app.telemetry_log_path.as_ref() {
@@ -3232,6 +3257,49 @@ fn parse_git_graph_hash_field(field: &str) -> Option<&str> {
     })
 }
 
+fn normalize_git_remote_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let without_suffix = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    if let Some(rest) = without_suffix.strip_prefix("git@")
+        && let Some((host, path)) = rest.split_once(':')
+    {
+        return format!(
+            "{}/{}",
+            host.to_ascii_lowercase(),
+            path.trim_start_matches('/').to_ascii_lowercase()
+        );
+    }
+    if let Some(rest) = without_suffix.strip_prefix("ssh://") {
+        let rest = rest
+            .strip_prefix("git@")
+            .or_else(|| rest.split_once('@').map(|(_, r)| r))
+            .unwrap_or(rest);
+        if let Some((host, path)) = rest.split_once('/') {
+            return format!(
+                "{}/{}",
+                host.to_ascii_lowercase(),
+                path.trim_start_matches('/').to_ascii_lowercase()
+            );
+        }
+    }
+    if let Some(rest) = without_suffix.strip_prefix("https://").or_else(|| without_suffix.strip_prefix("http://")) {
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        if let Some((host, path)) = rest.split_once('/') {
+            return format!(
+                "{}/{}",
+                host.to_ascii_lowercase(),
+                path.trim_start_matches('/').to_ascii_lowercase()
+            );
+        }
+    }
+
+    without_suffix.to_ascii_lowercase()
+}
+
 fn selected_git_commit_idx(commits: &[GitCommitEntry], anchor_ts: i64) -> Option<usize> {
     if commits.is_empty() {
         return None;
@@ -3862,30 +3930,39 @@ impl App {
         self.enabled_log_groups.contains(&group)
     }
 
-    fn selected_git_match(
+    fn selected_git_view_state(
         &mut self,
         preview_width: usize,
         preview_height: usize,
-    ) -> Option<GitMatch> {
+    ) -> GitViewState {
         if self.show_telemetry || !self.git_graph_visible {
-            return None;
+            return GitViewState::Unavailable;
         }
-        let anchor_record_idx = self.selected_anchor_record_idx(preview_width, preview_height)?;
-        let rec = self.all.get(anchor_record_idx)?;
-        let cwd = rec.cwd.as_deref()?.trim();
-        if cwd.is_empty() {
-            return None;
+        let Some(anchor_record_idx) = self.selected_anchor_record_idx(preview_width, preview_height) else {
+            return GitViewState::Unavailable;
+        };
+        let Some(rec) = self.all.get(anchor_record_idx).cloned() else {
+            return GitViewState::Unavailable;
+        };
+        let Some(anchor_ts) = rec.timestamp.as_deref().and_then(parse_timestamp_epoch) else {
+            return GitViewState::Unavailable;
+        };
+
+        match self.resolve_git_repo_for_record(&rec) {
+            GitViewState::Available(mut git_match) => {
+                git_match.anchor_record_idx = anchor_record_idx;
+                git_match.anchor_ts = anchor_ts;
+                let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
+                    return GitViewState::Unavailable;
+                };
+                let Some(selected_commit_idx) = selected_git_commit_idx(&repo.commits, anchor_ts) else {
+                    return GitViewState::Unavailable;
+                };
+                git_match.selected_commit_idx = selected_commit_idx;
+                GitViewState::Available(git_match)
+            }
+            state => state,
         }
-        let repo_root = self.resolve_repo_root(cwd)?;
-        let anchor_ts = parse_timestamp_epoch(rec.timestamp.as_deref()?)?;
-        let repo = self.git_repo_context(&repo_root).ok()?;
-        let selected_commit_idx = selected_git_commit_idx(&repo.commits, anchor_ts)?;
-        Some(GitMatch {
-            anchor_record_idx,
-            repo_root,
-            anchor_ts,
-            selected_commit_idx,
-        })
     }
 
     fn selected_anchor_record_idx(
@@ -3929,6 +4006,144 @@ impl App {
         (!repo_root.is_empty()).then(|| PathBuf::from(repo_root))
     }
 
+    fn resolve_git_repo_for_record(&mut self, rec: &MessageRecord) -> GitViewState {
+        if rec.origin == "local" {
+            let Some(cwd) = rec.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+                return GitViewState::Unavailable;
+            };
+            let Some(repo_root) = self.resolve_repo_root(cwd) else {
+                return GitViewState::Unavailable;
+            };
+            return GitViewState::Available(GitMatch {
+                anchor_record_idx: 0,
+                repo_root,
+                anchor_ts: 0,
+                selected_commit_idx: 0,
+                guessed_from_remote: None,
+            });
+        }
+
+        let Some(remote_repo_root) = rec.git_repo_root.as_deref().filter(|root| !root.trim().is_empty()) else {
+            return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                remote_repo_root: None,
+                search_root: env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("~")),
+                candidate_count: 0,
+            });
+        };
+        let basename = Path::new(remote_repo_root)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty());
+        let Some(basename) = basename else {
+            return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                remote_repo_root: Some(remote_repo_root.to_string()),
+                search_root: env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("~")),
+                candidate_count: 0,
+            });
+        };
+        let search_root = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let expected_remotes = rec
+            .git_remotes
+            .values()
+            .map(|url| normalize_git_remote_url(url))
+            .filter(|url| !url.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        if expected_remotes.is_empty() {
+            return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+                remote_repo_root: Some(remote_repo_root.to_string()),
+                search_root,
+                candidate_count: 0,
+            });
+        }
+        let mut normalized_remotes = expected_remotes.iter().cloned().collect::<Vec<_>>();
+        normalized_remotes.sort();
+        let cache_key = format!(
+            "{}|{}",
+            remote_repo_root,
+            normalized_remotes.join("|")
+        );
+        if let Some(cached) = self.remote_git_lookup_cache.get(&cache_key) {
+            return match cached {
+                RemoteGitLookup::Resolved(repo_root) => GitViewState::Available(GitMatch {
+                    anchor_record_idx: 0,
+                    repo_root: repo_root.clone(),
+                    anchor_ts: 0,
+                    selected_commit_idx: 0,
+                    guessed_from_remote: Some(remote_repo_root.to_string()),
+                }),
+                RemoteGitLookup::Unavailable(unavailable) => {
+                    GitViewState::RemoteUnavailable(unavailable.clone())
+                }
+            };
+        }
+        let mut candidates = Vec::new();
+
+        for entry in WalkDir::new(&search_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy() != basename {
+                continue;
+            }
+            let path = entry.into_path();
+            let Some(repo_root) = self.resolve_repo_root(&path.to_string_lossy()) else {
+                continue;
+            };
+            let Ok(repo) = self.git_repo_context(&repo_root) else {
+                continue;
+            };
+            let candidate_remotes = repo
+                .remotes
+                .values()
+                .map(|url| normalize_git_remote_url(url))
+                .filter(|url| !url.is_empty())
+                .collect::<std::collections::HashSet<_>>();
+            if !expected_remotes.is_empty()
+                && candidate_remotes
+                    .intersection(&expected_remotes)
+                    .next()
+                    .is_none()
+            {
+                continue;
+            }
+            if !candidates.iter().any(|candidate: &PathBuf| candidate == &repo_root) {
+                candidates.push(repo_root);
+            }
+        }
+
+        if candidates.len() == 1 {
+            let repo_root = candidates.remove(0);
+            self.remote_git_lookup_cache
+                .insert(cache_key, RemoteGitLookup::Resolved(repo_root.clone()));
+            return GitViewState::Available(GitMatch {
+                anchor_record_idx: 0,
+                repo_root,
+                anchor_ts: 0,
+                selected_commit_idx: 0,
+                guessed_from_remote: Some(remote_repo_root.to_string()),
+            });
+        }
+
+        let unavailable = RemoteGitUnavailable {
+            remote_repo_root: Some(remote_repo_root.to_string()),
+            search_root,
+            candidate_count: candidates.len(),
+        };
+        self.remote_git_lookup_cache
+            .insert(cache_key, RemoteGitLookup::Unavailable(unavailable.clone()));
+        GitViewState::RemoteUnavailable(unavailable)
+    }
+
     fn git_repo_context(&mut self, repo_root: &Path) -> anyhow::Result<&GitRepoContext> {
         if !self.git_repo_cache.contains_key(repo_root) {
             let log_output = Command::new("git")
@@ -3945,6 +4160,33 @@ impl App {
                 .lines()
                 .filter_map(parse_git_commit_line)
                 .collect::<Vec<_>>();
+
+            let remotes_output = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .arg("config")
+                .arg("--get-regexp")
+                .arg(r"^remote\..*\.url$")
+                .output()
+                .with_context(|| format!("failed to read git remotes from {}", repo_root.display()))?;
+            let mut remotes = HashMap::new();
+            if remotes_output.status.success() {
+                for line in String::from_utf8_lossy(&remotes_output.stdout).lines() {
+                    let mut parts = line.splitn(2, ' ');
+                    let key = parts.next().unwrap_or("").trim();
+                    let value = parts.next().unwrap_or("").trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let Some(name) = key
+                        .strip_prefix("remote.")
+                        .and_then(|rest| rest.strip_suffix(".url"))
+                    else {
+                        continue;
+                    };
+                    remotes.insert(name.to_string(), value.to_string());
+                }
+            }
 
             let graph_output = Command::new("git")
                 .arg("-C")
@@ -3978,6 +4220,7 @@ impl App {
                 GitRepoContext {
                     repo_root: repo_root.to_path_buf(),
                     commits,
+                    remotes,
                     graph_lines,
                     graph_line_commit_indices,
                 },
@@ -4894,13 +5137,29 @@ impl App {
     }
 
     fn build_git_graph_doc(&mut self, preview_width: usize, preview_height: usize) -> GitPaneDoc {
-        let Some(git_match) = self.selected_git_match(preview_width, preview_height) else {
-            return GitPaneDoc {
-                lines: vec![
-                    Line::raw("git graph unavailable"),
-                    Line::raw("select a turn with a timestamp and git-backed cwd"),
-                ],
-            };
+        let git_match = match self.selected_git_view_state(preview_width, preview_height) {
+            GitViewState::Available(git_match) => git_match,
+            GitViewState::RemoteUnavailable(unavailable) => {
+                return GitPaneDoc {
+                    lines: vec![
+                        Line::raw("git: no validated local repo match"),
+                        Line::raw(format!(
+                            "remote repo: {}",
+                            unavailable.remote_repo_root.as_deref().unwrap_or("(missing)")
+                        )),
+                        Line::raw(format!("searched: {}", unavailable.search_root.display())),
+                        Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
+                    ],
+                };
+            }
+            GitViewState::Unavailable => {
+                return GitPaneDoc {
+                    lines: vec![
+                        Line::raw("git graph unavailable"),
+                        Line::raw("select a turn with a timestamp and git-backed cwd"),
+                    ],
+                };
+            }
         };
         let anchor_ts = short_ts(
             self.all
@@ -4932,8 +5191,14 @@ impl App {
                 &selected_commit.hash[..selected_commit.hash.len().min(12)],
                 selected_commit.summary
             )),
-            Line::raw(""),
         ];
+        if let Some(remote_repo_root) = git_match.guessed_from_remote.as_deref() {
+            lines.push(Line::raw(format!(
+                "repo source: guessed local clone for {}",
+                remote_repo_root
+            )));
+        }
+        lines.push(Line::raw(""));
         for (idx, line) in repo.graph_lines[start..end].iter().enumerate() {
             let absolute = start + idx;
             let style = if absolute == selected_graph_line {
@@ -4950,10 +5215,26 @@ impl App {
     }
 
     fn build_git_commit_doc(&mut self, preview_width: usize, preview_height: usize) -> GitPaneDoc {
-        let Some(git_match) = self.selected_git_match(preview_width, preview_height) else {
-            return GitPaneDoc {
-                lines: vec![Line::raw("commit preview unavailable")],
-            };
+        let git_match = match self.selected_git_view_state(preview_width, preview_height) {
+            GitViewState::Available(git_match) => git_match,
+            GitViewState::RemoteUnavailable(unavailable) => {
+                return GitPaneDoc {
+                    lines: vec![
+                        Line::raw("git commit preview unavailable"),
+                        Line::raw(format!(
+                            "remote repo: {}",
+                            unavailable.remote_repo_root.as_deref().unwrap_or("(missing)")
+                        )),
+                        Line::raw(format!("searched: {}", unavailable.search_root.display())),
+                        Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
+                    ],
+                };
+            }
+            GitViewState::Unavailable => {
+                return GitPaneDoc {
+                    lines: vec![Line::raw("commit preview unavailable")],
+                };
+            }
         };
         let (hash, summary) = {
             let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
@@ -4977,8 +5258,14 @@ impl App {
                 git_match.anchor_ts,
                 summary
             )),
-            Line::raw(""),
         ];
+        if let Some(remote_repo_root) = git_match.guessed_from_remote.as_deref() {
+            lines.push(Line::raw(format!(
+                "repo source: guessed local clone for {}",
+                remote_repo_root
+            )));
+        }
+        lines.push(Line::raw(""));
         lines.extend(
             preview_lines
                 .iter()
@@ -6272,6 +6559,7 @@ mod tests {
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
+            remote_git_lookup_cache: HashMap::new(),
         }
     }
 
@@ -6382,6 +6670,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -6418,6 +6708,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -6435,6 +6727,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -6485,6 +6779,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::ClaudeProjectJsonl,
         });
@@ -6519,6 +6815,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -6546,6 +6844,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::ClaudeProjectJsonl,
         });
@@ -6577,6 +6877,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::OpenCodeSession,
         });
@@ -6734,6 +7036,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source,
         })
@@ -6958,6 +7262,7 @@ mod tests {
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
+            remote_git_lookup_cache: HashMap::new(),
         };
 
         app.update_results();
@@ -7052,6 +7357,7 @@ mod tests {
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
+            remote_git_lookup_cache: HashMap::new(),
         };
 
         app.update_results();
@@ -7238,6 +7544,8 @@ mod tests {
                 machine_id: String::new(),
                 machine_name: String::new(),
                 project_slug: None,
+                git_repo_root: None,
+                git_remotes: HashMap::new(),
                 origin: String::new(),
                 source: SourceKind::OpenCodeSession,
             }),
@@ -7255,6 +7563,8 @@ mod tests {
                 machine_id: String::new(),
                 machine_name: String::new(),
                 project_slug: None,
+                git_repo_root: None,
+                git_remotes: HashMap::new(),
                 origin: String::new(),
                 source: SourceKind::OpenCodeSession,
             }),
@@ -7309,6 +7619,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -7497,6 +7809,65 @@ mod tests {
         assert_eq!(selected_git_commit_idx(&commits, 250), Some(1));
         assert_eq!(selected_git_commit_idx(&commits, 150), Some(2));
         assert_eq!(selected_git_commit_idx(&commits, 50), Some(2));
+    }
+
+    #[test]
+    fn normalize_git_remote_url_collapses_common_remote_forms() {
+        assert_eq!(
+            normalize_git_remote_url("git@github.com:owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_git_remote_url("ssh://git@github.com/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_git_remote_url("https://github.com/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn remote_git_doc_requires_remote_url_overlap_to_guess_local_repo() {
+        let mut app = ready_app_with_indexed_data(vec![MessageRecord {
+            timestamp: Some("2026-04-14T17:15:00Z".to_string()),
+            role: Role::User,
+            text: "remote turn".to_string(),
+            file: PathBuf::from("/tmp/x.jsonl"),
+            line: 1,
+            session_id: Some("remote-session".to_string()),
+            account: None,
+            cwd: Some("/home/slu/project".to_string()),
+            phase: None,
+            images: Vec::new(),
+            machine_id: "remote-host".to_string(),
+            machine_name: "remote-host".to_string(),
+            project_slug: Some("project".to_string()),
+            git_repo_root: Some("/home/slu/project".to_string()),
+            git_remotes: HashMap::new(),
+            origin: "remote".to_string(),
+            source: SourceKind::CodexSessionJsonl,
+        }]);
+        app.git_graph_visible = true;
+        app.git_commit_visible = true;
+        app.update_results();
+
+        let doc = app.build_git_graph_doc(80, 20);
+        let rendered = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("git: no validated local repo match"));
+        assert!(rendered.contains("remote repo: /home/slu/project"));
+        assert!(rendered.contains("matching repos: 0"));
     }
 
     #[test]
@@ -7848,6 +8219,8 @@ mod tests {
             machine_id: String::new(),
             machine_name: String::new(),
             project_slug: None,
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: String::new(),
             source: SourceKind::CodexSessionJsonl,
         });
@@ -8233,6 +8606,7 @@ mod tests {
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
+            remote_git_lookup_cache: HashMap::new(),
         };
 
         assert_eq!(

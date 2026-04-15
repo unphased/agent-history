@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File},
     io::{self, BufRead as _, BufReader},
@@ -84,6 +84,9 @@ pub struct MessageRecord {
     pub machine_id: String,
     pub machine_name: String,
     pub project_slug: Option<String>,
+    pub git_repo_root: Option<String>,
+    #[serde(default)]
+    pub git_remotes: HashMap<String, String>,
     pub origin: String,
 
     pub source: SourceKind,
@@ -132,6 +135,12 @@ pub enum IndexerEvent {
 struct FileContext {
     session_id: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitRepoMetadata {
+    repo_root: Option<String>,
+    remotes: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -818,6 +827,7 @@ fn run_indexer(
 
     let mut records_count = 0usize;
     let mut sessions_count = 0usize;
+    let mut git_metadata_cache: HashMap<String, GitRepoMetadata> = HashMap::new();
 
     let mut cache_store = match cache_path {
         Some(path) => {
@@ -972,7 +982,12 @@ fn run_indexer(
 
         match index_input_to_chunk(input) {
             Ok(mut chunk) => {
-                attach_machine_metadata(&mut chunk.records, &machine, "local");
+                attach_machine_metadata(
+                    &mut chunk.records,
+                    &machine,
+                    "local",
+                    &mut git_metadata_cache,
+                );
                 let current = chunk.current.clone();
                 let records_added = chunk.records.len();
                 let sessions_added = chunk.sessions.len();
@@ -1043,7 +1058,12 @@ fn run_indexer(
                         continue;
                     };
                     let mut chunk = chunk;
-                    attach_machine_metadata(&mut chunk.records, &machine, "local");
+                    attach_machine_metadata(
+                        &mut chunk.records,
+                        &machine,
+                        "local",
+                        &mut git_metadata_cache,
+                    );
                     let records_added = chunk.records.len();
                     let sessions_added = chunk.sessions.len();
                     let cache_write_started = Instant::now();
@@ -1191,17 +1211,38 @@ fn attach_machine_metadata(
     records: &mut [MessageRecord],
     machine: &config::MachineIdentity,
     origin: &str,
+    git_metadata_cache: &mut HashMap<String, GitRepoMetadata>,
 ) {
     for rec in records {
         rec.machine_id = machine.id.clone();
         rec.machine_name = machine.name.clone();
         rec.project_slug = rec.cwd.as_deref().map(dir_name_from_cwd_owned);
+        let git_metadata = rec
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(|cwd| {
+                git_metadata_cache
+                    .entry(cwd.to_string())
+                    .or_insert_with(|| probe_git_repo_metadata(cwd))
+                    .clone()
+            })
+            .unwrap_or_default();
+        rec.git_repo_root = git_metadata.repo_root;
+        rec.git_remotes = git_metadata.remotes;
         rec.origin = origin.to_string();
     }
 }
 
-fn blank_record_metadata() -> (String, String, Option<String>, String) {
-    (String::new(), String::new(), None, "local".to_string())
+fn blank_record_metadata() -> (String, String, Option<String>, Option<String>, HashMap<String, String>, String) {
+    (
+        String::new(),
+        String::new(),
+        None,
+        None,
+        HashMap::new(),
+        "local".to_string(),
+    )
 }
 
 fn dir_name_from_cwd_owned(cwd: &str) -> String {
@@ -1211,6 +1252,62 @@ fn dir_name_from_cwd_owned(cwd: &str) -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(cwd)
         .to_string()
+}
+
+fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return GitRepoMetadata::default(),
+    };
+    let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if repo_root.is_empty() {
+        return GitRepoMetadata::default();
+    }
+
+    let remotes_output = match Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("config")
+        .arg("--get-regexp")
+        .arg(r"^remote\..*\.url$")
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            return GitRepoMetadata {
+                repo_root: Some(repo_root),
+                remotes: HashMap::new(),
+            };
+        }
+    };
+
+    let mut remotes = HashMap::new();
+    for line in String::from_utf8_lossy(&remotes_output.stdout).lines() {
+        let mut parts = line.splitn(2, ' ');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if value.is_empty() {
+            continue;
+        }
+        let Some(name) = key
+            .strip_prefix("remote.")
+            .and_then(|rest| rest.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        remotes.insert(name.to_string(), value.to_string());
+    }
+
+    GitRepoMetadata {
+        repo_root: Some(repo_root),
+        remotes,
+    }
 }
 
 fn fingerprint_for_input(input: &IndexInput) -> anyhow::Result<String> {
@@ -1268,6 +1365,7 @@ fn run_full_scan(
 ) -> anyhow::Result<Vec<MessageRecord>> {
     let mut indexed_inputs: Vec<Option<IndexedInputChunk>> = Vec::with_capacity(total_files);
     indexed_inputs.resize_with(total_files, || None);
+    let mut git_metadata_cache: HashMap<String, GitRepoMetadata> = HashMap::new();
     let mut sessions: HashSet<(SourceKind, String, Option<String>)> = HashSet::new();
     let mut records = 0usize;
     let mut processed_files = 0usize;
@@ -1281,7 +1379,12 @@ fn run_full_scan(
 
         match index_input_to_chunk(input) {
             Ok(mut chunk) => {
-                attach_machine_metadata(&mut chunk.records, machine, "local");
+                attach_machine_metadata(
+                    &mut chunk.records,
+                    machine,
+                    "local",
+                    &mut git_metadata_cache,
+                );
                 records = records.saturating_add(chunk.records.len());
                 sessions.extend(chunk.sessions.iter().cloned());
                 let current = chunk.current.clone();
@@ -1342,7 +1445,12 @@ fn run_full_scan(
             match result {
                 IndexedInputResult::Indexed { index, chunk } => {
                     let mut chunk = chunk;
-                    attach_machine_metadata(&mut chunk.records, machine, "local");
+                    attach_machine_metadata(
+                        &mut chunk.records,
+                        machine,
+                        "local",
+                        &mut git_metadata_cache,
+                    );
                     records = records.saturating_add(chunk.records.len());
                     sessions.extend(chunk.sessions.iter().cloned());
                     let current = chunk.current.clone();
@@ -1877,7 +1985,8 @@ fn index_opencode_session_file(
             })
             .or_else(|| session_ts.clone());
         let phase = message.mode.clone().or(message.agent.clone());
-        let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
+        let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+            blank_record_metadata();
 
         out.push(MessageRecord {
             timestamp,
@@ -1893,6 +2002,8 @@ fn index_opencode_session_file(
             machine_id,
             machine_name,
             project_slug,
+            git_repo_root,
+            git_remotes,
             origin,
             source: SourceKind::OpenCodeSession,
         });
@@ -1903,7 +2014,8 @@ fn index_opencode_session_file(
         && let Some(title) = fallback_title
     {
         telemetry.used_title_fallback = true;
-        let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
+        let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+            blank_record_metadata();
         out.push(MessageRecord {
             timestamp: session_ts,
             role: Role::User,
@@ -1918,6 +2030,8 @@ fn index_opencode_session_file(
             machine_id,
             machine_name,
             project_slug,
+            git_repo_root,
+            git_remotes,
             origin,
             source: SourceKind::OpenCodeSession,
         });
@@ -2274,7 +2388,8 @@ fn extract_codex_session_record(
 
     let text = extract_content_text(payload)?;
     let images = extract_codex_content_images(payload);
-    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
+    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+        blank_record_metadata();
 
     Some(MessageRecord {
         timestamp,
@@ -2290,6 +2405,8 @@ fn extract_codex_session_record(
         machine_id,
         machine_name,
         project_slug,
+        git_repo_root,
+        git_remotes,
         origin,
         source: SourceKind::CodexSessionJsonl,
     })
@@ -2327,7 +2444,8 @@ fn extract_claude_project_record(
     let cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
 
     let text = extract_claude_message_text(message)?;
-    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
+    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+        blank_record_metadata();
 
     Some(MessageRecord {
         timestamp,
@@ -2343,6 +2461,8 @@ fn extract_claude_project_record(
         machine_id,
         machine_name,
         project_slug,
+        git_repo_root,
+        git_remotes,
         origin,
         source: SourceKind::ClaudeProjectJsonl,
     })
@@ -2418,7 +2538,8 @@ fn extract_codex_history_record(
     let ts = h.ts?;
     let session_id = h.session_id?;
     let text = h.text?;
-    let (machine_id, machine_name, project_slug, origin) = blank_record_metadata();
+    let (machine_id, machine_name, project_slug, git_repo_root, git_remotes, origin) =
+        blank_record_metadata();
 
     Some(MessageRecord {
         timestamp: Some(ts.to_string()),
@@ -2434,6 +2555,8 @@ fn extract_codex_history_record(
         machine_id,
         machine_name,
         project_slug,
+        git_repo_root,
+        git_remotes,
         origin,
         source: SourceKind::CodexHistoryJsonl,
     })
@@ -2536,6 +2659,8 @@ mod tests {
             machine_id: "mbp".to_string(),
             machine_name: "MacBook Pro".to_string(),
             project_slug: Some("proj".to_string()),
+            git_repo_root: None,
+            git_remotes: HashMap::new(),
             origin: "local".to_string(),
             source: SourceKind::CodexSessionJsonl,
         };
@@ -2573,6 +2698,8 @@ mod tests {
                 machine_id: "local".to_string(),
                 machine_name: "local".to_string(),
                 project_slug: None,
+                git_repo_root: None,
+                git_remotes: HashMap::new(),
                 origin: "local".to_string(),
                 source: SourceKind::CodexSessionJsonl,
             },
@@ -2590,6 +2717,8 @@ mod tests {
                 machine_id: "local".to_string(),
                 machine_name: "local".to_string(),
                 project_slug: None,
+                git_repo_root: None,
+                git_remotes: HashMap::new(),
                 origin: "local".to_string(),
                 source: SourceKind::CodexSessionJsonl,
             },
