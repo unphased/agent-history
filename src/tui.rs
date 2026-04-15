@@ -1091,7 +1091,7 @@ fn remote_desync_label(state: &cache::RemoteSyncStatus, now_secs: i64) -> Option
         .last_success_ms
         .map(|last_success| concise_elapsed_label(now_secs.saturating_sub(last_success)))
         .unwrap_or_else(|| "?".to_string());
-    Some(format!("Behind {age}"))
+    Some(format!("desync {age}"))
 }
 
 fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
@@ -9577,7 +9577,7 @@ mod tests {
             machine_id: "mini".to_string(),
             machine_name: "Mini".to_string(),
             origin: "workstation".to_string(),
-            remote_desync_label: Some("Behind 3h".to_string()),
+            remote_desync_label: Some("desync 3h".to_string()),
             project_slug: None,
         };
 
@@ -9586,7 +9586,7 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
 
-        assert!(rendered.contains("Mini Behind 3h"));
+        assert!(rendered.contains("Mini desync 3h"));
     }
 
     #[test]
@@ -9604,7 +9604,7 @@ mod tests {
 
         assert_eq!(
             remote_desync_label(&state, 10_000).as_deref(),
-            Some("Behind 2h")
+            Some("desync 2h")
         );
     }
 
