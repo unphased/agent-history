@@ -37,7 +37,6 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -3895,31 +3894,17 @@ fn current_preview_inner_height(
 }
 
 impl App {
-    fn find_local_repo_candidates(&mut self, search_root: &Path, basename: &str) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-        for entry in WalkDir::new(search_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_dir() {
-                continue;
-            }
-            if entry.file_name().to_string_lossy() != basename {
-                continue;
-            }
-            let path = entry.into_path();
-            let Some(repo_root) = self.resolve_repo_root(&path.to_string_lossy()) else {
-                continue;
-            };
-            if !candidates
-                .iter()
-                .any(|candidate: &PathBuf| candidate == &repo_root)
-            {
-                candidates.push(repo_root);
-            }
+    fn find_local_repo_candidate(&self, search_root: &Path, basename: &str) -> Option<PathBuf> {
+        let basename = basename.trim();
+        if basename.is_empty() {
+            return None;
         }
-        candidates
+        let candidate = search_root.join(basename);
+        let git_dir = candidate.join(".git");
+        if fs::metadata(&git_dir).is_err() {
+            return None;
+        }
+        self.resolve_repo_root(&candidate.to_string_lossy())
     }
 
     fn refresh_remote_sync_states(&mut self) {
@@ -4198,19 +4183,17 @@ impl App {
             .as_deref()
             .filter(|root| !root.trim().is_empty())
         else {
-            let cache_key = format!(
-                "missing-meta|{}",
-                cwd_basename.as_deref().unwrap_or("")
-            );
+            let cache_key = format!("missing-meta|{}", cwd_basename.as_deref().unwrap_or(""));
             if let Some(RemoteGitLookup::Unavailable(unavailable)) =
                 self.remote_git_lookup_cache.get(&cache_key)
             {
                 return GitViewState::RemoteUnavailable(unavailable.clone());
             }
-            let candidate_paths = cwd_basename
-                .as_deref()
-                .map(|basename| self.find_local_repo_candidates(&search_root, basename))
-                .unwrap_or_default();
+            let candidate_paths = cwd_basename.as_deref().map_or_else(Vec::new, |basename| {
+                self.find_local_repo_candidate(&search_root, basename)
+                    .into_iter()
+                    .collect()
+            });
             let unavailable = RemoteGitUnavailable {
                 reason: "remote cache is missing git repo metadata".to_string(),
                 remote_repo_root: None,
@@ -4250,7 +4233,10 @@ impl App {
             {
                 return GitViewState::RemoteUnavailable(unavailable.clone());
             }
-            let candidate_paths = self.find_local_repo_candidates(&search_root, basename);
+            let candidate_paths = self
+                .find_local_repo_candidate(&search_root, basename)
+                .into_iter()
+                .collect::<Vec<_>>();
             let unavailable = RemoteGitUnavailable {
                 reason: "remote cache is missing git remote URLs for validation".to_string(),
                 remote_repo_root: Some(remote_repo_root.to_string()),
@@ -4281,7 +4267,10 @@ impl App {
             };
         }
         let mut candidates = Vec::new();
-        let candidate_paths = self.find_local_repo_candidates(&search_root, basename);
+        let candidate_paths = self
+            .find_local_repo_candidate(&search_root, basename)
+            .into_iter()
+            .collect::<Vec<_>>();
         for repo_root in candidate_paths.iter().cloned() {
             let Ok(repo) = self.git_repo_context(&repo_root) else {
                 continue;
@@ -9431,6 +9420,38 @@ mod tests {
         assert_eq!(sessions[0].source, SourceKind::CodexHistoryJsonl);
         assert_eq!(sessions[0].session_id, "h1");
         assert_eq!(all[sessions[0].first_user_idx].text, "hello");
+    }
+
+    #[test]
+    fn find_local_repo_candidate_only_checks_home_basename_path() {
+        let tmp = TempDir::new("agent-history-remote-git");
+        let home = tmp.path.join("home");
+        let nested_repo = home.join("nested").join("xyz");
+        fs::create_dir_all(nested_repo.parent().unwrap()).unwrap();
+        let nested_init = Command::new("git")
+            .arg("init")
+            .arg(&nested_repo)
+            .output()
+            .unwrap();
+        assert!(nested_init.status.success());
+
+        let app = empty_app();
+        assert_eq!(app.find_local_repo_candidate(&home, "xyz"), None);
+
+        let direct_repo = home.join("xyz");
+        let direct_init = Command::new("git")
+            .arg("init")
+            .arg(&direct_repo)
+            .output()
+            .unwrap();
+        assert!(direct_init.status.success());
+
+        let resolved = app.find_local_repo_candidate(&home, "xyz").unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("xyz")
+        );
+        assert!(resolved.ends_with("home/xyz"));
     }
 
     #[test]
