@@ -4198,18 +4198,30 @@ impl App {
             .as_deref()
             .filter(|root| !root.trim().is_empty())
         else {
+            let cache_key = format!(
+                "missing-meta|{}",
+                cwd_basename.as_deref().unwrap_or("")
+            );
+            if let Some(RemoteGitLookup::Unavailable(unavailable)) =
+                self.remote_git_lookup_cache.get(&cache_key)
+            {
+                return GitViewState::RemoteUnavailable(unavailable.clone());
+            }
             let candidate_paths = cwd_basename
                 .as_deref()
                 .map(|basename| self.find_local_repo_candidates(&search_root, basename))
                 .unwrap_or_default();
-            return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+            let unavailable = RemoteGitUnavailable {
                 reason: "remote cache is missing git repo metadata".to_string(),
                 remote_repo_root: None,
                 remote_cwd: rec.cwd.clone(),
                 search_root,
                 candidate_count: candidate_paths.len(),
                 candidate_paths,
-            });
+            };
+            self.remote_git_lookup_cache
+                .insert(cache_key, RemoteGitLookup::Unavailable(unavailable.clone()));
+            return GitViewState::RemoteUnavailable(unavailable);
         };
         let basename = Path::new(remote_repo_root)
             .file_name()
@@ -4232,15 +4244,24 @@ impl App {
             .filter(|url| !url.is_empty())
             .collect::<std::collections::HashSet<_>>();
         if expected_remotes.is_empty() {
+            let cache_key = format!("missing-remotes|{}", remote_repo_root);
+            if let Some(RemoteGitLookup::Unavailable(unavailable)) =
+                self.remote_git_lookup_cache.get(&cache_key)
+            {
+                return GitViewState::RemoteUnavailable(unavailable.clone());
+            }
             let candidate_paths = self.find_local_repo_candidates(&search_root, basename);
-            return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
+            let unavailable = RemoteGitUnavailable {
                 reason: "remote cache is missing git remote URLs for validation".to_string(),
                 remote_repo_root: Some(remote_repo_root.to_string()),
                 remote_cwd: rec.cwd.clone(),
                 search_root,
                 candidate_count: candidate_paths.len(),
                 candidate_paths,
-            });
+            };
+            self.remote_git_lookup_cache
+                .insert(cache_key, RemoteGitLookup::Unavailable(unavailable.clone()));
+            return GitViewState::RemoteUnavailable(unavailable);
         }
         let mut normalized_remotes = expected_remotes.iter().cloned().collect::<Vec<_>>();
         normalized_remotes.sort();
