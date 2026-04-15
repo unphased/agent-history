@@ -248,9 +248,9 @@ struct PaneGeometry {
 const PREVIEW_MAX_MATCHES: usize = 100;
 const PREVIEW_MAX_LINES: usize = 5000;
 const EVENT_BUFFER_MAX_BYTES: usize = 50 * 1024 * 1024;
-const MIN_RESULTS_PCT: u16 = 12;
-const MIN_GIT_PCT: u16 = 16;
-const MIN_TURNS_PCT: u16 = 28;
+const MIN_RESULTS_PCT: u16 = 15;
+const MIN_GIT_PCT: u16 = 15;
+const MIN_TURNS_PCT: u16 = 15;
 const MIN_GRAPH_PCT: u16 = 20;
 const MAX_GRAPH_PCT: u16 = 80;
 
