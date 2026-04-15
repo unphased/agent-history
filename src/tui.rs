@@ -4098,10 +4098,10 @@ impl App {
 
     fn query_prompt_prefix(&self) -> String {
         if self.show_telemetry {
-            return "events> ".to_string();
+            return "events❯ ".to_string();
         }
         if self.active_tag_filters.is_empty() {
-            return "> ".to_string();
+            return "❯ ".to_string();
         }
 
         let filters = self
@@ -4114,7 +4114,7 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("  ");
-        format!("[{filters}]> ")
+        format!("[{filters}]❯ ")
     }
 
     fn displayed_query(&self) -> &str {
