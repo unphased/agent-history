@@ -37,6 +37,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -674,6 +675,107 @@ fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     cmp::max(1, line.width().div_ceil(width))
 }
 
+fn lighten_preview_color(color: Color, amount: f32) -> Color {
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    let lift = |component: u8| -> u8 {
+        let component = component as f32;
+        (component + (255.0 - component) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(lift(red), lift(green), lift(blue))
+}
+
+fn preview_record_highlight_colors(preview_bgcolor: Option<Color>) -> (Color, Color) {
+    let base = preview_bgcolor.unwrap_or(PREVIEW_HOVER_BG);
+    let hover_bg = lighten_preview_color(base, PREVIEW_HOVER_LIGHTEN_AMOUNT);
+    let selected_bg = lighten_preview_color(base, PREVIEW_SELECTED_LIGHTEN_AMOUNT);
+    (
+        if matches!(hover_bg, Color::Rgb(..)) {
+            hover_bg
+        } else {
+            PREVIEW_HOVER_BG
+        },
+        if matches!(selected_bg, Color::Rgb(..)) {
+            selected_bg
+        } else {
+            PREVIEW_SELECTED_BG
+        },
+    )
+}
+
+fn wrap_preview_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    if line.spans.is_empty() {
+        return vec![Line::raw("")];
+    }
+
+    let mut wrapped_lines = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in &line.spans {
+        let mut current_text = String::new();
+        for ch in span.content.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width > 0 && char_width > 0 && current_width + char_width > width {
+                if !current_text.is_empty() {
+                    current_spans.push(Span::styled(mem::take(&mut current_text), span.style));
+                }
+                wrapped_lines.push(Line::from(mem::take(&mut current_spans)));
+                current_width = 0;
+            }
+
+            current_text.push(ch);
+            current_width += char_width;
+
+            if current_width >= width {
+                if !current_text.is_empty() {
+                    current_spans.push(Span::styled(mem::take(&mut current_text), span.style));
+                }
+                wrapped_lines.push(Line::from(mem::take(&mut current_spans)));
+                current_width = 0;
+            }
+        }
+
+        if !current_text.is_empty() {
+            current_spans.push(Span::styled(current_text, span.style));
+        }
+    }
+
+    if !current_spans.is_empty() || wrapped_lines.is_empty() {
+        wrapped_lines.push(Line::from(current_spans));
+    }
+
+    wrapped_lines
+}
+
+fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> Line<'static> {
+    if width == 0 {
+        return line.clone();
+    }
+    let mut spans = line
+        .spans
+        .iter()
+        .cloned()
+        .map(|span| Span::styled(span.content, span.style.patch(Style::default().bg(bg))))
+        .collect::<Vec<_>>();
+    let used_width = line.width();
+    if used_width < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used_width),
+            Style::default().bg(bg),
+        ));
+    } else if spans.is_empty() {
+        spans.push(Span::styled(" ".repeat(width), Style::default().bg(bg)));
+    }
+    Line::from(spans)
+}
+
 fn preview_visual_line_count(lines: &[Line<'_>], width: usize) -> usize {
     lines
         .iter()
@@ -1131,6 +1233,8 @@ const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
 const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
+const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
+const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
 const QUERY_MATCH_FG: Color = Color::Black;
 
 const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
@@ -3640,53 +3744,39 @@ fn with_anchor_indicator(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> 
     lines
 }
 
-fn highlight_preview_record(
-    lines: &mut [Line<'static>],
-    doc: &PreviewDoc,
-    record_idx: usize,
-    style: Style,
-) {
-    for (line_idx, line_record_idx) in doc.line_record_indices.iter().enumerate() {
-        if *line_record_idx != Some(record_idx) {
-            continue;
-        }
-        lines[line_idx] = Line::from(
-            lines[line_idx]
-                .spans
-                .iter()
-                .cloned()
-                .map(|span| Span::styled(span.content, span.style.patch(style)))
-                .collect::<Vec<_>>(),
-        );
-    }
-}
-
 fn with_preview_record_highlights(
     doc: &PreviewDoc,
+    preview_width: usize,
     selected_record_idx: Option<usize>,
     hovered_record_idx: Option<usize>,
     anchor_record_idx: Option<usize>,
+    preview_bgcolor: Option<Color>,
 ) -> Vec<Line<'static>> {
-    let mut lines = with_anchor_indicator(doc, anchor_record_idx);
-    if let Some(hovered_record_idx) =
-        hovered_record_idx.filter(|idx| Some(*idx) != selected_record_idx)
+    if preview_width == 0 {
+        return with_anchor_indicator(doc, anchor_record_idx);
+    }
+
+    let (hover_bg, selected_bg) = preview_record_highlight_colors(preview_bgcolor);
+    let lines = with_anchor_indicator(doc, anchor_record_idx);
+    let mut visual_lines = Vec::new();
+    for (line, record_idx) in lines
+        .into_iter()
+        .zip(doc.line_record_indices.iter().copied())
     {
-        highlight_preview_record(
-            &mut lines,
-            doc,
-            hovered_record_idx,
-            Style::default().bg(PREVIEW_HOVER_BG),
-        );
+        let highlight_bg = match record_idx {
+            Some(record_idx) if Some(record_idx) == selected_record_idx => Some(selected_bg),
+            Some(record_idx) if Some(record_idx) == hovered_record_idx => Some(hover_bg),
+            _ => None,
+        };
+        for wrapped_line in wrap_preview_line(&line, preview_width) {
+            visual_lines.push(if let Some(bg) = highlight_bg {
+                preview_line_with_block_bg(&wrapped_line, preview_width, bg)
+            } else {
+                wrapped_line
+            });
+        }
     }
-    if let Some(selected_record_idx) = selected_record_idx {
-        highlight_preview_record(
-            &mut lines,
-            doc,
-            selected_record_idx,
-            Style::default().bg(PREVIEW_SELECTED_BG),
-        );
-    }
-    lines
+    visual_lines
 }
 
 fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
@@ -6608,8 +6698,21 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         app.preview_scroll = first_match_visual_line.saturating_sub(2);
         app.preview_scroll_reset_pending = false;
     }
+    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
+        app.current_preview_selection(&preview_doc, preview_inner_width)
+    } else {
+        None
+    };
     let layout_started = Instant::now();
-    let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+    let preview_lines = with_preview_record_highlights(
+        &preview_doc,
+        preview_inner_width,
+        selected_preview_record_idx,
+        app.hovered_preview_record_idx,
+        turn_anchor_record_idx,
+        app.preview_bgcolor,
+    );
+    let preview_total_lines = preview_lines.len();
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     if app.log_group_enabled(LogGroup::Perf) {
@@ -6626,11 +6729,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             }),
         );
     }
-    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
-        app.current_preview_selection(&preview_doc, preview_inner_width)
-    } else {
-        None
-    };
     let preview_title = if !app.showing_session_browser() && !query.is_empty() {
         app.query_preview_title("Preview", selected_preview_record_idx)
     } else if app.showing_session_browser() {
@@ -6638,22 +6736,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         app.preview_title("Preview")
     };
-    let preview = Paragraph::new(Text::from(with_preview_record_highlights(
-        &preview_doc,
-        selected_preview_record_idx,
-        app.hovered_preview_record_idx,
-        turn_anchor_record_idx,
-    )))
-    .style(preview_style)
-    .block(
-        Block::default()
-            .style(preview_style)
-            .border_style(preview_border_style)
-            .borders(Borders::ALL)
-            .title(preview_title),
-    )
-    .scroll((app.preview_scroll as u16, 0))
-    .wrap(Wrap { trim: false });
+    let preview = Paragraph::new(Text::from(preview_lines))
+        .style(preview_style)
+        .block(
+            Block::default()
+                .style(preview_style)
+                .border_style(preview_border_style)
+                .borders(Borders::ALL)
+                .title(preview_title),
+        )
+        .scroll((app.preview_scroll as u16, 0));
     f.render_widget(preview, preview_area);
 
     render_footer(f, root[1], app.status_text(), app.footer_help_text());
@@ -9413,7 +9505,9 @@ mod tests {
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
         let doc = app.session_browser_doc();
-        let lines = with_preview_record_highlights(&doc, Some(1), Some(2), None);
+        let preview_bg = Some(Color::Rgb(32, 52, 84));
+        let (hover_bg, selected_bg) = preview_record_highlight_colors(preview_bg);
+        let lines = with_preview_record_highlights(&doc, 200, Some(1), Some(2), None, preview_bg);
         let second_line_idx = doc
             .line_record_indices
             .iter()
@@ -9425,15 +9519,11 @@ mod tests {
             .position(|record_idx| *record_idx == Some(2))
             .expect("expected hovered record line");
 
-        assert_eq!(
-            lines[second_line_idx].spans[0].style.bg,
-            Some(PREVIEW_SELECTED_BG)
-        );
+        assert_eq!(lines[second_line_idx].spans[0].style.bg, Some(selected_bg));
         assert_eq!(lines[second_line_idx].spans[0].style.fg, None);
-        assert_eq!(
-            lines[third_line_idx].spans[0].style.bg,
-            Some(PREVIEW_HOVER_BG)
-        );
+        assert_eq!(lines[second_line_idx].width(), 200);
+        assert_eq!(lines[third_line_idx].spans[0].style.bg, Some(hover_bg));
+        assert_eq!(lines[third_line_idx].width(), 200);
     }
 
     #[test]
