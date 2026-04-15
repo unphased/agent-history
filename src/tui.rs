@@ -3318,7 +3318,11 @@ fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
         .split(area)[0];
 
     let mut results_pct = app.layout_state.results_pct.clamp(MIN_RESULTS_PCT, 100);
-    let max_results = 100 - MIN_GIT_PCT - MIN_TURNS_PCT;
+    let max_results = if app.show_telemetry || !app.git_graph_visible {
+        100 - MIN_TURNS_PCT
+    } else {
+        100 - MIN_GIT_PCT - MIN_TURNS_PCT
+    };
     results_pct = results_pct.min(max_results);
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -3639,9 +3643,14 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                         let total = geometry.root.width.max(1);
                         let rel = mouse.column.saturating_sub(geometry.root.x) as u32;
                         let pct = ((rel * 100) / total as u32) as i16;
+                        let max_results = if app.show_telemetry || !app.git_graph_visible {
+                            100 - MIN_TURNS_PCT
+                        } else {
+                            100 - MIN_GIT_PCT - MIN_TURNS_PCT
+                        };
                         app.layout_state.results_pct = pct.clamp(
                             MIN_RESULTS_PCT as i16,
-                            (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
+                            max_results as i16,
                         ) as u16;
                     }
                     ActiveSplit::GitTurns => {
@@ -3824,9 +3833,14 @@ impl App {
     fn adjust_split(&mut self, split: ActiveSplit, delta: i16) {
         match split {
             ActiveSplit::ResultsGit => {
+                let max_results = if self.show_telemetry || !self.git_graph_visible {
+                    100 - MIN_TURNS_PCT
+                } else {
+                    100 - MIN_GIT_PCT - MIN_TURNS_PCT
+                };
                 let next = (self.layout_state.results_pct as i16 + delta).clamp(
                     MIN_RESULTS_PCT as i16,
-                    (100 - MIN_GIT_PCT - MIN_TURNS_PCT) as i16,
+                    max_results as i16,
                 );
                 self.layout_state.results_pct = next as u16;
             }
@@ -7565,6 +7579,18 @@ mod tests {
 
         assert_eq!(app.dragged_split, Some(ActiveSplit::ResultsGit));
         assert_eq!(app.layout_state.results_pct, 40);
+    }
+
+    #[test]
+    fn hidden_git_allows_preview_to_shrink_only_to_turns_minimum() {
+        let mut app = empty_app();
+        app.ready = true;
+        app.layout_state.results_pct = 90;
+
+        let geometry = app_geometry(Rect::new(0, 0, 100, 30), &app);
+
+        assert_eq!(geometry.results.width, 85);
+        assert_eq!(geometry.turn_preview.width, 15);
     }
 
     #[test]
