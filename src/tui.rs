@@ -2611,6 +2611,7 @@ struct App {
     selected: usize,
     offset: usize,
     selected_preview_record_idx: Option<usize>,
+    hovered_preview_record_idx: Option<usize>,
     preview_scroll: usize,
     preview_scroll_reset_pending: bool,
     session_browser_start_scroll: usize,
@@ -2724,6 +2725,7 @@ fn run_app(
         selected: 0,
         offset: 0,
         selected_preview_record_idx: None,
+        hovered_preview_record_idx: None,
         preview_scroll: 0,
         preview_scroll_reset_pending: false,
         session_browser_start_scroll: 0,
@@ -3244,13 +3246,14 @@ fn handle_key(
                 app.telemetry_query.insert(byte_pos, c);
                 app.telemetry_cursor_pos += 1;
                 app.reset_telemetry_search();
+                return Ok(false);
             } else if text_input_active {
                 let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
                 app.query.insert(byte_pos, c);
                 app.cursor_pos += 1;
                 app.update_results();
+                return Ok(false);
             }
-            return Ok(false);
         }
         _ => {}
     }
@@ -3635,33 +3638,55 @@ fn with_anchor_indicator(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> 
     lines
 }
 
-fn with_selected_preview_line(
+fn highlight_preview_record(
+    lines: &mut [Line<'static>],
+    doc: &PreviewDoc,
+    record_idx: usize,
+    style: Style,
+) {
+    for (line_idx, line_record_idx) in doc.line_record_indices.iter().enumerate() {
+        if *line_record_idx != Some(record_idx) {
+            continue;
+        }
+        lines[line_idx] = Line::from(
+            lines[line_idx]
+                .spans
+                .iter()
+                .cloned()
+                .map(|span| Span::styled(span.content, span.style.patch(style)))
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+fn with_preview_record_highlights(
     doc: &PreviewDoc,
     selected_record_idx: Option<usize>,
+    hovered_record_idx: Option<usize>,
     anchor_record_idx: Option<usize>,
 ) -> Vec<Line<'static>> {
     let mut lines = with_anchor_indicator(doc, anchor_record_idx);
-    let Some(selected_record_idx) = selected_record_idx else {
-        return lines;
-    };
-    let Some(line_idx) = doc
-        .line_record_indices
-        .iter()
-        .position(|record_idx| *record_idx == Some(selected_record_idx))
-    else {
-        return lines;
-    };
-    let selected_style = Style::default()
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
-    lines[line_idx] = Line::from(
-        lines[line_idx]
-            .spans
-            .iter()
-            .cloned()
-            .map(|span| Span::styled(span.content, span.style.patch(selected_style)))
-            .collect::<Vec<_>>(),
-    );
+    if let Some(hovered_record_idx) =
+        hovered_record_idx.filter(|idx| Some(*idx) != selected_record_idx)
+    {
+        highlight_preview_record(
+            &mut lines,
+            doc,
+            hovered_record_idx,
+            Style::default().bg(Color::DarkGray),
+        );
+    }
+    if let Some(selected_record_idx) = selected_record_idx {
+        highlight_preview_record(
+            &mut lines,
+            doc,
+            selected_record_idx,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     lines
 }
 
@@ -3848,6 +3873,9 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(_) => {
             app.dragged_split = None;
+            if !point_in_rect(mouse.column, mouse.row, preview_area) {
+                app.hovered_preview_record_idx = None;
+            }
             if !app.show_telemetry {
                 if point_near_vertical_split(mouse.column, geometry.turn_preview) {
                     app.active_split = Some(ActiveSplit::ResultsGit);
@@ -3890,9 +3918,9 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     };
                     let preview_width = preview_area.width.saturating_sub(2) as usize;
                     let preview_height = preview_area.height.saturating_sub(2) as usize;
-                    if let Some(record_idx) =
-                        app.hovered_preview_record_idx(&preview_doc, preview_area, mouse)
-                    {
+                    app.hovered_preview_record_idx =
+                        app.preview_record_idx_at_mouse(&preview_doc, preview_area, mouse);
+                    if let Some(record_idx) = app.hovered_preview_record_idx {
                         app.select_preview_record_full_reveal_if_possible(
                             &preview_doc,
                             preview_width,
@@ -3914,15 +3942,16 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     app.build_preview_doc()
                 };
                 let preview_width = preview_area.width.saturating_sub(2) as usize;
-                if let Some(record_idx) =
-                    app.hovered_preview_record_idx(&preview_doc, preview_area, mouse)
-                {
-                    app.selected_preview_record_idx = Some(record_idx);
+                app.hovered_preview_record_idx =
+                    app.preview_record_idx_at_mouse(&preview_doc, preview_area, mouse);
+                if app.hovered_preview_record_idx.is_some() {
                     if preview_width > 0 {
                         app.preview_scroll_reset_pending = false;
                     }
                     app.input_mode = InputMode::PreviewNav;
                 }
+            } else if !app.show_telemetry {
+                app.hovered_preview_record_idx = None;
             }
         }
         MouseEventKind::ScrollUp => {
@@ -4290,7 +4319,7 @@ impl App {
         self.preview_scroll_reset_pending = false;
     }
 
-    fn hovered_preview_record_idx(
+    fn preview_record_idx_at_mouse(
         &self,
         doc: &PreviewDoc,
         preview_area: Rect,
@@ -5234,6 +5263,7 @@ impl App {
                     .map(|session| session.first_user_idx)
             })
         });
+        self.hovered_preview_record_idx = None;
         if self.showing_session_browser() {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
@@ -6616,9 +6646,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         app.preview_title("Preview")
     };
-    let preview = Paragraph::new(Text::from(with_selected_preview_line(
+    let preview = Paragraph::new(Text::from(with_preview_record_highlights(
         &preview_doc,
         selected_preview_record_idx,
+        app.hovered_preview_record_idx,
         turn_anchor_record_idx,
     )))
     .style(preview_style)
@@ -7193,6 +7224,7 @@ mod tests {
             selected: 0,
             offset: 0,
             selected_preview_record_idx: None,
+            hovered_preview_record_idx: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -7900,6 +7932,7 @@ mod tests {
             selected: 0,
             offset: 0,
             selected_preview_record_idx: None,
+            hovered_preview_record_idx: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -7999,6 +8032,7 @@ mod tests {
             selected: 0,
             offset: 0,
             selected_preview_record_idx: None,
+            hovered_preview_record_idx: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -9183,7 +9217,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_hover_over_preview_updates_selected_turn() {
+    fn mouse_hover_over_preview_updates_hovered_turn_without_changing_selection() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:01Z"),
@@ -9209,6 +9243,7 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
+        assert_eq!(app.selected_preview_record_idx, Some(0));
         let area = Rect::new(0, 0, 100, 30);
         let geometry = app_geometry(area, &app);
         let preview_area = geometry.turn_preview;
@@ -9232,7 +9267,8 @@ mod tests {
             },
         );
 
-        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(app.hovered_preview_record_idx, Some(1));
         assert_eq!(app.preview_scroll, 0);
     }
 
@@ -9289,8 +9325,108 @@ mod tests {
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.hovered_preview_record_idx, Some(1));
         assert_eq!(app.preview_scroll, second_start);
         assert_eq!(app.input_mode, InputMode::PreviewNav);
+    }
+
+    #[test]
+    fn preview_record_highlights_render_hover_and_selection_differently() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let doc = app.session_browser_doc();
+        let lines = with_preview_record_highlights(&doc, Some(1), Some(2), None);
+        let second_line_idx = doc
+            .line_record_indices
+            .iter()
+            .position(|record_idx| *record_idx == Some(1))
+            .expect("expected selected record line");
+        let third_line_idx = doc
+            .line_record_indices
+            .iter()
+            .position(|record_idx| *record_idx == Some(2))
+            .expect("expected hovered record line");
+
+        assert_eq!(
+            lines[second_line_idx].spans[0].style.bg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(lines[second_line_idx].spans[0].style.fg, Some(Color::Black));
+        assert_eq!(
+            lines[third_line_idx].spans[0].style.bg,
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn handle_key_j_and_k_hop_turns_in_preview_nav_mode() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.selected_preview_record_idx, Some(0));
     }
 
     #[test]
@@ -9397,6 +9533,7 @@ mod tests {
             selected: 1,
             offset: 0,
             selected_preview_record_idx: None,
+            hovered_preview_record_idx: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
