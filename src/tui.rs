@@ -2593,6 +2593,7 @@ struct App {
     session_browser_active_pane: SessionBrowserPane,
     git_graph_scroll: usize,
     git_commit_scroll: usize,
+    last_git_graph_anchor: Option<(PathBuf, usize)>,
     git_graph_visible: bool,
     git_commit_visible: bool,
     input_mode: InputMode,
@@ -2705,6 +2706,7 @@ fn run_app(
         session_browser_active_pane: SessionBrowserPane::Start,
         git_graph_scroll: 0,
         git_commit_scroll: 0,
+        last_git_graph_anchor: None,
         git_graph_visible: false,
         git_commit_visible: false,
         input_mode: InputMode::SessionSearch,
@@ -3019,6 +3021,14 @@ fn handle_key(
             app.cycle_layout_preset();
             return Ok(false);
         }
+        KeyCode::Char('r')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.show_telemetry =>
+        {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.refresh_selected_git_repo_cache(preview_width, preview_height);
+            return Ok(false);
+        }
         KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL) && app.show_telemetry =>
         {
@@ -3035,177 +3045,50 @@ fn handle_key(
             app.jump_preview_match(-1, width);
             return Ok(false);
         }
-        KeyCode::Left
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            app.adjust_active_split(-2);
-            return Ok(false);
-        }
-        KeyCode::Right
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            app.adjust_active_split(2);
-            return Ok(false);
-        }
-        KeyCode::Up
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            app.adjust_active_split(-2);
-            return Ok(false);
-        }
-        KeyCode::Down
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-        {
-            app.adjust_active_split(2);
-            return Ok(false);
-        }
-        KeyCode::Backspace => {
-            if app.show_telemetry {
-                if app.telemetry_cursor_pos > 0 {
-                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
-                    let prev_byte_pos =
-                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos - 1);
-                    app.telemetry_query
-                        .replace_range(prev_byte_pos..byte_pos, "");
-                    app.telemetry_cursor_pos -= 1;
-                    app.reset_telemetry_search();
-                }
-            } else if app.cursor_pos > 0 {
-                let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
-                let prev_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos - 1);
-                app.query.replace_range(prev_byte_pos..byte_pos, "");
-                app.cursor_pos -= 1;
-                app.update_results();
-            }
-            return Ok(false);
-        }
-        KeyCode::Delete => {
-            if app.show_telemetry {
-                let char_count = app.telemetry_query.chars().count();
-                if app.telemetry_cursor_pos < char_count {
-                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
-                    let next_byte_pos =
-                        char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos + 1);
-                    app.telemetry_query
-                        .replace_range(byte_pos..next_byte_pos, "");
-                    app.reset_telemetry_search();
-                }
-            } else {
-                let char_count = app.query.chars().count();
-                if app.cursor_pos < char_count {
-                    let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
-                    let next_byte_pos = char_to_byte_pos(&app.query, app.cursor_pos + 1);
-                    app.query.replace_range(byte_pos..next_byte_pos, "");
-                }
-                app.update_results();
-            }
-            return Ok(false);
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry {
-                app.telemetry_query.clear();
-                app.telemetry_cursor_pos = 0;
-                app.reset_telemetry_search();
-            } else {
-                app.clear_query_and_filters();
-            }
-            return Ok(false);
-        }
-        KeyCode::Left => {
-            if app.show_telemetry {
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.telemetry_cursor_pos =
-                        prev_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
-                } else {
-                    app.telemetry_cursor_pos = app.telemetry_cursor_pos.saturating_sub(1);
-                }
-            } else if key.modifiers.contains(KeyModifiers::ALT) {
-                app.cursor_pos = prev_word_boundary(&app.query, app.cursor_pos);
-            } else {
-                app.cursor_pos = app.cursor_pos.saturating_sub(1);
-            }
-            return Ok(false);
-        }
-        KeyCode::Right => {
-            if app.show_telemetry {
-                let char_count = app.telemetry_query.chars().count();
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.telemetry_cursor_pos =
-                        next_word_boundary(&app.telemetry_query, app.telemetry_cursor_pos);
-                } else if app.telemetry_cursor_pos < char_count {
-                    app.telemetry_cursor_pos += 1;
-                }
-            } else {
-                let char_count = app.query.chars().count();
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.cursor_pos = next_word_boundary(&app.query, app.cursor_pos);
-                } else if app.cursor_pos < char_count {
-                    app.cursor_pos += 1;
-                }
-            }
-            return Ok(false);
-        }
-        KeyCode::Home => {
-            if app.show_telemetry {
-                app.telemetry_cursor_pos = 0;
-            } else {
-                app.cursor_pos = 0;
-            }
-            return Ok(false);
-        }
-        KeyCode::End => {
-            if app.show_telemetry {
-                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
-            } else {
-                app.cursor_pos = app.query.chars().count();
-            }
-            return Ok(false);
-        }
-        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry {
-                app.telemetry_cursor_pos = 0;
-            } else {
-                app.cursor_pos = 0;
-            }
-            return Ok(false);
-        }
-        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.show_telemetry {
-                app.telemetry_cursor_pos = app.telemetry_query.chars().count();
-            } else {
-                app.cursor_pos = app.query.chars().count();
-            }
-            return Ok(false);
-        }
-        KeyCode::Char(c) => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                if app.show_telemetry {
-                    let byte_pos = char_to_byte_pos(&app.telemetry_query, app.telemetry_cursor_pos);
-                    app.telemetry_query.insert(byte_pos, c);
-                    app.telemetry_cursor_pos += 1;
-                    app.reset_telemetry_search();
-                } else {
-                    let byte_pos = char_to_byte_pos(&app.query, app.cursor_pos);
-                    app.query.insert(byte_pos, c);
-                    app.cursor_pos += 1;
-                    app.update_results();
-                }
+        _ => {}
+    }
+
+    if !app.show_telemetry {
+        match (app.input_mode, key.code) {
+            (InputMode::PreviewNav, KeyCode::Char('-'))
+            | (InputMode::GitGraph, KeyCode::Char('-'))
+            | (InputMode::GitCommit, KeyCode::Char('-')) => {
+                app.adjust_split(ActiveSplit::ResultsGit, -2);
                 return Ok(false);
             }
+            (InputMode::PreviewNav, KeyCode::Char('='))
+            | (InputMode::GitGraph, KeyCode::Char('='))
+            | (InputMode::GitCommit, KeyCode::Char('=')) => {
+                app.adjust_split(ActiveSplit::ResultsGit, 2);
+                return Ok(false);
+            }
+            (InputMode::PreviewNav, KeyCode::Char('_'))
+            | (InputMode::PreviewNav, KeyCode::Char('+')) => {
+                return Ok(false);
+            }
+            (InputMode::GitGraph, KeyCode::Char('_')) => {
+                app.adjust_split(ActiveSplit::GitTurns, -2);
+                return Ok(false);
+            }
+            (InputMode::GitGraph, KeyCode::Char('+')) => {
+                app.adjust_split(ActiveSplit::GitTurns, 2);
+                return Ok(false);
+            }
+            (InputMode::GitCommit, KeyCode::Char('_')) => {
+                app.adjust_split(ActiveSplit::GitColumnVertical, -2);
+                return Ok(false);
+            }
+            (InputMode::GitCommit, KeyCode::Char('+')) => {
+                app.adjust_split(ActiveSplit::GitColumnVertical, 2);
+                return Ok(false);
+            }
+            _ => {}
         }
-        _ => {}
     }
 
     let text_input_active =
         app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch);
 
-    // Accept query input even while indexing is still in progress.
     match key.code {
         KeyCode::Backspace => {
             if app.show_telemetry {
@@ -3443,6 +3326,26 @@ fn handle_key(
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.scroll_preview_page(1, preview_height, preview_width);
         }
+        KeyCode::Up if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.scroll_preview_lines(-1, preview_width);
+        }
+        KeyCode::Down if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            app.scroll_preview_lines(1, preview_width);
+        }
+        KeyCode::PageUp if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(-1, preview_height, preview_width);
+        }
+        KeyCode::PageDown
+            if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) =>
+        {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_page(1, preview_height, preview_width);
+        }
         KeyCode::Up if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
             app.move_selection(-1)
         }
@@ -3451,24 +3354,32 @@ fn handle_key(
         {
             app.move_selection(1)
         }
-        KeyCode::PageUp
-            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
-        {
+        KeyCode::PageUp if app.show_telemetry => {
             let preview_width = current_preview_inner_width(terminal, app)?;
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.scroll_preview_page(-1, preview_height, preview_width);
         }
-        KeyCode::PageDown
-            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
-        {
+        KeyCode::PageDown if app.show_telemetry => {
             let preview_width = current_preview_inner_width(terminal, app)?;
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.scroll_preview_page(1, preview_height, preview_width);
         }
-        KeyCode::Home if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
+        KeyCode::PageUp if matches!(app.input_mode, InputMode::SessionSearch) => {
+            let page_height = cmp::max(1, current_results_inner_height(terminal, app)? as i32);
+            app.move_selection(-page_height);
+        }
+        KeyCode::PageDown if matches!(app.input_mode, InputMode::SessionSearch) => {
+            let page_height = cmp::max(1, current_results_inner_height(terminal, app)? as i32);
+            app.move_selection(page_height);
+        }
+        KeyCode::Home
+            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
+        {
             app.select_first()
         }
-        KeyCode::End if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) => {
+        KeyCode::End
+            if app.show_telemetry || matches!(app.input_mode, InputMode::SessionSearch) =>
+        {
             app.select_last()
         }
         _ => {}
@@ -3660,12 +3571,12 @@ fn selected_git_commit_idx(commits: &[GitCommitEntry], anchor_ts: i64) -> Option
     if commits.is_empty() {
         return None;
     }
-    Some(
-        commits
-            .iter()
-            .position(|commit| commit.epoch <= anchor_ts)
-            .unwrap_or_else(|| commits.len().saturating_sub(1)),
-    )
+    let idx = commits.partition_point(|commit| commit.epoch > anchor_ts);
+    Some(if idx < commits.len() {
+        idx
+    } else {
+        commits.len().saturating_sub(1)
+    })
 }
 
 fn point_near_vertical_split(x: u16, rect: Rect) -> bool {
@@ -4152,6 +4063,15 @@ fn current_preview_inner_height(
         .saturating_sub(2) as usize)
 }
 
+fn current_results_inner_height(
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+) -> anyhow::Result<usize> {
+    let area = terminal.size().context("failed to get terminal size")?;
+    let geometry = app_geometry(area.into(), app);
+    Ok(geometry.results.height.saturating_sub(2) as usize)
+}
+
 impl App {
     fn next_input_mode(&self) -> InputMode {
         match self.input_mode {
@@ -4374,13 +4294,6 @@ impl App {
             "layout preset {}",
             self.layout_state.preset.label()
         ));
-    }
-
-    fn adjust_active_split(&mut self, delta: i16) {
-        let Some(split) = self.active_split else {
-            return;
-        };
-        self.adjust_split(split, delta);
     }
 
     fn adjust_split(&mut self, split: ActiveSplit, delta: i16) {
@@ -4745,8 +4658,15 @@ impl App {
             let mut graph_line_commit_indices = Vec::new();
             for line in String::from_utf8_lossy(&graph_output.stdout).lines() {
                 let mut parts = line.splitn(2, '\t');
-                let hash = parse_git_graph_hash_field(parts.next().unwrap_or("")).unwrap_or("");
-                let display = parts.next().unwrap_or(line).to_string();
+                let graph_field = parts.next().unwrap_or("");
+                let hash = parse_git_graph_hash_field(graph_field).unwrap_or("");
+                let display = match parts.next() {
+                    Some(rest) if !rest.is_empty() && !graph_field.is_empty() => {
+                        format!("{graph_field} {rest}")
+                    }
+                    Some(rest) if !rest.is_empty() => rest.to_string(),
+                    _ => graph_field.to_string(),
+                };
                 let commit_idx = commits.iter().position(|commit| commit.hash == hash);
                 graph_lines.push(display);
                 graph_line_commit_indices.push(commit_idx);
@@ -4804,6 +4724,29 @@ impl App {
                 repo_root.display()
             )
         })
+    }
+
+    fn refresh_selected_git_repo_cache(&mut self, preview_width: usize, preview_height: usize) {
+        let repo_root = match self.selected_git_view_state(preview_width, preview_height) {
+            GitViewState::Available(git_match) => git_match.repo_root,
+            _ => {
+                self.set_ui_status("git cache refresh skipped: no git-backed repo selected");
+                return;
+            }
+        };
+        self.git_repo_cache.remove(&repo_root);
+        self.git_commit_preview_cache
+            .retain(|(cached_root, _), _| cached_root != &repo_root);
+        self.last_git_graph_anchor = None;
+        match self.git_repo_context(&repo_root) {
+            Ok(_) => self.set_ui_status(format!("refreshed git cache for {}", repo_root.display())),
+            Err(err) => {
+                self.indexing.last_warn = Some(format!(
+                    "git cache refresh failed for {}: {err:#}",
+                    repo_root.display()
+                ))
+            }
+        }
     }
 
     fn events_title(&self) -> String {
@@ -4890,6 +4833,44 @@ impl App {
 
     fn set_ui_status(&mut self, status: impl Into<String>) {
         self.ui_status = Some(status.into());
+    }
+
+    fn query_bar_style(&self) -> Style {
+        if self.show_telemetry {
+            return Style::default().fg(Color::White);
+        }
+        if matches!(self.input_mode, InputMode::SessionSearch) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    }
+
+    fn footer_help_text(&self) -> String {
+        if self.show_telemetry {
+            return format!(
+                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                self.displayed_query().trim()
+            );
+        }
+        match self.input_mode {
+            InputMode::SessionSearch => format!(
+                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Backspace/Delete: edit  Ctrl+u: clear  query: \"{}\"",
+                self.displayed_query().trim()
+            ),
+            InputMode::PreviewNav => {
+                "Tab/Shift+Tab: focus  Esc: search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
+            }
+            InputMode::GitGraph => {
+                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+            }
+            InputMode::GitCommit => {
+                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+            }
+        }
     }
 
     fn query_prompt_prefix(&self) -> String {
@@ -5670,6 +5651,7 @@ impl App {
         let git_match = match self.selected_git_view_state(preview_width, preview_height) {
             GitViewState::Available(git_match) => git_match,
             GitViewState::RemoteUnavailable(unavailable) => {
+                self.last_git_graph_anchor = None;
                 let mut lines = vec![
                     Line::raw("git: remote fallback unavailable"),
                     Line::raw(format!("reason: {}", unavailable.reason)),
@@ -5708,6 +5690,7 @@ impl App {
                 return GitPaneDoc { lines };
             }
             GitViewState::Unavailable => {
+                self.last_git_graph_anchor = None;
                 return GitPaneDoc {
                     lines: vec![
                         Line::raw("git graph unavailable"),
@@ -5722,50 +5705,64 @@ impl App {
                 .and_then(|rec| rec.timestamp.as_deref()),
         );
         let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
+            self.last_git_graph_anchor = None;
             return GitPaneDoc {
                 lines: vec![Line::raw("failed to load git graph")],
             };
         };
-        let selected_commit = &repo.commits[git_match.selected_commit_idx];
-        let selected_graph_line = repo
-            .graph_line_commit_indices
-            .iter()
-            .position(|idx| *idx == Some(git_match.selected_commit_idx))
-            .unwrap_or(0);
-        let window_radius = preview_height.max(4);
-        let start = selected_graph_line.saturating_sub(window_radius);
-        let end = cmp::min(
-            repo.graph_lines.len(),
-            selected_graph_line + window_radius + 1,
-        );
-        let mut lines = vec![
-            Line::raw(format!("repo: {}", repo.repo_root.display())),
-            Line::raw(format!(
-                "anchor: {}  selected commit: {}  {}",
-                anchor_ts,
-                &selected_commit.hash[..selected_commit.hash.len().min(12)],
-                selected_commit.summary
-            )),
-        ];
-        if let Some(remote_repo_root) = git_match.guessed_from_remote.as_deref() {
-            lines.push(Line::raw(format!(
-                "repo source: guessed local clone for {}",
-                remote_repo_root
-            )));
+        let (anchor_key, graph_offset, lines) = {
+            let selected_commit = &repo.commits[git_match.selected_commit_idx];
+            let selected_graph_line = repo
+                .graph_line_commit_indices
+                .iter()
+                .position(|idx| *idx == Some(git_match.selected_commit_idx))
+                .unwrap_or(0);
+            let mut lines = vec![
+                Line::raw(format!("repo: {}", repo.repo_root.display())),
+                Line::raw(format!(
+                    "anchor: {}  selected commit: {}  {}",
+                    anchor_ts,
+                    &selected_commit.hash[..selected_commit.hash.len().min(12)],
+                    selected_commit.summary
+                )),
+            ];
+            if let Some(remote_repo_root) = git_match.guessed_from_remote.as_deref() {
+                lines.push(Line::raw(format!(
+                    "repo source: guessed local clone for {}",
+                    remote_repo_root
+                )));
+            }
+            lines.push(Line::raw(""));
+            let graph_offset = lines.len();
+            for (idx, line) in repo.graph_lines.iter().enumerate() {
+                let style = if idx == selected_graph_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![Span::styled(line.clone(), style)]));
+            }
+            (
+                (repo.repo_root.clone(), selected_graph_line),
+                graph_offset,
+                lines,
+            )
+        };
+        if self.last_git_graph_anchor.as_ref() != Some(&anchor_key) && preview_height > 0 {
+            let target_line = graph_offset.saturating_add(anchor_key.1);
+            let viewport_start = self.git_graph_scroll;
+            let viewport_end = viewport_start.saturating_add(preview_height);
+            if target_line < viewport_start {
+                self.git_graph_scroll = target_line;
+            } else if target_line >= viewport_end {
+                self.git_graph_scroll =
+                    target_line.saturating_sub(preview_height.saturating_sub(1));
+            }
         }
-        lines.push(Line::raw(""));
-        for (idx, line) in repo.graph_lines[start..end].iter().enumerate() {
-            let absolute = start + idx;
-            let style = if absolute == selected_graph_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            lines.push(Line::from(vec![Span::styled(line.clone(), style)]));
-        }
+        self.last_git_graph_anchor = Some(anchor_key);
         GitPaneDoc { lines }
     }
 
@@ -6334,13 +6331,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let geometry = app_geometry(f.area(), app);
     let query_prefix = app.query_prompt_prefix();
-    let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
-        .style(Style::default().fg(Color::White));
+    let query =
+        Paragraph::new(format!("{query_prefix}{displayed_query}")).style(app.query_bar_style());
     f.render_widget(query, geometry.query);
-    let cursor_x =
-        geometry.query.x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
-    let cursor_y = geometry.query.y;
-    f.set_cursor_position((cursor_x, cursor_y));
+    if matches!(app.input_mode, InputMode::SessionSearch) {
+        let cursor_x = geometry.query.x
+            + query_prefix.chars().count() as u16
+            + app.displayed_cursor_pos() as u16;
+        let cursor_y = geometry.query.y;
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     // Results pane (manual windowing)
     let results_area = geometry.results;
@@ -6384,14 +6384,24 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ));
     }
 
+    let results_border_style = if matches!(app.input_mode, InputMode::SessionSearch) {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let results = Paragraph::new(Text::from(lines)).block(
-        Block::default().borders(Borders::ALL).title(format!(
-            "Results (sessions {}/{} turns {}/{})",
-            app.filtered.len(),
-            app.sessions.len(),
-            app.matched_turn_count(),
-            app.total_turn_count()
-        )),
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(results_border_style)
+            .title(format!(
+                "Results (sessions {}/{} turns {}/{})",
+                app.filtered.len(),
+                app.sessions.len(),
+                app.matched_turn_count(),
+                app.total_turn_count()
+            )),
     );
     f.render_widget(results, results_area);
 
@@ -6403,13 +6413,22 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .preview_bgcolor
         .map(|color| Style::default().bg(color))
         .unwrap_or_default();
-    let preview_border_style = if app.preview_remote_style {
+    let preview_base_border_style = if app.preview_remote_style {
         Style::default()
             .fg(REMOTE_PREVIEW_BORDER_FG)
             .bg(REMOTE_ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
+    };
+    let preview_border_style = if matches!(app.input_mode, InputMode::PreviewNav) {
+        preview_base_border_style.patch(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        preview_base_border_style
     };
     if let Some(git_graph_area) = geometry.git_graph {
         let graph_inner_height = git_graph_area.height.saturating_sub(2) as usize;
@@ -6540,15 +6559,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     .wrap(Wrap { trim: false });
     f.render_widget(preview, preview_area);
 
-    render_footer(
-        f,
-        root[1],
-        app.status_text(),
-        format!(
-            "Esc/Ctrl+c: quit  Enter: resume  Ctrl+o: pager  Ctrl+t: events  Ctrl+v: git graph  Ctrl+d: commit  Ctrl+l: layout  ↑/↓: move  PgUp/PgDn: pane page  Ctrl+b/f: prev/next turn  Ctrl+n/p: next/prev match  Alt+Shift+arrows: resize  wheel: pane scroll  Backspace: delete  Ctrl+u: clear query+tag filters  query: \"{}\"",
-            app.displayed_query().trim()
-        ),
-    );
+    render_footer(f, root[1], app.status_text(), app.footer_help_text());
 
     // Highlight the selected row by overdrawing it in the results pane.
     if total > 0 && inner_height > 0 && app.selected >= visible_start && app.selected < visible_end
@@ -7115,6 +7126,7 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             git_graph_scroll: 0,
             git_commit_scroll: 0,
+            last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
             input_mode: InputMode::SessionSearch,
@@ -7821,6 +7833,7 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             git_graph_scroll: 0,
             git_commit_scroll: 0,
+            last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
             input_mode: InputMode::SessionSearch,
@@ -7919,6 +7932,7 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             git_graph_scroll: 0,
             git_commit_scroll: 0,
+            last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
             input_mode: InputMode::SessionSearch,
@@ -9258,6 +9272,7 @@ mod tests {
             session_browser_active_pane: SessionBrowserPane::Start,
             git_graph_scroll: 0,
             git_commit_scroll: 0,
+            last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
             input_mode: InputMode::SessionSearch,
