@@ -437,8 +437,10 @@ fn sync_remotes_from_args_with_cache_path(
         let refresh_cmd = shell_command_string("ssh", &[&target, &remote_cmd, "refresh"]);
         let rsync_src = format!("{target}:{remote_cache_path}");
         let local_db = cache::remote_db_path_for(cache_path, &remote.name);
-        let rsync_cmd =
-            shell_command_string("rsync", &["-az", &rsync_src, local_db.to_string_lossy().as_ref()]);
+        let rsync_cmd = shell_command_string(
+            "rsync",
+            &["-az", &rsync_src, local_db.to_string_lossy().as_ref()],
+        );
         let record = telemetry::EventRecord::new(
             None,
             "remote_sync_started",
@@ -1234,7 +1236,14 @@ fn attach_machine_metadata(
     }
 }
 
-fn blank_record_metadata() -> (String, String, Option<String>, Option<String>, HashMap<String, String>, String) {
+fn blank_record_metadata() -> (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    HashMap<String, String>,
+    String,
+) {
     (
         String::new(),
         String::new(),

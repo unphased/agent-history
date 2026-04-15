@@ -475,9 +475,7 @@ pub fn load_records_from_remote_db(
     }
 
     let mut stmt = conn
-        .prepare(
-            &remote_message_records_query(version, false),
-        )
+        .prepare(&remote_message_records_query(version, false))
         .context("remote cache record query failed")?;
     let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
     let mut out = Vec::new();
@@ -545,9 +543,7 @@ pub fn stream_records_from_remote_db(
     }
 
     let mut stmt = conn
-        .prepare(
-            &remote_message_records_query(version, false),
-        )
+        .prepare(&remote_message_records_query(version, false))
         .context("remote cache record query failed")?;
     let rows = stmt.query_map([], |row| decode_message_record_row(row, Some(origin)))?;
     for row in rows {
