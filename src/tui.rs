@@ -3921,7 +3921,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     app.hovered_preview_record_idx =
                         app.preview_record_idx_at_mouse(&preview_doc, preview_area, mouse);
                     if let Some(record_idx) = app.hovered_preview_record_idx {
-                        app.select_preview_record_full_reveal_if_possible(
+                        app.select_preview_record_click_reveal(
                             &preview_doc,
                             preview_width,
                             preview_height,
@@ -4287,7 +4287,7 @@ impl App {
         self.preview_scroll_reset_pending = false;
     }
 
-    fn select_preview_record_full_reveal_if_possible(
+    fn select_preview_record_click_reveal(
         &mut self,
         doc: &PreviewDoc,
         preview_width: usize,
@@ -4306,16 +4306,9 @@ impl App {
             return;
         };
         self.selected_preview_record_idx = Some(record_idx);
-        let section_height = section_end.saturating_sub(section_start);
-        if section_height <= preview_height {
-            let viewport_start = self.preview_scroll;
-            let viewport_end = viewport_start.saturating_add(preview_height);
-            if section_start < viewport_start {
-                self.preview_scroll = section_start;
-            } else if section_end > viewport_end {
-                self.preview_scroll = section_end.saturating_sub(preview_height);
-            }
-        }
+        let min_scroll = cmp::min(section_start, section_end.saturating_sub(preview_height));
+        let max_scroll = cmp::max(section_start, section_end.saturating_sub(preview_height));
+        self.preview_scroll = self.preview_scroll.clamp(min_scroll, max_scroll);
         self.preview_scroll_reset_pending = false;
     }
 
@@ -9328,6 +9321,69 @@ mod tests {
         assert_eq!(app.hovered_preview_record_idx, Some(1));
         assert_eq!(app.preview_scroll, second_start);
         assert_eq!(app.input_mode, InputMode::PreviewNav);
+    }
+
+    #[test]
+    fn clicking_tall_preview_turn_reveals_as_much_of_it_as_possible() {
+        let tall_turn = (1..=24)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                &tall_turn,
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let area = Rect::new(0, 0, 100, 10);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let doc = app.session_browser_doc();
+        let (second_start, second_end) = preview_record_visual_bounds(&doc, preview_width, 1)
+            .expect("expected second preview record bounds");
+        let second_height = second_end.saturating_sub(second_start);
+        assert!(second_height > preview_height);
+
+        app.preview_scroll = second_end.saturating_sub(1);
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: preview_area.x + 2,
+                row: preview_area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.hovered_preview_record_idx, Some(1));
+        assert_eq!(
+            app.preview_scroll,
+            second_end.saturating_sub(preview_height)
+        );
     }
 
     #[test]
