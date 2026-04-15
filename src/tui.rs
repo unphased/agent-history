@@ -727,6 +727,14 @@ fn short_ts(ts: Option<&str>) -> String {
     ts.get(0..19).unwrap_or(ts).to_string()
 }
 
+fn short_ts_millis(ts: Option<&str>) -> String {
+    let ts = ts.unwrap_or("");
+    if let Some(formatted) = display_timestamp_millis(ts) {
+        return formatted;
+    }
+    ts.get(0..23).unwrap_or(ts).to_string()
+}
+
 fn parse_timestamp_epoch(ts: &str) -> Option<i64> {
     if let Ok(n) = ts.parse::<i64>() {
         let abs = n.unsigned_abs();
@@ -794,8 +802,32 @@ fn log_group_toggle_key(group: LogGroup) -> &'static str {
     }
 }
 
+fn telemetry_relative_age(now_ms: u128, event_ms: u128) -> String {
+    let elapsed_ms = now_ms.saturating_sub(event_ms);
+    if elapsed_ms < 1_000 {
+        return format!("{elapsed_ms}ms");
+    }
+    if elapsed_ms < 60_000 {
+        let secs = elapsed_ms / 1_000;
+        let millis = elapsed_ms % 1_000;
+        return format!("{secs}.{millis:03}s");
+    }
+    if elapsed_ms < 10_800_000 {
+        return format!("{}m", cmp::max(1, elapsed_ms / 60_000));
+    }
+    if elapsed_ms < 86_400_000 {
+        return format!("{}h", cmp::max(1, elapsed_ms / 3_600_000));
+    }
+    format!("{}d", cmp::max(1, elapsed_ms / 86_400_000))
+}
+
 fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
-    let ts = short_ts(Some(&record.ts_ms.to_string()));
+    format_telemetry_event_line_with_now(record, unix_now_nanos() / 1_000_000)
+}
+
+fn format_telemetry_event_line_with_now(record: &telemetry::EventRecord, now_ms: u128) -> String {
+    let ts = short_ts_millis(Some(&record.ts_ms.to_string()));
+    let rel = telemetry_relative_age(now_ms, record.ts_ms);
     let kind = record.kind.as_str();
     let data = &record.data;
     let prefix = record
@@ -957,7 +989,7 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
     if ts.is_empty() {
         format!("{prefix}{kind}: {summary}")
     } else {
-        format!("{ts}  {prefix}{kind}: {summary}")
+        format!("{ts}  {:>8}  {prefix}{kind}: {summary}", rel)
     }
 }
 
@@ -2333,6 +2365,11 @@ fn display_timestamp(ts: &str) -> Option<String> {
     Some(format_unix_seconds_short(secs))
 }
 
+fn display_timestamp_millis(ts: &str) -> Option<String> {
+    let nanos = parse_timestamp_nanos(ts)?;
+    Some(format_unix_timestamp_millis(nanos))
+}
+
 fn parse_rfc3339_timestamp_nanos(s: &str) -> Option<i128> {
     let bytes = s.as_bytes();
     if bytes.len() < 20 {
@@ -2468,6 +2505,13 @@ fn format_unix_seconds_short(secs: i64) -> String {
     let minute = (secs_of_day % 3_600) / 60;
     let second = secs_of_day % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+fn format_unix_timestamp_millis(nanos: i128) -> String {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let millis = nanos.rem_euclid(1_000_000_000).div_euclid(1_000_000);
+    let secs = i64::try_from(secs).unwrap_or_default();
+    format!("{}.{millis:03}", format_unix_seconds_short(secs))
 }
 
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
@@ -7689,16 +7733,19 @@ mod tests {
 
     #[test]
     fn telemetry_event_line_formats_ui_session_started_banner() {
-        let record = telemetry::EventRecord::new(
-            None,
-            "ui_session_started",
-            json!({
+        let record = telemetry::EventRecord {
+            ts_ms: 1_704_067_200_123,
+            group: None,
+            kind: "ui_session_started".to_string(),
+            data: json!({
                 "pid": 4242,
                 "cwd": "/Users/slu/agent-history",
             }),
-        );
+        };
 
-        let rendered = format_telemetry_event_line(&record);
+        let rendered = format_telemetry_event_line_with_now(&record, 1_704_067_320_123);
+        assert!(rendered.contains("2024-01-01T00:00:00.123"));
+        assert!(rendered.contains("  2m  "));
         assert!(rendered.contains("agent-history ui started"));
         assert!(rendered.contains("pid=4242"));
         assert!(rendered.contains("cwd=/Users/slu/agent-history"));
@@ -9160,11 +9207,32 @@ mod tests {
     }
 
     #[test]
+    fn short_ts_millis_formats_epoch_and_rfc3339_with_millis() {
+        assert_eq!(
+            short_ts_millis(Some("1704067200123")),
+            "2024-01-01T00:00:00.123"
+        );
+        assert_eq!(
+            short_ts_millis(Some("2026-02-10T00:00:00.456Z")),
+            "2026-02-10T00:00:00.456"
+        );
+    }
+
+    #[test]
     fn concise_elapsed_label_uses_compact_units() {
         assert_eq!(concise_elapsed_label(0), "now");
         assert_eq!(concise_elapsed_label(3_540), "59m");
         assert_eq!(concise_elapsed_label(7_200), "2h");
         assert_eq!(concise_elapsed_label(172_800), "2d");
+    }
+
+    #[test]
+    fn telemetry_relative_age_uses_ms_seconds_minutes_and_hours() {
+        assert_eq!(telemetry_relative_age(2_000, 1_877), "123ms");
+        assert_eq!(telemetry_relative_age(15_000, 3_655), "11.345s");
+        assert_eq!(telemetry_relative_age(7_200_000, 0), "120m");
+        assert_eq!(telemetry_relative_age(20_000_000, 0), "5h");
+        assert_eq!(telemetry_relative_age(200_000_000, 0), "2d");
     }
 
     #[test]
