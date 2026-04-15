@@ -77,6 +77,7 @@ struct SessionSummary {
     machine_id: String,
     machine_name: String,
     origin: String,
+    remote_desync_label: Option<String>,
     project_slug: Option<String>,
     first_user_idx: usize,
     last_ts: Option<String>,
@@ -447,6 +448,7 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
                 machine_id: key.machine_id.to_string(),
                 machine_name: agg.machine_name.unwrap_or(key.machine_id).to_string(),
                 origin: key.origin.to_string(),
+                remote_desync_label: None,
                 project_slug: agg.project_slug.map(|s| s.to_string()),
                 first_user_idx,
                 last_ts: agg.last_ts.map(|s| s.to_string()),
@@ -927,8 +929,7 @@ fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
         "remote_sync_started" => format!(
             "remote={} host={} started refresh_cmd={} rsync_cmd={}",
             telemetry_metric_str(data, "remote_name").unwrap_or(""),
-            telemetry_metric_str(data, "host").unwrap_or("")
-            ,
+            telemetry_metric_str(data, "host").unwrap_or(""),
             truncate_middle(telemetry_metric_str(data, "refresh_cmd").unwrap_or(""), 80),
             truncate_middle(telemetry_metric_str(data, "rsync_cmd").unwrap_or(""), 80)
         ),
@@ -983,6 +984,41 @@ fn tag_style(fg: Color, bg: Color) -> Style {
     Style::default().fg(fg).bg(bg)
 }
 
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn concise_elapsed_label(elapsed_secs: i64) -> String {
+    if elapsed_secs <= 0 {
+        return "now".to_string();
+    }
+    if elapsed_secs < 3_600 {
+        return format!("{}m", cmp::max(1, elapsed_secs / 60));
+    }
+    if elapsed_secs < 86_400 {
+        return format!("{}h", cmp::max(1, elapsed_secs / 3_600));
+    }
+    format!("{}d", cmp::max(1, elapsed_secs / 86_400))
+}
+
+fn remote_desync_label(state: &cache::RemoteSyncStatus, now_secs: i64) -> Option<String> {
+    let attempted = state.last_attempted_ms?;
+    let attempted_after_success = state
+        .last_success_ms
+        .is_none_or(|last_success| attempted >= last_success);
+    if state.last_error.is_none() || !attempted_after_success {
+        return None;
+    }
+    let age = state
+        .last_success_ms
+        .map(|last_success| concise_elapsed_label(now_secs.saturating_sub(last_success)))
+        .unwrap_or_else(|| "?".to_string());
+    Some(format!("Behind {age}"))
+}
+
 fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bool {
     tags.show_host && sess.origin != "local" && !sess.machine_name.trim().is_empty()
 }
@@ -990,6 +1026,8 @@ fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bo
 const REMOTE_ACCENT: Color = Color::Rgb(138, 112, 144);
 const REMOTE_TAG_BG: Color = Color::Rgb(82, 70, 88);
 const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
+const REMOTE_DESYNC_TAG_BG: Color = Color::Rgb(104, 54, 92);
+const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
 const QUERY_MATCH_FG: Color = Color::Black;
 
@@ -1030,13 +1068,20 @@ fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
         });
     }
     if should_show_host_tag(sess, tags) {
+        let desync = sess.remote_desync_label.as_deref();
         specs.push(SessionTagSpec {
             filter: TagFilter {
                 kind: TagFilterKind::Host,
                 value: sess.machine_name.clone(),
             },
-            content: format!(" {} ", sess.machine_name),
-            style: tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
+            content: match desync {
+                Some(label) => format!(" {} {} ", sess.machine_name, label),
+                None => format!(" {} ", sess.machine_name),
+            },
+            style: match desync {
+                Some(_) => tag_style(REMOTE_DESYNC_TAG_FG, REMOTE_DESYNC_TAG_BG),
+                None => tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
+            },
         });
     }
     if tags.show_project
@@ -2486,6 +2531,7 @@ struct App {
     preview_bgcolor: Option<Color>,
     preview_remote_style: bool,
     preview_bgcolor_cache: HashMap<String, Option<Color>>,
+    remote_sync_states: HashMap<String, cache::RemoteSyncStatus>,
     ui_tags: config::UiTagConfig,
     remotes: HashMap<String, config::RemoteConfig>,
     git_repo_cache: HashMap<PathBuf, GitRepoContext>,
@@ -2591,6 +2637,7 @@ fn run_app(
         preview_bgcolor: None,
         preview_remote_style: false,
         preview_bgcolor_cache: HashMap::new(),
+        remote_sync_states: HashMap::new(),
         ui_tags: app_config.ui.tags,
         remotes,
         git_repo_cache: HashMap::new(),
@@ -2791,6 +2838,7 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
         }
         IndexerEvent::Warn { message } => {
             app.indexing.last_warn = Some(message);
+            app.refresh_remote_sync_states();
         }
         IndexerEvent::Telemetry { record } => {
             app.append_event_record(record);
@@ -2808,6 +2856,7 @@ fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
     app.indexing.sessions = sessions.len();
     app.sessions = sessions;
     app.session_records = session_records;
+    app.refresh_remote_sync_states();
     app.ready = true;
     app.update_results();
 }
@@ -3252,9 +3301,9 @@ fn parse_git_commit_line(line: &str) -> Option<GitCommitEntry> {
 }
 
 fn parse_git_graph_hash_field(field: &str) -> Option<&str> {
-    field.split_whitespace().find(|token| {
-        token.len() >= 7 && token.chars().all(|ch| ch.is_ascii_hexdigit())
-    })
+    field
+        .split_whitespace()
+        .find(|token| token.len() >= 7 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
 fn normalize_git_remote_url(url: &str) -> String {
@@ -3286,7 +3335,10 @@ fn normalize_git_remote_url(url: &str) -> String {
             );
         }
     }
-    if let Some(rest) = without_suffix.strip_prefix("https://").or_else(|| without_suffix.strip_prefix("http://")) {
+    if let Some(rest) = without_suffix
+        .strip_prefix("https://")
+        .or_else(|| without_suffix.strip_prefix("http://"))
+    {
         let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
         if let Some((host, path)) = rest.split_once('/') {
             return format!(
@@ -3376,13 +3428,7 @@ fn with_selected_preview_line(
 fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Min(1),
-                Constraint::Length(app.footer_height()),
-            ]
-            .as_ref(),
-        )
+        .constraints([Constraint::Min(1), Constraint::Length(app.footer_height())].as_ref())
         .split(area)[0];
 
     let mut results_pct = app.layout_state.results_pct.clamp(MIN_RESULTS_PCT, 100);
@@ -3611,7 +3657,9 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     app.build_preview_doc()
                 };
                 let preview_width = preview_area.width.saturating_sub(2) as usize;
-                if let Some(record_idx) = app.hovered_preview_record_idx(&preview_doc, preview_area, mouse) {
+                if let Some(record_idx) =
+                    app.hovered_preview_record_idx(&preview_doc, preview_area, mouse)
+                {
                     app.selected_preview_record_idx = Some(record_idx);
                     if preview_width > 0 {
                         app.preview_scroll_reset_pending = false;
@@ -3716,16 +3764,17 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                         } else {
                             100 - MIN_GIT_PCT - MIN_TURNS_PCT
                         };
-                        app.layout_state.results_pct = pct.clamp(
-                            MIN_RESULTS_PCT as i16,
-                            max_results as i16,
-                        ) as u16;
+                        app.layout_state.results_pct =
+                            pct.clamp(MIN_RESULTS_PCT as i16, max_results as i16) as u16;
                     }
                     ActiveSplit::GitTurns => {
                         let git_split_rect = geometry.git_graph.or(geometry.git_commit);
                         if let Some(git_split_rect) = git_split_rect {
-                            let total =
-                                geometry.results.height.saturating_add(git_split_rect.height).max(1);
+                            let total = geometry
+                                .results
+                                .height
+                                .saturating_add(git_split_rect.height)
+                                .max(1);
                             let rel = mouse.row.saturating_sub(geometry.results.y) as u32;
                             let results_pct = ((rel * 100) / total as u32) as i16;
                             let git_pct = 100 - results_pct;
@@ -3786,9 +3835,7 @@ fn current_preview_inner_width(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &App,
 ) -> anyhow::Result<usize> {
-    Ok(current_preview_area(terminal, app)?
-        .width
-        .saturating_sub(2) as usize)
+    Ok(current_preview_area(terminal, app)?.width.saturating_sub(2) as usize)
 }
 
 fn current_preview_inner_height(
@@ -3801,6 +3848,30 @@ fn current_preview_inner_height(
 }
 
 impl App {
+    fn refresh_remote_sync_states(&mut self) {
+        let states = self
+            .cache_path
+            .as_deref()
+            .and_then(|cache_path| cache::CacheStore::open(cache_path, false).ok())
+            .and_then(|store| store.load_remote_sync_states().ok())
+            .unwrap_or_default();
+        self.remote_sync_states = states
+            .into_iter()
+            .map(|state| (state.remote_name.clone(), state))
+            .collect();
+        self.apply_remote_sync_states();
+    }
+
+    fn apply_remote_sync_states(&mut self) {
+        let now_secs = unix_now_secs();
+        for sess in &mut self.sessions {
+            sess.remote_desync_label = self
+                .remote_sync_states
+                .get(&sess.origin)
+                .and_then(|state| remote_desync_label(state, now_secs));
+        }
+    }
+
     fn current_preview_selection(&self, doc: &PreviewDoc, preview_width: usize) -> Option<usize> {
         self.selected_preview_record_idx
             .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
@@ -3833,9 +3904,17 @@ impl App {
         mouse: MouseEvent,
     ) -> Option<usize> {
         if mouse.column <= preview_area.x
-            || mouse.column >= preview_area.x.saturating_add(preview_area.width).saturating_sub(1)
+            || mouse.column
+                >= preview_area
+                    .x
+                    .saturating_add(preview_area.width)
+                    .saturating_sub(1)
             || mouse.row <= preview_area.y
-            || mouse.row >= preview_area.y.saturating_add(preview_area.height).saturating_sub(1)
+            || mouse.row
+                >= preview_area
+                    .y
+                    .saturating_add(preview_area.height)
+                    .saturating_sub(1)
         {
             return None;
         }
@@ -3846,7 +3925,8 @@ impl App {
         let visual_offset = self
             .preview_scroll
             .saturating_add((mouse.row - preview_area.y - 1) as usize);
-        let raw = preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, visual_offset);
+        let raw =
+            preview_raw_line_index_for_visual_offset(&doc.lines, preview_width, visual_offset);
         doc.line_record_indices.get(raw).and_then(|idx| *idx)
     }
 
@@ -3906,10 +3986,8 @@ impl App {
                 } else {
                     100 - MIN_GIT_PCT - MIN_TURNS_PCT
                 };
-                let next = (self.layout_state.results_pct as i16 + delta).clamp(
-                    MIN_RESULTS_PCT as i16,
-                    max_results as i16,
-                );
+                let next = (self.layout_state.results_pct as i16 + delta)
+                    .clamp(MIN_RESULTS_PCT as i16, max_results as i16);
                 self.layout_state.results_pct = next as u16;
             }
             ActiveSplit::GitTurns => {
@@ -3938,7 +4016,9 @@ impl App {
         if self.show_telemetry || !self.git_graph_visible {
             return GitViewState::Unavailable;
         }
-        let Some(anchor_record_idx) = self.selected_anchor_record_idx(preview_width, preview_height) else {
+        let Some(anchor_record_idx) =
+            self.selected_anchor_record_idx(preview_width, preview_height)
+        else {
             return GitViewState::Unavailable;
         };
         let Some(rec) = self.all.get(anchor_record_idx).cloned() else {
@@ -3955,7 +4035,8 @@ impl App {
                 let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
                     return GitViewState::Unavailable;
                 };
-                let Some(selected_commit_idx) = selected_git_commit_idx(&repo.commits, anchor_ts) else {
+                let Some(selected_commit_idx) = selected_git_commit_idx(&repo.commits, anchor_ts)
+                else {
                     return GitViewState::Unavailable;
                 };
                 git_match.selected_commit_idx = selected_commit_idx;
@@ -4008,7 +4089,12 @@ impl App {
 
     fn resolve_git_repo_for_record(&mut self, rec: &MessageRecord) -> GitViewState {
         if rec.origin == "local" {
-            let Some(cwd) = rec.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+            let Some(cwd) = rec
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+            else {
                 return GitViewState::Unavailable;
             };
             let Some(repo_root) = self.resolve_repo_root(cwd) else {
@@ -4023,7 +4109,11 @@ impl App {
             });
         }
 
-        let Some(remote_repo_root) = rec.git_repo_root.as_deref().filter(|root| !root.trim().is_empty()) else {
+        let Some(remote_repo_root) = rec
+            .git_repo_root
+            .as_deref()
+            .filter(|root| !root.trim().is_empty())
+        else {
             return GitViewState::RemoteUnavailable(RemoteGitUnavailable {
                 remote_repo_root: None,
                 search_root: env::var_os("HOME")
@@ -4063,11 +4153,7 @@ impl App {
         }
         let mut normalized_remotes = expected_remotes.iter().cloned().collect::<Vec<_>>();
         normalized_remotes.sort();
-        let cache_key = format!(
-            "{}|{}",
-            remote_repo_root,
-            normalized_remotes.join("|")
-        );
+        let cache_key = format!("{}|{}", remote_repo_root, normalized_remotes.join("|"));
         if let Some(cached) = self.remote_git_lookup_cache.get(&cache_key) {
             return match cached {
                 RemoteGitLookup::Resolved(repo_root) => GitViewState::Available(GitMatch {
@@ -4116,7 +4202,10 @@ impl App {
             {
                 continue;
             }
-            if !candidates.iter().any(|candidate: &PathBuf| candidate == &repo_root) {
+            if !candidates
+                .iter()
+                .any(|candidate: &PathBuf| candidate == &repo_root)
+            {
                 candidates.push(repo_root);
             }
         }
@@ -4168,7 +4257,9 @@ impl App {
                 .arg("--get-regexp")
                 .arg(r"^remote\..*\.url$")
                 .output()
-                .with_context(|| format!("failed to read git remotes from {}", repo_root.display()))?;
+                .with_context(|| {
+                    format!("failed to read git remotes from {}", repo_root.display())
+                })?;
             let mut remotes = HashMap::new();
             if remotes_output.status.success() {
                 for line in String::from_utf8_lossy(&remotes_output.stdout).lines() {
@@ -4307,7 +4398,8 @@ impl App {
         let Some(record_idx) = record_idx else {
             return self.preview_title(label);
         };
-        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx) else {
+        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx)
+        else {
             return self.preview_title(label);
         };
         format!("{label}  turn {turn_idx}/{total_turns}")
@@ -4317,7 +4409,8 @@ impl App {
         let Some(record_idx) = record_idx else {
             return self.preview_title("Turns");
         };
-        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx) else {
+        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx)
+        else {
             return self.preview_title("Turns");
         };
         format!("Turns  turn {turn_idx}/{total_turns}")
@@ -4644,7 +4737,10 @@ impl App {
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
-            if !matches!(self.active_pane, ActivePane::GitGraph | ActivePane::GitCommit) {
+            if !matches!(
+                self.active_pane,
+                ActivePane::GitGraph | ActivePane::GitCommit
+            ) {
                 self.active_pane = ActivePane::TurnPreview;
             }
             self.preview_scroll_reset_pending = true;
@@ -5145,7 +5241,10 @@ impl App {
                         Line::raw("git: no validated local repo match"),
                         Line::raw(format!(
                             "remote repo: {}",
-                            unavailable.remote_repo_root.as_deref().unwrap_or("(missing)")
+                            unavailable
+                                .remote_repo_root
+                                .as_deref()
+                                .unwrap_or("(missing)")
                         )),
                         Line::raw(format!("searched: {}", unavailable.search_root.display())),
                         Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
@@ -5223,7 +5322,10 @@ impl App {
                         Line::raw("git commit preview unavailable"),
                         Line::raw(format!(
                             "remote repo: {}",
-                            unavailable.remote_repo_root.as_deref().unwrap_or("(missing)")
+                            unavailable
+                                .remote_repo_root
+                                .as_deref()
+                                .unwrap_or("(missing)")
                         )),
                         Line::raw(format!("searched: {}", unavailable.search_root.display())),
                         Line::raw(format!("matching repos: {}", unavailable.candidate_count)),
@@ -5440,7 +5542,9 @@ impl App {
                 0
             }
         } else {
-            current_pos.checked_sub(1).unwrap_or(section_records.len() - 1)
+            current_pos
+                .checked_sub(1)
+                .unwrap_or(section_records.len() - 1)
         };
         self.select_preview_record(&doc, preview_width, section_records[target_pos], true);
     }
@@ -5552,13 +5656,7 @@ impl App {
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Min(1),
-                Constraint::Length(app.footer_height()),
-            ]
-            .as_ref(),
-        )
+        .constraints([Constraint::Min(1), Constraint::Length(app.footer_height())].as_ref())
         .split(f.area());
 
     let displayed_query = app.displayed_query().to_string();
@@ -5567,7 +5665,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
             .style(Style::default().fg(Color::White));
         f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
-        let cursor_x = root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+        let cursor_x =
+            root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
         let cursor_y = root[0].y;
         f.set_cursor_position((cursor_x, cursor_y));
 
@@ -5698,7 +5797,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
             .style(Style::default().fg(Color::White));
         f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
-        let cursor_x = root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+        let cursor_x =
+            root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
         let cursor_y = root[0].y;
         f.set_cursor_position((cursor_x, cursor_y));
 
@@ -5754,7 +5854,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
         .style(Style::default().fg(Color::White));
     f.render_widget(query, geometry.query);
-    let cursor_x = geometry.query.x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+    let cursor_x =
+        geometry.query.x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
     let cursor_y = geometry.query.y;
     f.set_cursor_position((cursor_x, cursor_y));
 
@@ -5910,8 +6011,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         app.preview_scroll_reset_pending = false;
     }
     let layout_started = Instant::now();
-    let preview_total_lines =
-        preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+    let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     if app.log_group_enabled(LogGroup::Perf) {
@@ -6555,6 +6655,7 @@ mod tests {
             preview_bgcolor: None,
             preview_remote_style: false,
             preview_bgcolor_cache: HashMap::new(),
+            remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
@@ -7258,6 +7359,7 @@ mod tests {
             preview_bgcolor: None,
             preview_remote_style: false,
             preview_bgcolor_cache: HashMap::new(),
+            remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
@@ -7353,6 +7455,7 @@ mod tests {
             preview_bgcolor: None,
             preview_remote_style: false,
             preview_bgcolor_cache: HashMap::new(),
+            remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
@@ -7703,10 +7806,9 @@ mod tests {
         app.query = "needle".to_string();
         app.update_results();
 
-        let matched_record_idx = app.selected_record().and_then(|_| {
-            app.selected_hit()
-                .and_then(|hit| hit.matched_record_idx)
-        });
+        let matched_record_idx = app
+            .selected_record()
+            .and_then(|_| app.selected_hit().and_then(|hit| hit.matched_record_idx));
 
         assert_eq!(
             app.query_preview_title("Preview", matched_record_idx),
@@ -7742,10 +7844,7 @@ mod tests {
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
 
-        assert_eq!(
-            app.turns_preview_title(Some(1)),
-            "Turns  turn 2/3"
-        );
+        assert_eq!(app.turns_preview_title(Some(1)), "Turns  turn 2/3");
     }
 
     #[test]
@@ -8203,6 +8302,7 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "local".to_string(),
             origin: "local".to_string(),
+            remote_desync_label: None,
             project_slug: Some("proj".to_string()),
         };
         let rec = test_record(MessageRecord {
@@ -8502,6 +8602,7 @@ mod tests {
             machine_id: "mini".to_string(),
             machine_name: "Mini".to_string(),
             origin: "remote".to_string(),
+            remote_desync_label: None,
             project_slug: Some("proj".to_string()),
         };
 
@@ -8602,6 +8703,7 @@ mod tests {
             preview_bgcolor: None,
             preview_remote_style: false,
             preview_bgcolor_cache: HashMap::new(),
+            remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
@@ -8772,6 +8874,7 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "MBP".to_string(),
             origin: "local".to_string(),
+            remote_desync_label: None,
             project_slug: None,
         };
 
@@ -8797,6 +8900,7 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "MBP".to_string(),
             origin: "local".to_string(),
+            remote_desync_label: None,
             project_slug: None,
         };
         let tags = config::UiTagConfig {
@@ -8826,6 +8930,7 @@ mod tests {
             machine_id: "local".to_string(),
             machine_name: "MBP M1 Max".to_string(),
             origin: "local".to_string(),
+            remote_desync_label: None,
             project_slug: None,
         };
 
@@ -8851,6 +8956,7 @@ mod tests {
             machine_id: "mini".to_string(),
             machine_name: "Mini".to_string(),
             origin: "workstation".to_string(),
+            remote_desync_label: None,
             project_slug: None,
         };
 
@@ -8863,12 +8969,81 @@ mod tests {
     }
 
     #[test]
+    fn session_tag_spans_show_remote_host_desync_label() {
+        let sess = SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "s1".to_string(),
+            account: None,
+            first_user_idx: 0,
+            last_ts: None,
+            cwd: None,
+            dir: "proj".to_string(),
+            first_line: "hello".to_string(),
+            machine_id: "mini".to_string(),
+            machine_name: "Mini".to_string(),
+            origin: "workstation".to_string(),
+            remote_desync_label: Some("Behind 3h".to_string()),
+            project_slug: None,
+        };
+
+        let rendered = session_tag_spans(&sess, &config::UiTagConfig::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(rendered.contains("Mini Behind 3h"));
+    }
+
+    #[test]
+    fn remote_desync_label_uses_last_success_age_when_latest_attempt_failed() {
+        let state = cache::RemoteSyncStatus {
+            remote_name: "workstation".to_string(),
+            host: "workstation.local".to_string(),
+            last_attempted_ms: Some(10_000),
+            last_success_ms: Some(2_800),
+            last_duration_ms: Some(200),
+            imported_records: 10,
+            imported_sessions: 2,
+            last_error: Some("ssh failed".to_string()),
+        };
+
+        assert_eq!(
+            remote_desync_label(&state, 10_000).as_deref(),
+            Some("Behind 2h")
+        );
+    }
+
+    #[test]
+    fn remote_desync_label_ignores_last_error_when_success_is_newer() {
+        let state = cache::RemoteSyncStatus {
+            remote_name: "workstation".to_string(),
+            host: "workstation.local".to_string(),
+            last_attempted_ms: Some(10_000),
+            last_success_ms: Some(10_100),
+            last_duration_ms: Some(200),
+            imported_records: 10,
+            imported_sessions: 2,
+            last_error: Some("stale error".to_string()),
+        };
+
+        assert_eq!(remote_desync_label(&state, 10_200), None);
+    }
+
+    #[test]
     fn short_ts_formats_epoch_timestamps_for_display() {
         assert_eq!(short_ts(Some("1704067200000")), "2024-01-01T00:00:00");
         assert_eq!(
             short_ts(Some("2026-02-10T00:00:00Z")),
             "2026-02-10T00:00:00"
         );
+    }
+
+    #[test]
+    fn concise_elapsed_label_uses_compact_units() {
+        assert_eq!(concise_elapsed_label(0), "now");
+        assert_eq!(concise_elapsed_label(3_540), "59m");
+        assert_eq!(concise_elapsed_label(7_200), "2h");
+        assert_eq!(concise_elapsed_label(172_800), "2d");
     }
 
     #[test]
