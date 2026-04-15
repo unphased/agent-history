@@ -37,6 +37,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -674,6 +675,107 @@ fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     cmp::max(1, line.width().div_ceil(width))
 }
 
+fn lighten_preview_color(color: Color, amount: f32) -> Color {
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    let lift = |component: u8| -> u8 {
+        let component = component as f32;
+        (component + (255.0 - component) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(lift(red), lift(green), lift(blue))
+}
+
+fn preview_record_highlight_colors(preview_bgcolor: Option<Color>) -> (Color, Color) {
+    let base = preview_bgcolor.unwrap_or(PREVIEW_HOVER_BG);
+    let hover_bg = lighten_preview_color(base, PREVIEW_HOVER_LIGHTEN_AMOUNT);
+    let selected_bg = lighten_preview_color(base, PREVIEW_SELECTED_LIGHTEN_AMOUNT);
+    (
+        if matches!(hover_bg, Color::Rgb(..)) {
+            hover_bg
+        } else {
+            PREVIEW_HOVER_BG
+        },
+        if matches!(selected_bg, Color::Rgb(..)) {
+            selected_bg
+        } else {
+            PREVIEW_SELECTED_BG
+        },
+    )
+}
+
+fn wrap_preview_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    if line.spans.is_empty() {
+        return vec![Line::raw("")];
+    }
+
+    let mut wrapped_lines = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in &line.spans {
+        let mut current_text = String::new();
+        for ch in span.content.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width > 0 && char_width > 0 && current_width + char_width > width {
+                if !current_text.is_empty() {
+                    current_spans.push(Span::styled(mem::take(&mut current_text), span.style));
+                }
+                wrapped_lines.push(Line::from(mem::take(&mut current_spans)));
+                current_width = 0;
+            }
+
+            current_text.push(ch);
+            current_width += char_width;
+
+            if current_width >= width {
+                if !current_text.is_empty() {
+                    current_spans.push(Span::styled(mem::take(&mut current_text), span.style));
+                }
+                wrapped_lines.push(Line::from(mem::take(&mut current_spans)));
+                current_width = 0;
+            }
+        }
+
+        if !current_text.is_empty() {
+            current_spans.push(Span::styled(current_text, span.style));
+        }
+    }
+
+    if !current_spans.is_empty() || wrapped_lines.is_empty() {
+        wrapped_lines.push(Line::from(current_spans));
+    }
+
+    wrapped_lines
+}
+
+fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> Line<'static> {
+    if width == 0 {
+        return line.clone();
+    }
+    let mut spans = line
+        .spans
+        .iter()
+        .cloned()
+        .map(|span| Span::styled(span.content, span.style.patch(Style::default().bg(bg))))
+        .collect::<Vec<_>>();
+    let used_width = line.width();
+    if used_width < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used_width),
+            Style::default().bg(bg),
+        ));
+    } else if spans.is_empty() {
+        spans.push(Span::styled(" ".repeat(width), Style::default().bg(bg)));
+    }
+    Line::from(spans)
+}
+
 fn preview_visual_line_count(lines: &[Line<'_>], width: usize) -> usize {
     lines
         .iter()
@@ -1129,6 +1231,10 @@ const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
 const REMOTE_DESYNC_TAG_BG: Color = Color::Rgb(104, 54, 92);
 const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
+const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
+const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
+const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
+const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
 const QUERY_MATCH_FG: Color = Color::Black;
 
 const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
@@ -1281,18 +1387,13 @@ fn highlighted_line(text: &str, query: &str, base_style: Style) -> Line<'static>
 
 #[derive(Clone, Copy)]
 struct MarkdownTheme {
-    heading_markers: Style,
     headings: [Style; 6],
-    quote_markers: Style,
     quote_text: Style,
     list_markers: Style,
     rule: Style,
     inline_code: Style,
-    markdown_markers: Style,
     link_text: Style,
     link_url: Style,
-    table_pipes: Style,
-    table_rule: Style,
     code_fence: Style,
     code_text: Style,
     code_keyword: Style,
@@ -1310,7 +1411,6 @@ struct MarkdownTheme {
 impl MarkdownTheme {
     fn new(base_style: Style) -> Self {
         Self {
-            heading_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             headings: [
                 base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1319,7 +1419,6 @@ impl MarkdownTheme {
                 base_style.fg(Color::LightBlue).add_modifier(Modifier::BOLD),
                 base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ],
-            quote_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             quote_text: base_style.fg(Color::Gray).add_modifier(Modifier::ITALIC),
             list_markers: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
             rule: base_style.fg(Color::DarkGray),
@@ -1327,13 +1426,10 @@ impl MarkdownTheme {
                 .fg(Color::Yellow)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
-            markdown_markers: base_style.fg(Color::DarkGray),
             link_text: base_style
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
             link_url: base_style.fg(Color::Cyan),
-            table_pipes: base_style.fg(Color::DarkGray),
-            table_rule: base_style.fg(Color::DarkGray),
             code_fence: base_style.fg(Color::DarkGray),
             code_text: base_style.fg(Color::LightYellow),
             code_keyword: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1487,22 +1583,19 @@ fn render_markdown_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>>
 
     if let Some((indent, level, content)) = parse_heading(line) {
         let mut spans = Vec::new();
+        let heading_style = theme.heading_style(level);
         push_styled_text(&mut spans, indent.to_string(), Style::default());
-        push_styled_text(&mut spans, "#".repeat(level), theme.heading_markers);
+        push_styled_text(&mut spans, "#".repeat(level), heading_style);
         if line.trim_start().len() > level {
-            push_styled_text(&mut spans, " ".to_string(), theme.heading_markers);
+            push_styled_text(&mut spans, " ".to_string(), heading_style);
         }
-        spans.extend(render_inline_markdown(
-            content,
-            theme.heading_style(level),
-            theme,
-        ));
+        spans.extend(render_inline_markdown(content, heading_style, theme));
         return spans;
     }
 
     if let Some((prefix, content)) = parse_blockquote(line) {
         let mut spans = Vec::new();
-        push_styled_text(&mut spans, prefix.to_string(), theme.quote_markers);
+        push_styled_text(&mut spans, prefix.to_string(), theme.quote_text);
         spans.extend(render_inline_markdown(content, theme.quote_text, theme));
         return spans;
     }
@@ -1516,7 +1609,7 @@ fn render_markdown_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>>
     }
 
     if is_table_rule(line) {
-        return render_table_line(line, theme, theme.table_rule);
+        return render_table_line(line, theme, theme.rule);
     }
 
     if line.contains('|') {
@@ -1536,7 +1629,7 @@ fn render_table_line(line: &str, theme: &MarkdownTheme, text_style: Style) -> Ve
         if start < idx {
             spans.extend(render_inline_markdown(&line[start..idx], text_style, theme));
         }
-        push_styled_text(&mut spans, "|".to_string(), theme.table_pipes);
+        push_styled_text(&mut spans, "|".to_string(), text_style);
         start = idx + ch.len_utf8();
     }
     if start < line.len() {
@@ -1846,13 +1939,13 @@ fn render_inline_markdown(
             push_styled_text(
                 &mut spans,
                 rest[..marker_len].to_string(),
-                theme.markdown_markers,
+                theme.inline_code,
             );
             push_styled_text(&mut spans, code.to_string(), theme.inline_code);
             push_styled_text(
                 &mut spans,
                 rest[consumed - marker_len..consumed].to_string(),
-                theme.markdown_markers,
+                theme.inline_code,
             );
             idx += consumed;
             continue;
@@ -1860,50 +1953,41 @@ fn render_inline_markdown(
 
         if let Some((consumed, label, url)) = parse_inline_link(rest) {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "[".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, "[".to_string(), theme.link_text);
             spans.extend(render_inline_markdown(label, theme.link_text, theme));
-            push_styled_text(&mut spans, "](".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, "](".to_string(), theme.link_url);
             push_styled_text(&mut spans, url.to_string(), theme.link_url);
-            push_styled_text(&mut spans, ")".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, ")".to_string(), theme.link_url);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "~~") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.strike),
-                theme,
-            ));
-            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
+            let strike_style = base_style.patch(theme.strike);
+            push_styled_text(&mut spans, "~~".to_string(), strike_style);
+            spans.extend(render_inline_markdown(inner, strike_style, theme));
+            push_styled_text(&mut spans, "~~".to_string(), strike_style);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "**") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.strong),
-                theme,
-            ));
-            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
+            let strong_style = base_style.patch(theme.strong);
+            push_styled_text(&mut spans, "**".to_string(), strong_style);
+            spans.extend(render_inline_markdown(inner, strong_style, theme));
+            push_styled_text(&mut spans, "**".to_string(), strong_style);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "*") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.emphasis),
-                theme,
-            ));
-            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
+            let emphasis_style = base_style.patch(theme.emphasis);
+            push_styled_text(&mut spans, "*".to_string(), emphasis_style);
+            spans.extend(render_inline_markdown(inner, emphasis_style, theme));
+            push_styled_text(&mut spans, "*".to_string(), emphasis_style);
             idx += consumed;
             continue;
         }
@@ -3651,56 +3735,39 @@ fn with_anchor_indicator(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> 
     lines
 }
 
-fn highlight_preview_record(
-    lines: &mut [Line<'static>],
-    doc: &PreviewDoc,
-    record_idx: usize,
-    style: Style,
-) {
-    for (line_idx, line_record_idx) in doc.line_record_indices.iter().enumerate() {
-        if *line_record_idx != Some(record_idx) {
-            continue;
-        }
-        lines[line_idx] = Line::from(
-            lines[line_idx]
-                .spans
-                .iter()
-                .cloned()
-                .map(|span| Span::styled(span.content, span.style.patch(style)))
-                .collect::<Vec<_>>(),
-        );
-    }
-}
-
 fn with_preview_record_highlights(
     doc: &PreviewDoc,
+    preview_width: usize,
     selected_record_idx: Option<usize>,
     hovered_record_idx: Option<usize>,
     anchor_record_idx: Option<usize>,
+    preview_bgcolor: Option<Color>,
 ) -> Vec<Line<'static>> {
-    let mut lines = with_anchor_indicator(doc, anchor_record_idx);
-    if let Some(hovered_record_idx) =
-        hovered_record_idx.filter(|idx| Some(*idx) != selected_record_idx)
+    if preview_width == 0 {
+        return with_anchor_indicator(doc, anchor_record_idx);
+    }
+
+    let (hover_bg, selected_bg) = preview_record_highlight_colors(preview_bgcolor);
+    let lines = with_anchor_indicator(doc, anchor_record_idx);
+    let mut visual_lines = Vec::new();
+    for (line, record_idx) in lines
+        .into_iter()
+        .zip(doc.line_record_indices.iter().copied())
     {
-        highlight_preview_record(
-            &mut lines,
-            doc,
-            hovered_record_idx,
-            Style::default().bg(Color::DarkGray),
-        );
+        let highlight_bg = match record_idx {
+            Some(record_idx) if Some(record_idx) == selected_record_idx => Some(selected_bg),
+            Some(record_idx) if Some(record_idx) == hovered_record_idx => Some(hover_bg),
+            _ => None,
+        };
+        for wrapped_line in wrap_preview_line(&line, preview_width) {
+            visual_lines.push(if let Some(bg) = highlight_bg {
+                preview_line_with_block_bg(&wrapped_line, preview_width, bg)
+            } else {
+                wrapped_line
+            });
+        }
     }
-    if let Some(selected_record_idx) = selected_record_idx {
-        highlight_preview_record(
-            &mut lines,
-            doc,
-            selected_record_idx,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    lines
+    visual_lines
 }
 
 fn app_geometry(area: Rect, app: &App) -> PaneGeometry {
@@ -6740,8 +6807,21 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         app.preview_scroll = first_match_visual_line.saturating_sub(2);
         app.preview_scroll_reset_pending = false;
     }
+    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
+        app.current_preview_selection(&preview_doc, preview_inner_width)
+    } else {
+        None
+    };
     let layout_started = Instant::now();
-    let preview_total_lines = preview_visual_line_count(&preview_doc.lines, preview_inner_width);
+    let preview_lines = with_preview_record_highlights(
+        &preview_doc,
+        preview_inner_width,
+        selected_preview_record_idx,
+        app.hovered_preview_record_idx,
+        turn_anchor_record_idx,
+        app.preview_bgcolor,
+    );
+    let preview_total_lines = preview_lines.len();
     let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     if app.log_group_enabled(LogGroup::Perf) {
@@ -6758,11 +6838,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             }),
         );
     }
-    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
-        app.current_preview_selection(&preview_doc, preview_inner_width)
-    } else {
-        None
-    };
     let preview_title = if !app.showing_session_browser() && !query.is_empty() {
         app.query_preview_title("Preview", selected_preview_record_idx)
     } else if app.showing_session_browser() {
@@ -6770,22 +6845,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         app.preview_title("Preview")
     };
-    let preview = Paragraph::new(Text::from(with_preview_record_highlights(
-        &preview_doc,
-        selected_preview_record_idx,
-        app.hovered_preview_record_idx,
-        turn_anchor_record_idx,
-    )))
-    .style(preview_style)
-    .block(
-        Block::default()
-            .style(preview_style)
-            .border_style(preview_border_style)
-            .borders(Borders::ALL)
-            .title(preview_title),
-    )
-    .scroll((app.preview_scroll as u16, 0))
-    .wrap(Wrap { trim: false });
+    let preview = Paragraph::new(Text::from(preview_lines))
+        .style(preview_style)
+        .block(
+            Block::default()
+                .style(preview_style)
+                .border_style(preview_border_style)
+                .borders(Borders::ALL)
+                .title(preview_title),
+        )
+        .scroll((app.preview_scroll as u16, 0));
     f.render_widget(preview, preview_area);
 
     render_footer(f, root[1], app.status_text(), app.footer_help_text());
@@ -9548,7 +9617,9 @@ mod tests {
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
         let doc = app.session_browser_doc();
-        let lines = with_preview_record_highlights(&doc, Some(1), Some(2), None);
+        let preview_bg = Some(Color::Rgb(32, 52, 84));
+        let (hover_bg, selected_bg) = preview_record_highlight_colors(preview_bg);
+        let lines = with_preview_record_highlights(&doc, 200, Some(1), Some(2), None, preview_bg);
         let second_line_idx = doc
             .line_record_indices
             .iter()
@@ -9560,15 +9631,11 @@ mod tests {
             .position(|record_idx| *record_idx == Some(2))
             .expect("expected hovered record line");
 
-        assert_eq!(
-            lines[second_line_idx].spans[0].style.bg,
-            Some(Color::Yellow)
-        );
-        assert_eq!(lines[second_line_idx].spans[0].style.fg, Some(Color::Black));
-        assert_eq!(
-            lines[third_line_idx].spans[0].style.bg,
-            Some(Color::DarkGray)
-        );
+        assert_eq!(lines[second_line_idx].spans[0].style.bg, Some(selected_bg));
+        assert_eq!(lines[second_line_idx].spans[0].style.fg, None);
+        assert_eq!(lines[second_line_idx].width(), 200);
+        assert_eq!(lines[third_line_idx].spans[0].style.bg, Some(hover_bg));
+        assert_eq!(lines[third_line_idx].width(), 200);
     }
 
     #[test]
@@ -9818,9 +9885,16 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "# Heading with `code`");
-        assert_eq!(lines[0].spans[0].style, theme.heading_markers);
-        assert_eq!(lines[0].spans[1].style, theme.heading_style(1));
-        assert_eq!(lines[0].spans[3].style, theme.inline_code);
+        assert!(lines[0].spans.iter().any(
+            |span| span.content.as_ref().contains('#') && span.style == theme.heading_style(1)
+        ));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("code")
+                    && span.style == theme.inline_code)
+        );
     }
 
     #[test]
@@ -9830,8 +9904,20 @@ mod tests {
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(line_text(&lines[0]), "[docs](https://example.com)");
-        assert_eq!(lines[0].spans[1].style, theme.link_text);
-        assert_eq!(lines[0].spans[3].style, theme.link_url);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("docs")
+                    && span.style == theme.link_text)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("https://example.com")
+                    && span.style == theme.link_url)
+        );
     }
 
     #[test]
@@ -9891,9 +9977,44 @@ mod tests {
 
         assert_eq!(line_text(&lines[0]), "> quoted");
         assert_eq!(line_text(&lines[1]), "- item");
-        assert_eq!(lines[0].spans[0].style, theme.quote_markers);
-        assert_eq!(lines[0].spans[1].style, theme.quote_text);
+        assert_eq!(lines[0].spans[0].style, theme.quote_text);
         assert_eq!(lines[1].spans[0].style, theme.list_markers);
+    }
+
+    #[test]
+    fn preview_markdown_renders_emphasis_markers_with_content_style() {
+        let lines = render_preview_message_lines(
+            "**bold** and *italic* and ~~gone~~",
+            "",
+            Style::default(),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(line_text(&lines[0]), "**bold** and *italic* and ~~gone~~");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("bold")
+                    && span.content.as_ref().contains("**")
+                    && span.style == theme.strong)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("italic")
+                    && span.content.as_ref().contains('*')
+                    && span.style == theme.emphasis)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("gone")
+                    && span.content.as_ref().contains("~~")
+                    && span.style == theme.strike)
+        );
     }
 
     #[test]
