@@ -1387,18 +1387,13 @@ fn highlighted_line(text: &str, query: &str, base_style: Style) -> Line<'static>
 
 #[derive(Clone, Copy)]
 struct MarkdownTheme {
-    heading_markers: Style,
     headings: [Style; 6],
-    quote_markers: Style,
     quote_text: Style,
     list_markers: Style,
     rule: Style,
     inline_code: Style,
-    markdown_markers: Style,
     link_text: Style,
     link_url: Style,
-    table_pipes: Style,
-    table_rule: Style,
     code_fence: Style,
     code_text: Style,
     code_keyword: Style,
@@ -1416,7 +1411,6 @@ struct MarkdownTheme {
 impl MarkdownTheme {
     fn new(base_style: Style) -> Self {
         Self {
-            heading_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             headings: [
                 base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1425,7 +1419,6 @@ impl MarkdownTheme {
                 base_style.fg(Color::LightBlue).add_modifier(Modifier::BOLD),
                 base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ],
-            quote_markers: base_style.fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             quote_text: base_style.fg(Color::Gray).add_modifier(Modifier::ITALIC),
             list_markers: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
             rule: base_style.fg(Color::DarkGray),
@@ -1433,13 +1426,10 @@ impl MarkdownTheme {
                 .fg(Color::Yellow)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
-            markdown_markers: base_style.fg(Color::DarkGray),
             link_text: base_style
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
             link_url: base_style.fg(Color::Cyan),
-            table_pipes: base_style.fg(Color::DarkGray),
-            table_rule: base_style.fg(Color::DarkGray),
             code_fence: base_style.fg(Color::DarkGray),
             code_text: base_style.fg(Color::LightYellow),
             code_keyword: base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1593,22 +1583,19 @@ fn render_markdown_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>>
 
     if let Some((indent, level, content)) = parse_heading(line) {
         let mut spans = Vec::new();
+        let heading_style = theme.heading_style(level);
         push_styled_text(&mut spans, indent.to_string(), Style::default());
-        push_styled_text(&mut spans, "#".repeat(level), theme.heading_markers);
+        push_styled_text(&mut spans, "#".repeat(level), heading_style);
         if line.trim_start().len() > level {
-            push_styled_text(&mut spans, " ".to_string(), theme.heading_markers);
+            push_styled_text(&mut spans, " ".to_string(), heading_style);
         }
-        spans.extend(render_inline_markdown(
-            content,
-            theme.heading_style(level),
-            theme,
-        ));
+        spans.extend(render_inline_markdown(content, heading_style, theme));
         return spans;
     }
 
     if let Some((prefix, content)) = parse_blockquote(line) {
         let mut spans = Vec::new();
-        push_styled_text(&mut spans, prefix.to_string(), theme.quote_markers);
+        push_styled_text(&mut spans, prefix.to_string(), theme.quote_text);
         spans.extend(render_inline_markdown(content, theme.quote_text, theme));
         return spans;
     }
@@ -1622,7 +1609,7 @@ fn render_markdown_line(line: &str, theme: &MarkdownTheme) -> Vec<Span<'static>>
     }
 
     if is_table_rule(line) {
-        return render_table_line(line, theme, theme.table_rule);
+        return render_table_line(line, theme, theme.rule);
     }
 
     if line.contains('|') {
@@ -1642,7 +1629,7 @@ fn render_table_line(line: &str, theme: &MarkdownTheme, text_style: Style) -> Ve
         if start < idx {
             spans.extend(render_inline_markdown(&line[start..idx], text_style, theme));
         }
-        push_styled_text(&mut spans, "|".to_string(), theme.table_pipes);
+        push_styled_text(&mut spans, "|".to_string(), text_style);
         start = idx + ch.len_utf8();
     }
     if start < line.len() {
@@ -1952,13 +1939,13 @@ fn render_inline_markdown(
             push_styled_text(
                 &mut spans,
                 rest[..marker_len].to_string(),
-                theme.markdown_markers,
+                theme.inline_code,
             );
             push_styled_text(&mut spans, code.to_string(), theme.inline_code);
             push_styled_text(
                 &mut spans,
                 rest[consumed - marker_len..consumed].to_string(),
-                theme.markdown_markers,
+                theme.inline_code,
             );
             idx += consumed;
             continue;
@@ -1966,50 +1953,41 @@ fn render_inline_markdown(
 
         if let Some((consumed, label, url)) = parse_inline_link(rest) {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "[".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, "[".to_string(), theme.link_text);
             spans.extend(render_inline_markdown(label, theme.link_text, theme));
-            push_styled_text(&mut spans, "](".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, "](".to_string(), theme.link_url);
             push_styled_text(&mut spans, url.to_string(), theme.link_url);
-            push_styled_text(&mut spans, ")".to_string(), theme.markdown_markers);
+            push_styled_text(&mut spans, ")".to_string(), theme.link_url);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "~~") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.strike),
-                theme,
-            ));
-            push_styled_text(&mut spans, "~~".to_string(), theme.markdown_markers);
+            let strike_style = base_style.patch(theme.strike);
+            push_styled_text(&mut spans, "~~".to_string(), strike_style);
+            spans.extend(render_inline_markdown(inner, strike_style, theme));
+            push_styled_text(&mut spans, "~~".to_string(), strike_style);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "**") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.strong),
-                theme,
-            ));
-            push_styled_text(&mut spans, "**".to_string(), theme.markdown_markers);
+            let strong_style = base_style.patch(theme.strong);
+            push_styled_text(&mut spans, "**".to_string(), strong_style);
+            spans.extend(render_inline_markdown(inner, strong_style, theme));
+            push_styled_text(&mut spans, "**".to_string(), strong_style);
             idx += consumed;
             continue;
         }
 
         if let Some((consumed, inner)) = parse_wrapped_segment(rest, "*") {
             flush_plain_text(&mut spans, &mut plain, base_style);
-            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
-            spans.extend(render_inline_markdown(
-                inner,
-                base_style.patch(theme.emphasis),
-                theme,
-            ));
-            push_styled_text(&mut spans, "*".to_string(), theme.markdown_markers);
+            let emphasis_style = base_style.patch(theme.emphasis);
+            push_styled_text(&mut spans, "*".to_string(), emphasis_style);
+            spans.extend(render_inline_markdown(inner, emphasis_style, theme));
+            push_styled_text(&mut spans, "*".to_string(), emphasis_style);
             idx += consumed;
             continue;
         }
@@ -9772,9 +9750,16 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "# Heading with `code`");
-        assert_eq!(lines[0].spans[0].style, theme.heading_markers);
-        assert_eq!(lines[0].spans[1].style, theme.heading_style(1));
-        assert_eq!(lines[0].spans[3].style, theme.inline_code);
+        assert!(lines[0].spans.iter().any(
+            |span| span.content.as_ref().contains('#') && span.style == theme.heading_style(1)
+        ));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("code")
+                    && span.style == theme.inline_code)
+        );
     }
 
     #[test]
@@ -9784,8 +9769,20 @@ mod tests {
         let theme = MarkdownTheme::new(Style::default());
 
         assert_eq!(line_text(&lines[0]), "[docs](https://example.com)");
-        assert_eq!(lines[0].spans[1].style, theme.link_text);
-        assert_eq!(lines[0].spans[3].style, theme.link_url);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("docs")
+                    && span.style == theme.link_text)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("https://example.com")
+                    && span.style == theme.link_url)
+        );
     }
 
     #[test]
@@ -9845,9 +9842,44 @@ mod tests {
 
         assert_eq!(line_text(&lines[0]), "> quoted");
         assert_eq!(line_text(&lines[1]), "- item");
-        assert_eq!(lines[0].spans[0].style, theme.quote_markers);
-        assert_eq!(lines[0].spans[1].style, theme.quote_text);
+        assert_eq!(lines[0].spans[0].style, theme.quote_text);
         assert_eq!(lines[1].spans[0].style, theme.list_markers);
+    }
+
+    #[test]
+    fn preview_markdown_renders_emphasis_markers_with_content_style() {
+        let lines = render_preview_message_lines(
+            "**bold** and *italic* and ~~gone~~",
+            "",
+            Style::default(),
+        );
+        let theme = MarkdownTheme::new(Style::default());
+
+        assert_eq!(line_text(&lines[0]), "**bold** and *italic* and ~~gone~~");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("bold")
+                    && span.content.as_ref().contains("**")
+                    && span.style == theme.strong)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("italic")
+                    && span.content.as_ref().contains('*')
+                    && span.style == theme.emphasis)
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("gone")
+                    && span.content.as_ref().contains("~~")
+                    && span.style == theme.strike)
+        );
     }
 
     #[test]
