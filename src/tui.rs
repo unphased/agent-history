@@ -11,8 +11,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -185,6 +185,13 @@ enum ActiveSplit {
     ResultsGit,
     GitTurns,
     GitColumnVertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeSequenceDiscardState {
+    Idle,
+    AwaitingLeader,
+    Discarding,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -775,7 +782,14 @@ fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> 
         .spans
         .iter()
         .cloned()
-        .map(|span| Span::styled(span.content, span.style.patch(Style::default().bg(bg))))
+        .map(|span| {
+            let style = if span.style.bg.is_some() {
+                span.style
+            } else {
+                span.style.patch(Style::default().bg(bg))
+            };
+            Span::styled(span.content, style)
+        })
         .collect::<Vec<_>>();
     let used_width = line.width();
     if used_width < width {
@@ -1302,6 +1316,8 @@ const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
+const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
+const INACTIVE_SEARCH_FIELD_FG: Color = Color::Rgb(236, 236, 236);
 const QUERY_MATCH_FG: Color = Color::Black;
 
 const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
@@ -1325,6 +1341,19 @@ fn query_match_style_for(term_index: usize) -> Style {
         .fg(QUERY_MATCH_FG)
         .bg(Color::Rgb(red, green, blue))
         .add_modifier(Modifier::BOLD)
+}
+
+fn active_search_field_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn inactive_search_field_style() -> Style {
+    Style::default()
+        .fg(INACTIVE_SEARCH_FIELD_FG)
+        .bg(INACTIVE_SEARCH_FIELD_BG)
 }
 
 fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<SessionTagSpec> {
@@ -2762,6 +2791,7 @@ struct App {
     active_split: Option<ActiveSplit>,
     layout_state: LayoutState,
     dragged_split: Option<ActiveSplit>,
+    escape_sequence_discard: EscapeSequenceDiscardState,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -2877,6 +2907,7 @@ fn run_app(
         active_split: None,
         layout_state: LayoutState::from_ui_state(&ui_state.layout),
         dragged_split: None,
+        escape_sequence_discard: EscapeSequenceDiscardState::Idle,
         last_query: String::new(),
         last_results: Vec::new(),
         last_tag_filters: Vec::new(),
@@ -2974,10 +3005,12 @@ fn run_app(
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
+                    app.clear_escape_sequence_discard();
                     handle_mouse(terminal, &mut app, mouse)?;
                     dirty = true;
                 }
                 Event::Resize(_, _) => {
+                    app.clear_escape_sequence_discard();
                     dirty = true;
                 }
                 _ => {}
@@ -3127,15 +3160,23 @@ fn handle_key(
     app: &mut App,
     key: KeyEvent,
 ) -> anyhow::Result<bool> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(false);
+    }
+
+    if app.discard_escape_sequence_key(&key) {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
 
     // PreviewSearch stacked-mode handlers — must fire before global Esc/Tab/BackTab
     if matches!(app.input_mode, InputMode::PreviewSearch) {
-        if key.code == KeyCode::Esc {
-            app.preview_search.query.clear();
-            app.preview_search.cursor_pos = 0;
+        if is_escape_action_key(key.code) {
+            app.arm_escape_sequence_discard();
+            app.clear_preview_search();
             app.input_mode = InputMode::PreviewNav;
             return Ok(false);
         }
@@ -3145,12 +3186,16 @@ fn handle_key(
         }
     }
 
-    if key.code == KeyCode::Esc {
+    if is_escape_action_key(key.code) {
         if app.show_telemetry {
             return Ok(true);
         }
+        app.arm_escape_sequence_discard();
         if matches!(app.input_mode, InputMode::SessionSearch) {
             return Ok(false);
+        }
+        if matches!(app.input_mode, InputMode::PreviewNav) {
+            app.clear_preview_search();
         }
         app.input_mode = InputMode::SessionSearch;
         return Ok(false);
@@ -3849,27 +3894,12 @@ fn point_near_horizontal_split(y: u16, rect: Rect) -> bool {
     rect.height > 0 && y == rect.y.saturating_sub(1)
 }
 
-fn preview_layout_lines(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
-    let Some(anchor_record_idx) = anchor_record_idx else {
-        return doc.lines.clone();
-    };
-    let mut lines = doc.lines.clone();
-    let Some(line_idx) = doc
-        .line_record_indices
-        .iter()
-        .position(|record_idx| *record_idx == Some(anchor_record_idx))
-    else {
-        return lines;
-    };
-    let mut spans = vec![Span::styled(
-        "git anchor  ",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )];
-    spans.extend(lines[line_idx].spans.clone());
-    lines[line_idx] = Line::from(spans);
-    lines
+fn is_escape_action_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::F(10))
+}
+
+fn preview_layout_lines(doc: &PreviewDoc, _anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
+    doc.lines.clone()
 }
 
 fn with_preview_record_highlights(
@@ -4194,13 +4224,18 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             adjusted_mouse,
                         );
                         if let Some(record_idx) = app.hovered_preview_record_idx {
+                            let reveal_doc = if app.showing_session_browser() {
+                                app.session_browser_doc_for(Some(record_idx))
+                            } else {
+                                preview_doc
+                            };
                             let preview_lines = preview_layout_lines(
-                                &preview_doc,
+                                &reveal_doc,
                                 app.git_graph_visible.then_some(record_idx),
                             );
                             app.reveal_preview_record(
                                 &preview_lines,
-                                &preview_doc.line_record_indices,
+                                &reveal_doc.line_record_indices,
                                 preview_width,
                                 preview_height,
                                 record_idx,
@@ -4768,6 +4803,12 @@ impl App {
         }
         if self.showing_session_browser() {
             let doc = self.session_browser_doc();
+            if let Some(record_idx) = self
+                .hovered_preview_record_idx
+                .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
+            {
+                return Some(record_idx);
+            }
             return self.current_preview_selection(&doc, &doc.lines, preview_width);
         }
 
@@ -5214,44 +5255,100 @@ impl App {
         self.ui_status = Some(status.into());
     }
 
+    fn arm_escape_sequence_discard(&mut self) {
+        self.escape_sequence_discard = EscapeSequenceDiscardState::AwaitingLeader;
+    }
+
+    fn clear_escape_sequence_discard(&mut self) {
+        self.escape_sequence_discard = EscapeSequenceDiscardState::Idle;
+    }
+
+    fn discard_escape_sequence_key(&mut self, key: &KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+
+        match self.escape_sequence_discard {
+            EscapeSequenceDiscardState::Idle => false,
+            EscapeSequenceDiscardState::AwaitingLeader => match key.code {
+                KeyCode::Char('[' | '<' | 'O') if key.modifiers.is_empty() => {
+                    self.escape_sequence_discard = EscapeSequenceDiscardState::Discarding;
+                    true
+                }
+                _ => {
+                    self.clear_escape_sequence_discard();
+                    false
+                }
+            },
+            EscapeSequenceDiscardState::Discarding => match key.code {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && matches!(c, '[' | '<' | ';' | '0'..='9' | 'M' | 'm' | '~') =>
+                {
+                    if matches!(c, 'M' | 'm' | '~') {
+                        self.clear_escape_sequence_discard();
+                    }
+                    true
+                }
+                _ => {
+                    self.clear_escape_sequence_discard();
+                    false
+                }
+            },
+        }
+    }
+
     fn query_bar_style(&self) -> Style {
         if self.show_telemetry {
             return Style::default().fg(Color::White);
         }
         if matches!(self.input_mode, InputMode::SessionSearch) {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            active_search_field_style()
         } else {
-            Style::default().fg(Color::DarkGray)
+            inactive_search_field_style()
         }
+    }
+
+    fn clear_preview_search(&mut self) {
+        if self.preview_search.query.is_empty() && self.preview_search.cursor_pos == 0 {
+            return;
+        }
+        self.preview_search.query.clear();
+        self.preview_search.cursor_pos = 0;
+        self.reset_preview_scroll_to_match();
     }
 
     fn footer_help_text(&self) -> String {
         if self.show_telemetry {
             return format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 self.displayed_query().trim()
             );
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Tab/Shift+Tab: focus  Enter: resume  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
-                "Tab/Shift+Tab: focus  Esc: search  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
+                let esc_action = if self.preview_search.query.trim().is_empty() {
+                    "search"
+                } else {
+                    "clear+search"
+                };
+                format!(
+                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events"
+                )
             }
             InputMode::PreviewSearch => format!(
-                "Esc: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
+                "Esc/F10: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
-                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
             }
             InputMode::GitCommit => {
-                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
             }
         }
     }
@@ -5700,7 +5797,7 @@ impl App {
         }
     }
 
-    fn session_browser_doc(&self) -> PreviewDoc {
+    fn session_browser_doc_for(&self, selected_record_idx: Option<usize>) -> PreviewDoc {
         let Some(hit) = self.selected_hit() else {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
@@ -5728,6 +5825,9 @@ impl App {
 
         let base_style = Style::default();
         let mut line_record_indices = Vec::new();
+        let expanded_record_idx = selected_record_idx
+            .filter(|record_idx| record_idxs.contains(record_idx))
+            .or_else(|| record_idxs.first().copied());
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
@@ -5767,18 +5867,20 @@ impl App {
                 rec.phase.as_deref().unwrap_or("")
             )));
             line_record_indices.push(Some(idx));
-            lines.push(Line::raw(format!(
-                "file: {}:{}",
-                rec.file.display(),
-                rec.line
-            )));
-            line_record_indices.push(Some(idx));
-            if !rec.images.is_empty() {
-                lines.push(Line::raw(format!("images: {}", rec.images.len())));
+            if Some(idx) == expanded_record_idx {
+                lines.push(Line::raw(format!(
+                    "file: {}:{}",
+                    rec.file.display(),
+                    rec.line
+                )));
                 line_record_indices.push(Some(idx));
-                for path in materialize_record_images(rec) {
-                    lines.push(Line::raw(format!("image file: {path}")));
+                if !rec.images.is_empty() {
+                    lines.push(Line::raw(format!("images: {}", rec.images.len())));
                     line_record_indices.push(Some(idx));
+                    for path in materialize_record_images(rec) {
+                        lines.push(Line::raw(format!("image file: {path}")));
+                        line_record_indices.push(Some(idx));
+                    }
                 }
             }
             let rendered_lines = render_preview_message_lines(&rec.text, "", base_style);
@@ -5794,6 +5896,10 @@ impl App {
             match_lines: Vec::new(),
             line_record_indices,
         }
+    }
+
+    fn session_browser_doc(&self) -> PreviewDoc {
+        self.session_browser_doc_for(self.selected_preview_record_idx)
     }
 
     fn build_preview_doc(&self) -> PreviewDoc {
@@ -6526,8 +6632,13 @@ impl App {
                 .unwrap_or(section_records.len() - 1)
         };
         let target_record_idx = section_records[target_pos];
+        let target_doc = if self.showing_session_browser() {
+            self.session_browser_doc_for(Some(target_record_idx))
+        } else {
+            doc
+        };
         let preview_lines = preview_layout_lines(
-            &doc,
+            &target_doc,
             if self.git_graph_visible {
                 Some(target_record_idx)
             } else {
@@ -6536,7 +6647,7 @@ impl App {
         );
         self.reveal_preview_record(
             &preview_lines,
-            &doc.line_record_indices,
+            &target_doc.line_record_indices,
             preview_width,
             preview_height,
             target_record_idx,
@@ -6790,11 +6901,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.status_text(),
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
-                "Esc/Ctrl+c: quit  Ctrl+t: events".to_string()
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events".to_string()
             },
         );
         return;
@@ -6853,7 +6964,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             root[1],
             app.status_text(),
             format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 app.displayed_query().trim()
             ),
         );
@@ -7122,12 +7233,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let search_prefix = "/ ";
         let search_display = &app.preview_search.query;
         let search_style = if matches!(app.input_mode, InputMode::PreviewSearch) {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            active_search_field_style()
         } else {
-            Style::default().fg(Color::DarkGray)
+            inactive_search_field_style()
         };
         let search_bar =
             Paragraph::new(format!("{search_prefix}{search_display}")).style(search_style);
@@ -7722,6 +7830,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8439,6 +8548,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8540,6 +8650,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8958,6 +9069,55 @@ mod tests {
     }
 
     #[test]
+    fn session_browser_doc_only_expands_selected_turn_metadata() {
+        let mut second = mr(
+            Some("2026-04-13T00:00:02Z"),
+            Role::Assistant,
+            "second body",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        second.phase = Some("reply".to_string());
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first body",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            second,
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third body",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.selected_preview_record_idx = Some(1);
+
+        let doc = app.session_browser_doc();
+        let rendered = doc.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|line| line.contains("turn 1")));
+        assert!(rendered.iter().any(|line| line.contains("turn 2")));
+        assert!(rendered.iter().any(|line| line.contains("turn 3")));
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("file: "))
+                .count(),
+            1
+        );
+        assert!(rendered.iter().any(|line| line.contains("first body")));
+        assert!(rendered.iter().any(|line| line.contains("second body")));
+        assert!(rendered.iter().any(|line| line.contains("third body")));
+    }
+
+    #[test]
     fn preview_selected_record_idx_uses_last_section_start_at_or_before_scroll() {
         let doc = PreviewDoc {
             lines: vec![
@@ -9137,7 +9297,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_layout_lines_marks_first_anchor_line() {
+    fn preview_layout_lines_leave_turn_text_unmodified() {
         let doc = PreviewDoc {
             lines: vec![
                 Line::raw("header"),
@@ -9155,8 +9315,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(rendered.starts_with("git anchor"));
-        assert!(rendered.contains("turn 2"));
+        assert_eq!(rendered, "turn 2");
     }
 
     #[test]
@@ -9776,7 +9935,7 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let doc = app.session_browser_doc();
+        let doc = app.session_browser_doc_for(Some(1));
         let preview_lines = preview_layout_lines(&doc, None);
         let initial_scroll = preview_visual_line_offset(&preview_lines, 1, 80);
         app.preview_scroll = initial_scroll;
@@ -9952,6 +10111,40 @@ mod tests {
     }
 
     #[test]
+    fn selected_anchor_record_idx_prefers_hovered_turn_in_session_browser() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.git_graph_visible = true;
+        app.update_results();
+        app.selected_preview_record_idx = Some(0);
+        app.hovered_preview_record_idx = Some(1);
+
+        assert_eq!(app.selected_anchor_record_idx(80, 20), Some(1));
+    }
+
+    #[test]
     fn clicking_preview_turn_reveals_entire_turn_when_it_fits() {
         let all = vec![
             mr(
@@ -9983,11 +10176,20 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
-        let doc = app.session_browser_doc();
-        let preview_lines = preview_layout_lines(&doc, None);
+        let current_doc = app.session_browser_doc();
+        let current_preview_lines = preview_layout_lines(&current_doc, None);
+        let (current_second_start, _) = preview_record_visual_bounds(
+            &current_preview_lines,
+            &current_doc.line_record_indices,
+            preview_width,
+            1,
+        )
+        .expect("expected collapsed second preview record bounds");
+        let target_doc = app.session_browser_doc_for(Some(1));
+        let target_preview_lines = preview_layout_lines(&target_doc, None);
         let (second_start, second_end) = preview_record_visual_bounds(
-            &preview_lines,
-            &doc.line_record_indices,
+            &target_preview_lines,
+            &target_doc.line_record_indices,
             preview_width,
             1,
         )
@@ -9995,7 +10197,7 @@ mod tests {
         let second_height = second_end.saturating_sub(second_start);
         assert!(second_height <= preview_height);
 
-        app.preview_scroll = second_start.saturating_add(1);
+        app.preview_scroll = current_second_start;
         let click_row = preview_area.y + 1;
 
         route_mouse(
@@ -10051,6 +10253,7 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
+        app.selected_preview_record_idx = Some(1);
         let doc = app.session_browser_doc();
         let preview_lines = preview_layout_lines(&doc, None);
         let (second_start, second_end) = preview_record_visual_bounds(
@@ -10142,6 +10345,28 @@ mod tests {
     }
 
     #[test]
+    fn preview_record_highlight_keeps_existing_match_backgrounds() {
+        let line = highlighted_line("alpha beta", "beta", Style::default());
+        let lines = with_preview_record_highlights(&[line], &[Some(0)], 20, Some(0), None, None);
+        let (_, selected_bg) = preview_record_highlight_colors(None);
+
+        let alpha_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "alpha ")
+            .expect("expected non-matching span");
+        let beta_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "beta")
+            .expect("expected matching span");
+
+        assert_eq!(alpha_span.style.bg, Some(selected_bg));
+        assert_eq!(beta_span.style.bg, query_match_style_for(0).bg);
+        assert_eq!(beta_span.style.fg, query_match_style_for(0).fg);
+    }
+
+    #[test]
     fn handle_key_j_and_k_hop_turns_in_preview_nav_mode() {
         let all = vec![
             mr(
@@ -10187,6 +10412,155 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.selected_preview_record_idx, Some(0));
+    }
+
+    #[test]
+    fn handle_key_escape_in_preview_search_clears_preview_filter_and_exits_to_preview_nav() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewSearch;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_escape_in_preview_nav_clears_preview_filter_before_returning_to_search() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+        assert_eq!(app.query, "find");
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.showing_session_browser());
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_f10_in_preview_nav_matches_escape_behavior() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+        assert_eq!(app.query, "find");
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.showing_session_browser());
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_escape_discards_mouse_report_tail_in_search() {
+        let mut app = empty_app();
+        app.ready = true;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        for c in ['<', '3', '5', ';', '1', '5', '1', ';', '6', '5', 'M'] {
+            handle_key(
+                &mut terminal,
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(app.query, "");
+        assert_eq!(app.cursor_pos, 0);
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+    }
+
+    #[test]
+    fn handle_key_escape_still_allows_normal_typing_after_non_sequence_char() {
+        let mut app = empty_app();
+        app.ready = true;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.query, "a");
+        assert_eq!(app.cursor_pos, 1);
     }
 
     #[test]
@@ -10310,6 +10684,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -10351,6 +10726,23 @@ mod tests {
         );
         assert_eq!(parse_hex_color("123abc"), None);
         assert_eq!(parse_hex_color("#123abz"), None);
+    }
+
+    #[test]
+    fn inactive_search_field_style_uses_explicit_contrast_colors() {
+        let mut app = empty_app();
+        app.input_mode = InputMode::PreviewNav;
+
+        assert_eq!(
+            inactive_search_field_style().fg,
+            Some(INACTIVE_SEARCH_FIELD_FG)
+        );
+        assert_eq!(
+            inactive_search_field_style().bg,
+            Some(INACTIVE_SEARCH_FIELD_BG)
+        );
+        assert_eq!(app.query_bar_style().fg, Some(INACTIVE_SEARCH_FIELD_FG));
+        assert_eq!(app.query_bar_style().bg, Some(INACTIVE_SEARCH_FIELD_BG));
     }
 
     #[test]
