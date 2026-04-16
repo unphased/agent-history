@@ -11,8 +11,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -185,6 +185,13 @@ enum ActiveSplit {
     ResultsGit,
     GitTurns,
     GitColumnVertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeSequenceDiscardState {
+    Idle,
+    AwaitingLeader,
+    Discarding,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2752,6 +2759,7 @@ struct App {
     active_split: Option<ActiveSplit>,
     layout_state: LayoutState,
     dragged_split: Option<ActiveSplit>,
+    escape_sequence_discard: EscapeSequenceDiscardState,
 
     last_query: String,
     last_results: Vec<usize>,
@@ -2867,6 +2875,7 @@ fn run_app(
         active_split: None,
         layout_state: LayoutState::from_ui_state(&ui_state.layout),
         dragged_split: None,
+        escape_sequence_discard: EscapeSequenceDiscardState::Idle,
         last_query: String::new(),
         last_results: Vec::new(),
         last_tag_filters: Vec::new(),
@@ -2964,10 +2973,12 @@ fn run_app(
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
+                    app.clear_escape_sequence_discard();
                     handle_mouse(terminal, &mut app, mouse)?;
                     dirty = true;
                 }
                 Event::Resize(_, _) => {
+                    app.clear_escape_sequence_discard();
                     dirty = true;
                 }
                 _ => {}
@@ -3117,6 +3128,14 @@ fn handle_key(
     app: &mut App,
     key: KeyEvent,
 ) -> anyhow::Result<bool> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(false);
+    }
+
+    if app.discard_escape_sequence_key(&key) {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
@@ -3124,6 +3143,7 @@ fn handle_key(
     // PreviewSearch stacked-mode handlers — must fire before global Esc/Tab/BackTab
     if matches!(app.input_mode, InputMode::PreviewSearch) {
         if key.code == KeyCode::Esc {
+            app.arm_escape_sequence_discard();
             app.clear_preview_search();
             app.input_mode = InputMode::PreviewNav;
             return Ok(false);
@@ -3138,6 +3158,7 @@ fn handle_key(
         if app.show_telemetry {
             return Ok(true);
         }
+        app.arm_escape_sequence_discard();
         if matches!(app.input_mode, InputMode::SessionSearch) {
             return Ok(false);
         }
@@ -5166,6 +5187,49 @@ impl App {
         self.ui_status = Some(status.into());
     }
 
+    fn arm_escape_sequence_discard(&mut self) {
+        self.escape_sequence_discard = EscapeSequenceDiscardState::AwaitingLeader;
+    }
+
+    fn clear_escape_sequence_discard(&mut self) {
+        self.escape_sequence_discard = EscapeSequenceDiscardState::Idle;
+    }
+
+    fn discard_escape_sequence_key(&mut self, key: &KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+
+        match self.escape_sequence_discard {
+            EscapeSequenceDiscardState::Idle => false,
+            EscapeSequenceDiscardState::AwaitingLeader => match key.code {
+                KeyCode::Char('[' | '<' | 'O') if key.modifiers.is_empty() => {
+                    self.escape_sequence_discard = EscapeSequenceDiscardState::Discarding;
+                    true
+                }
+                _ => {
+                    self.clear_escape_sequence_discard();
+                    false
+                }
+            },
+            EscapeSequenceDiscardState::Discarding => match key.code {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && matches!(c, '[' | '<' | ';' | '0'..='9' | 'M' | 'm' | '~') =>
+                {
+                    if matches!(c, 'M' | 'm' | '~') {
+                        self.clear_escape_sequence_discard();
+                    }
+                    true
+                }
+                _ => {
+                    self.clear_escape_sequence_discard();
+                    false
+                }
+            },
+        }
+    }
+
     fn query_bar_style(&self) -> Style {
         if self.show_telemetry {
             return Style::default().fg(Color::White);
@@ -5715,21 +5779,20 @@ impl App {
                 rec.phase.as_deref().unwrap_or("")
             )));
             line_record_indices.push(Some(idx));
-            if Some(idx) != expanded_record_idx {
-                continue;
-            }
-            lines.push(Line::raw(format!(
-                "file: {}:{}",
-                rec.file.display(),
-                rec.line
-            )));
-            line_record_indices.push(Some(idx));
-            if !rec.images.is_empty() {
-                lines.push(Line::raw(format!("images: {}", rec.images.len())));
+            if Some(idx) == expanded_record_idx {
+                lines.push(Line::raw(format!(
+                    "file: {}:{}",
+                    rec.file.display(),
+                    rec.line
+                )));
                 line_record_indices.push(Some(idx));
-                for path in materialize_record_images(rec) {
-                    lines.push(Line::raw(format!("image file: {path}")));
+                if !rec.images.is_empty() {
+                    lines.push(Line::raw(format!("images: {}", rec.images.len())));
                     line_record_indices.push(Some(idx));
+                    for path in materialize_record_images(rec) {
+                        lines.push(Line::raw(format!("image file: {path}")));
+                        line_record_indices.push(Some(idx));
+                    }
                 }
             }
             let rendered_lines = render_preview_message_lines(&rec.text, "", base_style);
@@ -7674,6 +7737,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8391,6 +8455,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8492,6 +8557,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
@@ -8910,7 +8976,7 @@ mod tests {
     }
 
     #[test]
-    fn session_browser_doc_only_expands_selected_turn_fields() {
+    fn session_browser_doc_only_expands_selected_turn_metadata() {
         let mut second = mr(
             Some("2026-04-13T00:00:02Z"),
             Role::Assistant,
@@ -8946,10 +9012,16 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("turn 1")));
         assert!(rendered.iter().any(|line| line.contains("turn 2")));
         assert!(rendered.iter().any(|line| line.contains("turn 3")));
-        assert!(rendered.iter().any(|line| line.contains("file:")));
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("file: "))
+                .count(),
+            1
+        );
+        assert!(rendered.iter().any(|line| line.contains("first body")));
         assert!(rendered.iter().any(|line| line.contains("second body")));
-        assert!(!rendered.iter().any(|line| line.contains("first body")));
-        assert!(!rendered.iter().any(|line| line.contains("third body")));
+        assert!(rendered.iter().any(|line| line.contains("third body")));
     }
 
     #[test]
@@ -10212,6 +10284,58 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_escape_discards_mouse_report_tail_in_search() {
+        let mut app = empty_app();
+        app.ready = true;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        for c in ['<', '3', '5', ';', '1', '5', '1', ';', '6', '5', 'M'] {
+            handle_key(
+                &mut terminal,
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(app.query, "");
+        assert_eq!(app.cursor_pos, 0);
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+    }
+
+    #[test]
+    fn handle_key_escape_still_allows_normal_typing_after_non_sequence_char() {
+        let mut app = empty_app();
+        app.ready = true;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.query, "a");
+        assert_eq!(app.cursor_pos, 1);
+    }
+
+    #[test]
     fn scroll_preview_page_uses_provided_page_height() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
@@ -10332,6 +10456,7 @@ mod tests {
             active_split: None,
             layout_state: LayoutState::new(),
             dragged_split: None,
+            escape_sequence_discard: EscapeSequenceDiscardState::Idle,
             last_query: String::new(),
             last_results: vec![],
             last_tag_filters: Vec::new(),
