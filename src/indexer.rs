@@ -1270,6 +1270,12 @@ fn dir_name_from_cwd_owned(cwd: &str) -> String {
         .to_string()
 }
 
+fn normalize_existing_path_string(path: &str) -> Option<String> {
+    fs::canonicalize(path)
+        .ok()
+        .map(|resolved| resolved.to_string_lossy().to_string())
+}
+
 fn shared_repo_label_from_common_dir(common_dir: &str) -> Option<String> {
     let path = Path::new(common_dir);
     let file_name = path.file_name().and_then(|s| s.to_str())?;
@@ -1282,9 +1288,10 @@ fn shared_repo_label_from_common_dir(common_dir: &str) -> Option<String> {
 }
 
 fn absolute_git_common_dir(cwd: &str) -> Option<String> {
+    let normalized_cwd = normalize_existing_path_string(cwd).unwrap_or_else(|| cwd.to_string());
     let output = Command::new("git")
         .arg("-C")
-        .arg(cwd)
+        .arg(&normalized_cwd)
         .arg("rev-parse")
         .arg("--git-common-dir")
         .output()
@@ -1300,15 +1307,22 @@ fn absolute_git_common_dir(cwd: &str) -> Option<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        Path::new(cwd).join(path)
+        Path::new(&normalized_cwd).join(path)
     };
-    Some(absolute.to_string_lossy().to_string())
+    Some(
+        absolute
+            .canonicalize()
+            .unwrap_or(absolute)
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 fn probe_git_repo_metadata(cwd: &str) -> GitRepoMetadata {
+    let normalized_cwd = normalize_existing_path_string(cwd).unwrap_or_else(|| cwd.to_string());
     let output = match Command::new("git")
         .arg("-C")
-        .arg(cwd)
+        .arg(&normalized_cwd)
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()
@@ -3551,6 +3565,22 @@ mod tests {
         assert_eq!(
             shared_repo_label_from_common_dir("/tmp/work/repo/.git/modules/lib"),
             Some("lib".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_existing_path_string_collapses_parent_segments() {
+        let tmp = TempDir::new("agent-history-normalize-path");
+        let repo = tmp.path.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let raw = format!("{}/child/..", repo.display());
+        fs::create_dir_all(repo.join("child")).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
+
+        assert_eq!(
+            normalize_existing_path_string(&raw),
+            Some(canonical_repo.display().to_string())
         );
     }
 }
