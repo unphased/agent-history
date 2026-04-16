@@ -775,7 +775,14 @@ fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> 
         .spans
         .iter()
         .cloned()
-        .map(|span| Span::styled(span.content, span.style.patch(Style::default().bg(bg))))
+        .map(|span| {
+            let style = if span.style.bg.is_some() {
+                span.style
+            } else {
+                span.style.patch(Style::default().bg(bg))
+            };
+            Span::styled(span.content, style)
+        })
         .collect::<Vec<_>>();
     let used_width = line.width();
     if used_width < width {
@@ -9975,6 +9982,28 @@ mod tests {
         assert_eq!(lines[second_line_idx].width(), 200);
         assert_eq!(lines[third_line_idx].spans[0].style.bg, Some(hover_bg));
         assert_eq!(lines[third_line_idx].width(), 200);
+    }
+
+    #[test]
+    fn preview_record_highlight_keeps_existing_match_backgrounds() {
+        let line = highlighted_line("alpha beta", "beta", Style::default());
+        let lines = with_preview_record_highlights(&[line], &[Some(0)], 20, Some(0), None, None);
+        let (_, selected_bg) = preview_record_highlight_colors(None);
+
+        let alpha_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "alpha ")
+            .expect("expected non-matching span");
+        let beta_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "beta")
+            .expect("expected matching span");
+
+        assert_eq!(alpha_span.style.bg, Some(selected_bg));
+        assert_eq!(beta_span.style.bg, query_match_style_for(0).bg);
+        assert_eq!(beta_span.style.fg, query_match_style_for(0).fg);
     }
 
     #[test]
