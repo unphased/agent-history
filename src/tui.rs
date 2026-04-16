@@ -1253,6 +1253,8 @@ const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
+const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
+const INACTIVE_SEARCH_FIELD_FG: Color = Color::Rgb(236, 236, 236);
 const QUERY_MATCH_FG: Color = Color::Black;
 
 const QUERY_MATCH_PALETTE: [(u8, u8, u8); 12] = [
@@ -1276,6 +1278,19 @@ fn query_match_style_for(term_index: usize) -> Style {
         .fg(QUERY_MATCH_FG)
         .bg(Color::Rgb(red, green, blue))
         .add_modifier(Modifier::BOLD)
+}
+
+fn active_search_field_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn inactive_search_field_style() -> Style {
+    Style::default()
+        .fg(INACTIVE_SEARCH_FIELD_FG)
+        .bg(INACTIVE_SEARCH_FIELD_BG)
 }
 
 fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<SessionTagSpec> {
@@ -3102,8 +3117,7 @@ fn handle_key(
     // PreviewSearch stacked-mode handlers — must fire before global Esc/Tab/BackTab
     if matches!(app.input_mode, InputMode::PreviewSearch) {
         if key.code == KeyCode::Esc {
-            app.preview_search.query.clear();
-            app.preview_search.cursor_pos = 0;
+            app.clear_preview_search();
             app.input_mode = InputMode::PreviewNav;
             return Ok(false);
         }
@@ -3119,6 +3133,9 @@ fn handle_key(
         }
         if matches!(app.input_mode, InputMode::SessionSearch) {
             return Ok(false);
+        }
+        if matches!(app.input_mode, InputMode::PreviewNav) {
+            app.clear_preview_search();
         }
         app.input_mode = InputMode::SessionSearch;
         return Ok(false);
@@ -3243,7 +3260,9 @@ fn handle_key(
                         &app.preview_search.query,
                         app.preview_search.cursor_pos - 1,
                     );
-                    app.preview_search.query.replace_range(prev_byte_pos..byte_pos, "");
+                    app.preview_search
+                        .query
+                        .replace_range(prev_byte_pos..byte_pos, "");
                     app.preview_search.cursor_pos -= 1;
                 }
             }
@@ -3256,7 +3275,9 @@ fn handle_key(
                         &app.preview_search.query,
                         app.preview_search.cursor_pos + 1,
                     );
-                    app.preview_search.query.replace_range(byte_pos..next_byte_pos, "");
+                    app.preview_search
+                        .query
+                        .replace_range(byte_pos..next_byte_pos, "");
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3265,34 +3286,34 @@ fn handle_key(
             }
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.preview_search.cursor_pos =
-                        prev_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                    app.preview_search.cursor_pos = prev_word_boundary(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos,
+                    );
                 } else {
-                    app.preview_search.cursor_pos =
-                        app.preview_search.cursor_pos.saturating_sub(1);
+                    app.preview_search.cursor_pos = app.preview_search.cursor_pos.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
                 let char_count = app.preview_search.query.chars().count();
                 if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.preview_search.cursor_pos =
-                        next_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                    app.preview_search.cursor_pos = next_word_boundary(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos,
+                    );
                 } else if app.preview_search.cursor_pos < char_count {
                     app.preview_search.cursor_pos += 1;
                 }
             }
             KeyCode::Home | KeyCode::Char('a')
-                if key.code == KeyCode::Home
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 app.preview_search.cursor_pos = 0;
             }
             KeyCode::End | KeyCode::Char('e')
-                if key.code == KeyCode::End
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                app.preview_search.cursor_pos =
-                    app.preview_search.query.chars().count();
+                app.preview_search.cursor_pos = app.preview_search.query.chars().count();
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4378,8 +4399,7 @@ fn current_results_inner_height(
 
 fn preview_has_search_bar(app: &App) -> bool {
     matches!(app.input_mode, InputMode::PreviewSearch)
-        || (matches!(app.input_mode, InputMode::PreviewNav)
-            && !app.preview_search.query.is_empty())
+        || (matches!(app.input_mode, InputMode::PreviewNav) && !app.preview_search.query.is_empty())
 }
 
 fn preview_content_rect(preview_area: Rect, has_search_bar: bool) -> Rect {
@@ -5152,13 +5172,19 @@ impl App {
             return Style::default().fg(Color::White);
         }
         if matches!(self.input_mode, InputMode::SessionSearch) {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            active_search_field_style()
         } else {
-            Style::default().fg(Color::DarkGray)
+            inactive_search_field_style()
         }
+    }
+
+    fn clear_preview_search(&mut self) {
+        if self.preview_search.query.is_empty() && self.preview_search.cursor_pos == 0 {
+            return;
+        }
+        self.preview_search.query.clear();
+        self.preview_search.cursor_pos = 0;
+        self.reset_preview_scroll_to_match();
     }
 
     fn footer_help_text(&self) -> String {
@@ -5174,7 +5200,14 @@ impl App {
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
-                "Tab/Shift+Tab: focus  Esc: search  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
+                let esc_action = if self.preview_search.query.trim().is_empty() {
+                    "search"
+                } else {
+                    "clear+search"
+                };
+                format!(
+                    "Tab/Shift+Tab: focus  Esc: {esc_action}  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events"
+                )
             }
             InputMode::PreviewSearch => format!(
                 "Esc: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
@@ -5556,10 +5589,7 @@ impl App {
                 sess.project_slug.as_deref().unwrap_or("")
             )),
             Line::raw(format!("source: {}", source_label(sess.source))),
-            Line::raw(format!(
-                "turns: {}",
-                record_idxs.len()
-            )),
+            Line::raw(format!("turns: {}", record_idxs.len())),
             Line::raw(""),
         ];
         line_record_indices.resize(lines.len(), None);
@@ -7033,15 +7063,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         let search_prefix = "/ ";
         let search_display = &app.preview_search.query;
         let search_style = if matches!(app.input_mode, InputMode::PreviewSearch) {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            active_search_field_style()
         } else {
-            Style::default().fg(Color::DarkGray)
+            inactive_search_field_style()
         };
-        let search_bar = Paragraph::new(format!("{search_prefix}{search_display}"))
-            .style(search_style);
+        let search_bar =
+            Paragraph::new(format!("{search_prefix}{search_display}")).style(search_style);
         f.render_widget(search_bar, search_bar_area);
         if matches!(app.input_mode, InputMode::PreviewSearch) {
             let cursor_x = search_bar_area.x
@@ -9999,6 +10026,70 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_escape_in_preview_search_clears_preview_filter_and_exits_to_preview_nav() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewSearch;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_escape_in_preview_nav_clears_preview_filter_before_returning_to_search() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+        assert_eq!(app.query, "find");
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.showing_session_browser());
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
     fn scroll_preview_page_uses_provided_page_height() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
@@ -10160,6 +10251,23 @@ mod tests {
         );
         assert_eq!(parse_hex_color("123abc"), None);
         assert_eq!(parse_hex_color("#123abz"), None);
+    }
+
+    #[test]
+    fn inactive_search_field_style_uses_explicit_contrast_colors() {
+        let mut app = empty_app();
+        app.input_mode = InputMode::PreviewNav;
+
+        assert_eq!(
+            inactive_search_field_style().fg,
+            Some(INACTIVE_SEARCH_FIELD_FG)
+        );
+        assert_eq!(
+            inactive_search_field_style().bg,
+            Some(INACTIVE_SEARCH_FIELD_BG)
+        );
+        assert_eq!(app.query_bar_style().fg, Some(INACTIVE_SEARCH_FIELD_FG));
+        assert_eq!(app.query_bar_style().bg, Some(INACTIVE_SEARCH_FIELD_BG));
     }
 
     #[test]
