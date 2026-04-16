@@ -3142,7 +3142,7 @@ fn handle_key(
 
     // PreviewSearch stacked-mode handlers — must fire before global Esc/Tab/BackTab
     if matches!(app.input_mode, InputMode::PreviewSearch) {
-        if key.code == KeyCode::Esc {
+        if is_escape_action_key(key.code) {
             app.arm_escape_sequence_discard();
             app.clear_preview_search();
             app.input_mode = InputMode::PreviewNav;
@@ -3154,7 +3154,7 @@ fn handle_key(
         }
     }
 
-    if key.code == KeyCode::Esc {
+    if is_escape_action_key(key.code) {
         if app.show_telemetry {
             return Ok(true);
         }
@@ -3860,6 +3860,10 @@ fn point_near_vertical_split(x: u16, rect: Rect) -> bool {
 
 fn point_near_horizontal_split(y: u16, rect: Rect) -> bool {
     rect.height > 0 && y == rect.y.saturating_sub(1)
+}
+
+fn is_escape_action_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::F(10))
 }
 
 fn preview_layout_lines(doc: &PreviewDoc, _anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
@@ -5253,13 +5257,13 @@ impl App {
     fn footer_help_text(&self) -> String {
         if self.show_telemetry {
             return format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 self.displayed_query().trim()
             );
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Tab/Shift+Tab: focus  Enter: resume  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
@@ -5269,18 +5273,18 @@ impl App {
                     "clear+search"
                 };
                 format!(
-                    "Tab/Shift+Tab: focus  Esc: {esc_action}  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events"
+                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events"
                 )
             }
             InputMode::PreviewSearch => format!(
-                "Esc: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
+                "Esc/F10: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
-                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
             }
             InputMode::GitCommit => {
-                "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
             }
         }
     }
@@ -6810,11 +6814,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             app.status_text(),
             if app.show_telemetry {
                 format!(
-                    "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
+                    "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear query+tag filters  query: \"{}\"",
                     app.query.trim()
                 )
             } else {
-                "Esc/Ctrl+c: quit  Ctrl+t: events".to_string()
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events".to_string()
             },
         );
         return;
@@ -6870,7 +6874,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             root[1],
             app.status_text(),
             format!(
-                "Esc/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 app.displayed_query().trim()
             ),
         );
@@ -10272,6 +10276,39 @@ mod tests {
             &mut terminal,
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+        assert_eq!(app.query, "find");
+        assert_eq!(app.preview_search.query, "");
+        assert_eq!(app.preview_search.cursor_pos, 0);
+        assert!(app.showing_session_browser());
+        assert!(app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_f10_in_preview_nav_matches_escape_behavior() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "find me",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.query = "find".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        app.preview_scroll_reset_pending = false;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::empty()),
         )
         .unwrap();
 
