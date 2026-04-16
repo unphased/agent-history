@@ -37,7 +37,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -1204,6 +1204,55 @@ fn tag_style(fg: Color, bg: Color) -> Style {
     Style::default().fg(fg).bg(bg)
 }
 
+fn tag_spec(
+    kind: TagFilterKind,
+    filter_value: String,
+    label: String,
+    desync_label: Option<&str>,
+) -> SessionTagSpec {
+    match kind {
+        TagFilterKind::Provider => SessionTagSpec {
+            filter: TagFilter {
+                kind,
+                value: filter_value,
+            },
+            content: format!(" {label} "),
+            style: tag_style(Color::Rgb(210, 217, 224), Color::Rgb(64, 78, 92)),
+        },
+        TagFilterKind::Host => SessionTagSpec {
+            filter: TagFilter {
+                kind,
+                value: filter_value,
+            },
+            content: match desync_label {
+                Some(desync_label) => format!(" {label} {desync_label} "),
+                None => format!(" {label} "),
+            },
+            style: match desync_label {
+                Some(_) => tag_style(REMOTE_DESYNC_TAG_FG, REMOTE_DESYNC_TAG_BG),
+                None => tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
+            },
+        },
+        TagFilterKind::Project => SessionTagSpec {
+            filter: TagFilter {
+                kind,
+                value: filter_value,
+            },
+            content: format!(" {label} "),
+            style: tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
+        },
+    }
+}
+
+fn tag_specs_to_spans(specs: Vec<SessionTagSpec>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for spec in specs {
+        spans.push(Span::styled(spec.content, spec.style));
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
 fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1282,31 +1331,21 @@ fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
     let mut specs = Vec::new();
     if tags.show_provider {
         let value = provider_label(sess.source, sess.account.as_deref());
-        specs.push(SessionTagSpec {
-            filter: TagFilter {
-                kind: TagFilterKind::Provider,
-                value: value.clone(),
-            },
-            content: format!(" {value} "),
-            style: tag_style(Color::Rgb(210, 217, 224), Color::Rgb(64, 78, 92)),
-        });
+        specs.push(tag_spec(
+            TagFilterKind::Provider,
+            value.clone(),
+            value,
+            None,
+        ));
     }
     if should_show_host_tag(sess, tags) {
         let desync = sess.remote_desync_label.as_deref();
-        specs.push(SessionTagSpec {
-            filter: TagFilter {
-                kind: TagFilterKind::Host,
-                value: sess.machine_name.clone(),
-            },
-            content: match desync {
-                Some(label) => format!(" {} {} ", sess.machine_name, label),
-                None => format!(" {} ", sess.machine_name),
-            },
-            style: match desync {
-                Some(_) => tag_style(REMOTE_DESYNC_TAG_FG, REMOTE_DESYNC_TAG_BG),
-                None => tag_style(REMOTE_TAG_FG, REMOTE_TAG_BG),
-            },
-        });
+        specs.push(tag_spec(
+            TagFilterKind::Host,
+            sess.machine_name.clone(),
+            sess.machine_name.clone(),
+            desync,
+        ));
     }
     if tags.show_project
         && let Some(project_key) = sess.project_key.as_deref().filter(|s| !s.trim().is_empty())
@@ -1315,25 +1354,18 @@ fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<S
             .as_deref()
             .filter(|s| !s.trim().is_empty())
     {
-        specs.push(SessionTagSpec {
-            filter: TagFilter {
-                kind: TagFilterKind::Project,
-                value: project_key.to_string(),
-            },
-            content: format!(" {project} "),
-            style: tag_style(Color::Rgb(224, 216, 194), Color::Rgb(92, 86, 64)),
-        });
+        specs.push(tag_spec(
+            TagFilterKind::Project,
+            project_key.to_string(),
+            project.to_string(),
+            None,
+        ));
     }
     specs
 }
 
 fn session_tag_spans(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for spec in session_tag_specs(sess, tags) {
-        spans.push(Span::styled(spec.content, spec.style));
-        spans.push(Span::raw(" "));
-    }
-    spans
+    tag_specs_to_spans(session_tag_specs(sess, tags))
 }
 
 fn result_line_text(
@@ -3243,7 +3275,9 @@ fn handle_key(
                         &app.preview_search.query,
                         app.preview_search.cursor_pos - 1,
                     );
-                    app.preview_search.query.replace_range(prev_byte_pos..byte_pos, "");
+                    app.preview_search
+                        .query
+                        .replace_range(prev_byte_pos..byte_pos, "");
                     app.preview_search.cursor_pos -= 1;
                 }
             }
@@ -3256,7 +3290,9 @@ fn handle_key(
                         &app.preview_search.query,
                         app.preview_search.cursor_pos + 1,
                     );
-                    app.preview_search.query.replace_range(byte_pos..next_byte_pos, "");
+                    app.preview_search
+                        .query
+                        .replace_range(byte_pos..next_byte_pos, "");
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3265,34 +3301,34 @@ fn handle_key(
             }
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.preview_search.cursor_pos =
-                        prev_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                    app.preview_search.cursor_pos = prev_word_boundary(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos,
+                    );
                 } else {
-                    app.preview_search.cursor_pos =
-                        app.preview_search.cursor_pos.saturating_sub(1);
+                    app.preview_search.cursor_pos = app.preview_search.cursor_pos.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
                 let char_count = app.preview_search.query.chars().count();
                 if key.modifiers.contains(KeyModifiers::ALT) {
-                    app.preview_search.cursor_pos =
-                        next_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                    app.preview_search.cursor_pos = next_word_boundary(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos,
+                    );
                 } else if app.preview_search.cursor_pos < char_count {
                     app.preview_search.cursor_pos += 1;
                 }
             }
             KeyCode::Home | KeyCode::Char('a')
-                if key.code == KeyCode::Home
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 app.preview_search.cursor_pos = 0;
             }
             KeyCode::End | KeyCode::Char('e')
-                if key.code == KeyCode::End
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                app.preview_search.cursor_pos =
-                    app.preview_search.query.chars().count();
+                app.preview_search.cursor_pos = app.preview_search.query.chars().count();
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3970,7 +4006,7 @@ fn tag_filter_at_result_column(
     tags: &config::UiTagConfig,
     content_x: usize,
 ) -> Option<TagFilter> {
-    let ts_width = short_ts(sess.last_ts.as_deref()).chars().count();
+    let ts_width = UnicodeWidthStr::width(short_ts(sess.last_ts.as_deref()).as_str());
     let specs = session_tag_specs(sess, tags);
     if specs.is_empty() {
         return None;
@@ -3978,7 +4014,7 @@ fn tag_filter_at_result_column(
 
     let mut cursor = ts_width + 1;
     for spec in specs {
-        let width = spec.content.chars().count();
+        let width = UnicodeWidthStr::width(spec.content.as_str());
         if (cursor..cursor + width).contains(&content_x) {
             return Some(spec.filter);
         }
@@ -3986,6 +4022,37 @@ fn tag_filter_at_result_column(
     }
 
     None
+}
+
+fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> {
+    let specs = app.active_filter_tag_specs();
+    if specs.is_empty() {
+        return None;
+    }
+
+    let mut cursor = 0;
+    for spec in specs {
+        let width = UnicodeWidthStr::width(spec.content.as_str());
+        if (cursor..cursor + width).contains(&content_x) {
+            return Some(spec.filter);
+        }
+        cursor += width + 1;
+    }
+
+    None
+}
+
+fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
+    if !point_in_rect(mouse.column, mouse.row, query_area) {
+        return;
+    }
+
+    app.input_mode = InputMode::SessionSearch;
+
+    let content_x = (mouse.column - query_area.x) as usize;
+    if let Some(filter) = tag_filter_at_query_column(app, content_x) {
+        app.toggle_tag_filter(filter);
+    }
 }
 
 fn handle_results_click(app: &mut App, results_area: Rect, mouse: MouseEvent) {
@@ -4074,6 +4141,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 }
             }
             if !app.show_telemetry {
+                handle_query_click(app, geometry.query, mouse);
                 handle_results_click(app, results_area, mouse);
                 if let Some(git_graph) = geometry.git_graph
                     && point_in_rect(mouse.column, mouse.row, git_graph)
@@ -4378,8 +4446,7 @@ fn current_results_inner_height(
 
 fn preview_has_search_bar(app: &App) -> bool {
     matches!(app.input_mode, InputMode::PreviewSearch)
-        || (matches!(app.input_mode, InputMode::PreviewNav)
-            && !app.preview_search.query.is_empty())
+        || (matches!(app.input_mode, InputMode::PreviewNav) && !app.preview_search.query.is_empty())
 }
 
 fn preview_content_rect(preview_area: Rect, has_search_bar: bool) -> Rect {
@@ -5201,27 +5268,47 @@ impl App {
             .to_string()
     }
 
-    fn query_prompt_prefix(&self) -> String {
-        if self.show_telemetry {
-            return "events❯ ".to_string();
-        }
-        if self.active_tag_filters.is_empty() {
-            return "❯ ".to_string();
-        }
-
-        let filters = self
-            .active_tag_filters
+    fn active_filter_tag_specs(&self) -> Vec<SessionTagSpec> {
+        self.active_tag_filters
             .iter()
             .map(|filter| match filter.kind {
-                TagFilterKind::Provider => format!("provider={}", filter.value),
-                TagFilterKind::Host => format!("host={}", filter.value),
-                TagFilterKind::Project => {
-                    format!("project={}", self.project_filter_label(&filter.value))
-                }
+                TagFilterKind::Provider => tag_spec(
+                    TagFilterKind::Provider,
+                    filter.value.clone(),
+                    filter.value.clone(),
+                    None,
+                ),
+                TagFilterKind::Host => tag_spec(
+                    TagFilterKind::Host,
+                    filter.value.clone(),
+                    filter.value.clone(),
+                    None,
+                ),
+                TagFilterKind::Project => tag_spec(
+                    TagFilterKind::Project,
+                    filter.value.clone(),
+                    self.project_filter_label(&filter.value),
+                    None,
+                ),
             })
-            .collect::<Vec<_>>()
-            .join("  ");
-        format!("[{filters}]❯ ")
+            .collect()
+    }
+
+    fn query_prompt_line(&self) -> Line<'static> {
+        if self.show_telemetry {
+            return Line::from(vec![Span::raw("events❯ ")]);
+        }
+        if self.active_tag_filters.is_empty() {
+            return Line::from(vec![Span::raw("❯ ")]);
+        }
+
+        let mut spans = tag_specs_to_spans(self.active_filter_tag_specs());
+        spans.push(Span::raw("❯ "));
+        Line::from(spans)
+    }
+
+    fn query_prompt_width(&self) -> usize {
+        self.query_prompt_line().width()
     }
 
     fn displayed_query(&self) -> &str {
@@ -5556,10 +5643,7 @@ impl App {
                 sess.project_slug.as_deref().unwrap_or("")
             )),
             Line::raw(format!("source: {}", source_label(sess.source))),
-            Line::raw(format!(
-                "turns: {}",
-                record_idxs.len()
-            )),
+            Line::raw(format!("turns: {}", record_idxs.len())),
             Line::raw(""),
         ];
         line_record_indices.resize(lines.len(), None);
@@ -6582,12 +6666,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let displayed_query = app.displayed_query().to_string();
     if !app.ready {
-        let query_prefix = app.query_prompt_prefix();
-        let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
-            .style(Style::default().fg(Color::White));
+        let mut query_spans = app.query_prompt_line().spans;
+        query_spans.push(Span::styled(
+            displayed_query.clone(),
+            Style::default().fg(Color::White),
+        ));
+        let query = Paragraph::new(Line::from(query_spans));
         f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
         let cursor_x =
-            root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+            root[0].x + app.query_prompt_width() as u16 + app.displayed_cursor_pos() as u16;
         let cursor_y = root[0].y;
         f.set_cursor_position((cursor_x, cursor_y));
 
@@ -6714,12 +6801,15 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     if app.show_telemetry {
-        let query_prefix = app.query_prompt_prefix();
-        let query = Paragraph::new(format!("{query_prefix}{displayed_query}"))
-            .style(Style::default().fg(Color::White));
+        let mut query_spans = app.query_prompt_line().spans;
+        query_spans.push(Span::styled(
+            displayed_query.clone(),
+            Style::default().fg(Color::White),
+        ));
+        let query = Paragraph::new(Line::from(query_spans));
         f.render_widget(query, Rect::new(root[0].x, root[0].y, root[0].width, 1));
         let cursor_x =
-            root[0].x + query_prefix.chars().count() as u16 + app.displayed_cursor_pos() as u16;
+            root[0].x + app.query_prompt_width() as u16 + app.displayed_cursor_pos() as u16;
         let cursor_y = root[0].y;
         f.set_cursor_position((cursor_x, cursor_y));
 
@@ -6771,14 +6861,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let geometry = app_geometry(f.area(), app);
-    let query_prefix = app.query_prompt_prefix();
-    let query =
-        Paragraph::new(format!("{query_prefix}{displayed_query}")).style(app.query_bar_style());
+    let mut query_spans = app.query_prompt_line().spans;
+    query_spans.push(Span::styled(displayed_query, app.query_bar_style()));
+    let query = Paragraph::new(Line::from(query_spans));
     f.render_widget(query, geometry.query);
     if matches!(app.input_mode, InputMode::SessionSearch) {
-        let cursor_x = geometry.query.x
-            + query_prefix.chars().count() as u16
-            + app.displayed_cursor_pos() as u16;
+        let cursor_x =
+            geometry.query.x + app.query_prompt_width() as u16 + app.displayed_cursor_pos() as u16;
         let cursor_y = geometry.query.y;
         f.set_cursor_position((cursor_x, cursor_y));
     }
@@ -7040,8 +7129,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let search_bar = Paragraph::new(format!("{search_prefix}{search_display}"))
-            .style(search_style);
+        let search_bar =
+            Paragraph::new(format!("{search_prefix}{search_display}")).style(search_style);
         f.render_widget(search_bar, search_bar_area);
         if matches!(app.input_mode, InputMode::PreviewSearch) {
             let cursor_x = search_bar_area.x
@@ -9404,6 +9493,108 @@ mod tests {
         assert_eq!(
             app.sessions[app.filtered[0].session_idx].project_slug,
             Some(expected_project)
+        );
+    }
+
+    #[test]
+    fn query_prompt_line_renders_active_filters_as_tag_chips() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha]);
+        app.active_tag_filters.push(TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        });
+
+        let prompt = app.query_prompt_line();
+        let rendered = prompt
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let expected_style = tag_spec(
+            TagFilterKind::Project,
+            "/tmp/repos/alpha/.git".to_string(),
+            "alpha".to_string(),
+            None,
+        )
+        .style;
+
+        assert_eq!(rendered, " alpha  ❯ ");
+        assert_eq!(prompt.spans[0].style, expected_style);
+    }
+
+    #[test]
+    fn clicking_query_filter_chip_removes_it_without_touching_query() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut beta = mr(
+            Some("2026-02-10T00:00:02Z"),
+            Role::User,
+            "second",
+            "session-beta",
+            SourceKind::CodexSessionJsonl,
+        );
+        beta.cwd = Some("/tmp/beta".to_string());
+        beta.project_slug = Some("beta".to_string());
+        beta.project_key = Some("/tmp/repos/beta/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha, beta]);
+        app.query = "sec".to_string();
+        app.cursor_pos = app.query.len();
+        app.active_tag_filters.push(TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        });
+        app.update_results();
+
+        let area = Rect::new(0, 0, 240, 30);
+        let query_area = app_geometry(area, &app).query;
+        let rendered = app
+            .query_prompt_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let project_offset = rendered.find(" alpha ").unwrap() as u16 + 1;
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: query_area.x + project_offset,
+                row: query_area.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.query, "sec");
+        assert!(app.active_tag_filters.is_empty());
+        assert_eq!(app.filtered.len(), 1);
+        assert_eq!(
+            app.sessions[app.filtered[0].session_idx]
+                .project_slug
+                .as_deref(),
+            Some("beta")
         );
     }
 
