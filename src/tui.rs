@@ -3841,27 +3841,8 @@ fn point_near_horizontal_split(y: u16, rect: Rect) -> bool {
     rect.height > 0 && y == rect.y.saturating_sub(1)
 }
 
-fn preview_layout_lines(doc: &PreviewDoc, anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
-    let Some(anchor_record_idx) = anchor_record_idx else {
-        return doc.lines.clone();
-    };
-    let mut lines = doc.lines.clone();
-    let Some(line_idx) = doc
-        .line_record_indices
-        .iter()
-        .position(|record_idx| *record_idx == Some(anchor_record_idx))
-    else {
-        return lines;
-    };
-    let mut spans = vec![Span::styled(
-        "git anchor  ",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )];
-    spans.extend(lines[line_idx].spans.clone());
-    lines[line_idx] = Line::from(spans);
-    lines
+fn preview_layout_lines(doc: &PreviewDoc, _anchor_record_idx: Option<usize>) -> Vec<Line<'static>> {
+    doc.lines.clone()
 }
 
 fn with_preview_record_highlights(
@@ -4154,13 +4135,18 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             adjusted_mouse,
                         );
                         if let Some(record_idx) = app.hovered_preview_record_idx {
+                            let reveal_doc = if app.showing_session_browser() {
+                                app.session_browser_doc_for(Some(record_idx))
+                            } else {
+                                preview_doc
+                            };
                             let preview_lines = preview_layout_lines(
-                                &preview_doc,
+                                &reveal_doc,
                                 app.git_graph_visible.then_some(record_idx),
                             );
                             app.reveal_preview_record(
                                 &preview_lines,
-                                &preview_doc.line_record_indices,
+                                &reveal_doc.line_record_indices,
                                 preview_width,
                                 preview_height,
                                 record_idx,
@@ -4728,6 +4714,12 @@ impl App {
         }
         if self.showing_session_browser() {
             let doc = self.session_browser_doc();
+            if let Some(record_idx) = self
+                .hovered_preview_record_idx
+                .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
+            {
+                return Some(record_idx);
+            }
             return self.current_preview_selection(&doc, &doc.lines, preview_width);
         }
 
@@ -5653,7 +5645,7 @@ impl App {
         }
     }
 
-    fn session_browser_doc(&self) -> PreviewDoc {
+    fn session_browser_doc_for(&self, selected_record_idx: Option<usize>) -> PreviewDoc {
         let Some(hit) = self.selected_hit() else {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
@@ -5681,6 +5673,9 @@ impl App {
 
         let base_style = Style::default();
         let mut line_record_indices = Vec::new();
+        let expanded_record_idx = selected_record_idx
+            .filter(|record_idx| record_idxs.contains(record_idx))
+            .or_else(|| record_idxs.first().copied());
 
         let mut lines: Vec<Line<'static>> = vec![
             Line::raw(format!("session id: {}", sess.session_id)),
@@ -5720,6 +5715,9 @@ impl App {
                 rec.phase.as_deref().unwrap_or("")
             )));
             line_record_indices.push(Some(idx));
+            if Some(idx) != expanded_record_idx {
+                continue;
+            }
             lines.push(Line::raw(format!(
                 "file: {}:{}",
                 rec.file.display(),
@@ -5747,6 +5745,10 @@ impl App {
             match_lines: Vec::new(),
             line_record_indices,
         }
+    }
+
+    fn session_browser_doc(&self) -> PreviewDoc {
+        self.session_browser_doc_for(self.selected_preview_record_idx)
     }
 
     fn build_preview_doc(&self) -> PreviewDoc {
@@ -6479,8 +6481,13 @@ impl App {
                 .unwrap_or(section_records.len() - 1)
         };
         let target_record_idx = section_records[target_pos];
+        let target_doc = if self.showing_session_browser() {
+            self.session_browser_doc_for(Some(target_record_idx))
+        } else {
+            doc
+        };
         let preview_lines = preview_layout_lines(
-            &doc,
+            &target_doc,
             if self.git_graph_visible {
                 Some(target_record_idx)
             } else {
@@ -6489,7 +6496,7 @@ impl App {
         );
         self.reveal_preview_record(
             &preview_lines,
-            &doc.line_record_indices,
+            &target_doc.line_record_indices,
             preview_width,
             preview_height,
             target_record_idx,
@@ -8903,6 +8910,49 @@ mod tests {
     }
 
     #[test]
+    fn session_browser_doc_only_expands_selected_turn_fields() {
+        let mut second = mr(
+            Some("2026-04-13T00:00:02Z"),
+            Role::Assistant,
+            "second body",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        second.phase = Some("reply".to_string());
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first body",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            second,
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third body",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.selected_preview_record_idx = Some(1);
+
+        let doc = app.session_browser_doc();
+        let rendered = doc.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|line| line.contains("turn 1")));
+        assert!(rendered.iter().any(|line| line.contains("turn 2")));
+        assert!(rendered.iter().any(|line| line.contains("turn 3")));
+        assert!(rendered.iter().any(|line| line.contains("file:")));
+        assert!(rendered.iter().any(|line| line.contains("second body")));
+        assert!(!rendered.iter().any(|line| line.contains("first body")));
+        assert!(!rendered.iter().any(|line| line.contains("third body")));
+    }
+
+    #[test]
     fn preview_selected_record_idx_uses_last_section_start_at_or_before_scroll() {
         let doc = PreviewDoc {
             lines: vec![
@@ -9082,7 +9132,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_layout_lines_marks_first_anchor_line() {
+    fn preview_layout_lines_leave_turn_text_unmodified() {
         let doc = PreviewDoc {
             lines: vec![
                 Line::raw("header"),
@@ -9100,8 +9150,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(rendered.starts_with("git anchor"));
-        assert!(rendered.contains("turn 2"));
+        assert_eq!(rendered, "turn 2");
     }
 
     #[test]
@@ -9619,7 +9668,7 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let doc = app.session_browser_doc();
+        let doc = app.session_browser_doc_for(Some(1));
         let preview_lines = preview_layout_lines(&doc, None);
         let initial_scroll = preview_visual_line_offset(&preview_lines, 1, 80);
         app.preview_scroll = initial_scroll;
@@ -9795,6 +9844,40 @@ mod tests {
     }
 
     #[test]
+    fn selected_anchor_record_idx_prefers_hovered_turn_in_session_browser() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.git_graph_visible = true;
+        app.update_results();
+        app.selected_preview_record_idx = Some(0);
+        app.hovered_preview_record_idx = Some(1);
+
+        assert_eq!(app.selected_anchor_record_idx(80, 20), Some(1));
+    }
+
+    #[test]
     fn clicking_preview_turn_reveals_entire_turn_when_it_fits() {
         let all = vec![
             mr(
@@ -9826,11 +9909,20 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
-        let doc = app.session_browser_doc();
-        let preview_lines = preview_layout_lines(&doc, None);
+        let current_doc = app.session_browser_doc();
+        let current_preview_lines = preview_layout_lines(&current_doc, None);
+        let (current_second_start, _) = preview_record_visual_bounds(
+            &current_preview_lines,
+            &current_doc.line_record_indices,
+            preview_width,
+            1,
+        )
+        .expect("expected collapsed second preview record bounds");
+        let target_doc = app.session_browser_doc_for(Some(1));
+        let target_preview_lines = preview_layout_lines(&target_doc, None);
         let (second_start, second_end) = preview_record_visual_bounds(
-            &preview_lines,
-            &doc.line_record_indices,
+            &target_preview_lines,
+            &target_doc.line_record_indices,
             preview_width,
             1,
         )
@@ -9838,7 +9930,7 @@ mod tests {
         let second_height = second_end.saturating_sub(second_start);
         assert!(second_height <= preview_height);
 
-        app.preview_scroll = second_start.saturating_add(1);
+        app.preview_scroll = current_second_start;
         let click_row = preview_area.y + 1;
 
         route_mouse(
@@ -9894,6 +9986,7 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
+        app.selected_preview_record_idx = Some(1);
         let doc = app.session_browser_doc();
         let preview_lines = preview_layout_lines(&doc, None);
         let (second_start, second_end) = preview_record_visual_bounds(
