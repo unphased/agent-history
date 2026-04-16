@@ -165,10 +165,17 @@ enum LayoutPreset {
     GitWide,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PaneSearchState {
+    query: String,
+    cursor_pos: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     SessionSearch,
     PreviewNav,
+    PreviewSearch,
     GitGraph,
     GitCommit,
 }
@@ -2718,7 +2725,7 @@ struct App {
     last_git_graph_anchor: Option<(PathBuf, usize)>,
     git_graph_visible: bool,
     git_commit_visible: bool,
-    preview_show_all_turns: bool,
+    preview_search: PaneSearchState,
     input_mode: InputMode,
     active_split: Option<ActiveSplit>,
     layout_state: LayoutState,
@@ -2833,7 +2840,7 @@ fn run_app(
         last_git_graph_anchor: None,
         git_graph_visible: false,
         git_commit_visible: false,
-        preview_show_all_turns: false,
+        preview_search: PaneSearchState::default(),
         input_mode: InputMode::SessionSearch,
         active_split: None,
         layout_state: LayoutState::from_ui_state(&ui_state.layout),
@@ -3092,6 +3099,20 @@ fn handle_key(
         return Ok(true);
     }
 
+    // PreviewSearch stacked-mode handlers — must fire before global Esc/Tab/BackTab
+    if matches!(app.input_mode, InputMode::PreviewSearch) {
+        if key.code == KeyCode::Esc {
+            app.preview_search.query.clear();
+            app.preview_search.cursor_pos = 0;
+            app.input_mode = InputMode::PreviewNav;
+            return Ok(false);
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            app.input_mode = InputMode::PreviewNav;
+            return Ok(false);
+        }
+    }
+
     if key.code == KeyCode::Esc {
         if app.show_telemetry {
             return Ok(true);
@@ -3144,17 +3165,6 @@ fn handle_key(
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cycle_layout_preset();
-            return Ok(false);
-        }
-        KeyCode::Char('s')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.show_telemetry =>
-        {
-            app.preview_show_all_turns = !app.preview_show_all_turns;
-            app.set_ui_status(if app.preview_show_all_turns {
-                "preview: showing all turns"
-            } else {
-                "preview: showing matched turns only"
-            });
             return Ok(false);
         }
         KeyCode::Char('r')
@@ -3220,6 +3230,82 @@ fn handle_key(
             }
             _ => {}
         }
+    }
+
+    // PreviewSearch insert-mode text editing
+    if matches!(app.input_mode, InputMode::PreviewSearch) {
+        match key.code {
+            KeyCode::Backspace => {
+                if app.preview_search.cursor_pos > 0 {
+                    let byte_pos =
+                        char_to_byte_pos(&app.preview_search.query, app.preview_search.cursor_pos);
+                    let prev_byte_pos = char_to_byte_pos(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos - 1,
+                    );
+                    app.preview_search.query.replace_range(prev_byte_pos..byte_pos, "");
+                    app.preview_search.cursor_pos -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                let char_count = app.preview_search.query.chars().count();
+                if app.preview_search.cursor_pos < char_count {
+                    let byte_pos =
+                        char_to_byte_pos(&app.preview_search.query, app.preview_search.cursor_pos);
+                    let next_byte_pos = char_to_byte_pos(
+                        &app.preview_search.query,
+                        app.preview_search.cursor_pos + 1,
+                    );
+                    app.preview_search.query.replace_range(byte_pos..next_byte_pos, "");
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.preview_search.query.clear();
+                app.preview_search.cursor_pos = 0;
+            }
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.preview_search.cursor_pos =
+                        prev_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                } else {
+                    app.preview_search.cursor_pos =
+                        app.preview_search.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                let char_count = app.preview_search.query.chars().count();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    app.preview_search.cursor_pos =
+                        next_word_boundary(&app.preview_search.query, app.preview_search.cursor_pos);
+                } else if app.preview_search.cursor_pos < char_count {
+                    app.preview_search.cursor_pos += 1;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a')
+                if key.code == KeyCode::Home
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.preview_search.cursor_pos = 0;
+            }
+            KeyCode::End | KeyCode::Char('e')
+                if key.code == KeyCode::End
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.preview_search.cursor_pos =
+                    app.preview_search.query.chars().count();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let byte_pos =
+                    char_to_byte_pos(&app.preview_search.query, app.preview_search.cursor_pos);
+                app.preview_search.query.insert(byte_pos, c);
+                app.preview_search.cursor_pos += 1;
+            }
+            _ => {}
+        }
+        return Ok(false);
     }
 
     let text_input_active =
@@ -3434,6 +3520,9 @@ fn handle_key(
                     }
                 }
             }
+        }
+        KeyCode::Char('/') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            app.input_mode = InputMode::PreviewSearch;
         }
         KeyCode::Char('k') if matches!(app.input_mode, InputMode::PreviewNav) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
@@ -4003,39 +4092,54 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 {
                     app.set_session_browser_active_pane(SessionBrowserPane::End);
                 } else if point_in_rect(mouse.column, mouse.row, geometry.turn_preview) {
-                    let preview_doc = if app.showing_session_browser() {
-                        app.session_browser_doc()
+                    let has_bar = preview_has_search_bar(app);
+                    let search_bar_row = geometry.turn_preview.y.saturating_add(1);
+                    if has_bar && mouse.row == search_bar_row {
+                        app.input_mode = InputMode::PreviewSearch;
                     } else {
-                        app.build_preview_doc()
-                    };
-                    let preview_width = preview_area.width.saturating_sub(2) as usize;
-                    let preview_height = preview_area.height.saturating_sub(2) as usize;
-                    let anchor_record_idx = if app.git_graph_visible {
-                        app.selected_anchor_record_idx(preview_width, preview_height)
-                    } else {
-                        None
-                    };
-                    let preview_lines = preview_layout_lines(&preview_doc, anchor_record_idx);
-                    app.hovered_preview_record_idx = app.preview_record_idx_at_mouse(
-                        &preview_lines,
-                        &preview_doc.line_record_indices,
-                        preview_area,
-                        mouse,
-                    );
-                    if let Some(record_idx) = app.hovered_preview_record_idx {
-                        let preview_lines = preview_layout_lines(
-                            &preview_doc,
-                            app.git_graph_visible.then_some(record_idx),
-                        );
-                        app.reveal_preview_record(
+                        let preview_doc = if app.showing_session_browser() {
+                            app.session_browser_doc()
+                        } else {
+                            app.build_preview_doc()
+                        };
+                        let adjusted_mouse = if has_bar {
+                            MouseEvent {
+                                row: mouse.row.saturating_sub(1),
+                                ..mouse
+                            }
+                        } else {
+                            mouse
+                        };
+                        let preview_width = preview_area.width.saturating_sub(2) as usize;
+                        let content = preview_content_rect(preview_area, has_bar);
+                        let preview_height = content.height as usize;
+                        let anchor_record_idx = if app.git_graph_visible {
+                            app.selected_anchor_record_idx(preview_width, preview_height)
+                        } else {
+                            None
+                        };
+                        let preview_lines = preview_layout_lines(&preview_doc, anchor_record_idx);
+                        app.hovered_preview_record_idx = app.preview_record_idx_at_mouse(
                             &preview_lines,
                             &preview_doc.line_record_indices,
-                            preview_width,
-                            preview_height,
-                            record_idx,
+                            preview_area,
+                            adjusted_mouse,
                         );
+                        if let Some(record_idx) = app.hovered_preview_record_idx {
+                            let preview_lines = preview_layout_lines(
+                                &preview_doc,
+                                app.git_graph_visible.then_some(record_idx),
+                            );
+                            app.reveal_preview_record(
+                                &preview_lines,
+                                &preview_doc.line_record_indices,
+                                preview_width,
+                                preview_height,
+                                record_idx,
+                            );
+                        }
+                        app.input_mode = InputMode::PreviewNav;
                     }
-                    app.input_mode = InputMode::PreviewNav;
                 } else if point_in_rect(mouse.column, mouse.row, results_area) {
                     app.input_mode = InputMode::SessionSearch;
                 }
@@ -4048,8 +4152,17 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 } else {
                     app.build_preview_doc()
                 };
+                let has_bar = preview_has_search_bar(app);
+                let adjusted_mouse = if has_bar {
+                    MouseEvent {
+                        row: mouse.row.saturating_sub(1),
+                        ..mouse
+                    }
+                } else {
+                    mouse
+                };
                 let preview_width = preview_area.width.saturating_sub(2) as usize;
-                let preview_height = preview_area.height.saturating_sub(2) as usize;
+                let preview_height = preview_content_rect(preview_area, has_bar).height as usize;
                 let anchor_record_idx = if app.git_graph_visible {
                     app.selected_anchor_record_idx(preview_width, preview_height)
                 } else {
@@ -4060,13 +4173,15 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     &preview_lines,
                     &preview_doc.line_record_indices,
                     preview_area,
-                    mouse,
+                    adjusted_mouse,
                 );
                 if app.hovered_preview_record_idx.is_some() {
                     if preview_width > 0 {
                         app.preview_scroll_reset_pending = false;
                     }
-                    app.input_mode = InputMode::PreviewNav;
+                    if !matches!(app.input_mode, InputMode::PreviewSearch) {
+                        app.input_mode = InputMode::PreviewNav;
+                    }
                 }
             } else if !app.show_telemetry {
                 app.hovered_preview_record_idx = None;
@@ -4247,9 +4362,9 @@ fn current_preview_inner_height(
     terminal: &Terminal<CrosstermBackend<Stdout>>,
     app: &App,
 ) -> anyhow::Result<usize> {
-    Ok(current_preview_area(terminal, app)?
-        .height
-        .saturating_sub(2) as usize)
+    let area = current_preview_area(terminal, app)?;
+    let has_bar = preview_has_search_bar(app);
+    Ok(preview_content_rect(area, has_bar).height as usize)
 }
 
 fn current_results_inner_height(
@@ -4259,6 +4374,26 @@ fn current_results_inner_height(
     let area = terminal.size().context("failed to get terminal size")?;
     let geometry = app_geometry(area.into(), app);
     Ok(geometry.results.height.saturating_sub(2) as usize)
+}
+
+fn preview_has_search_bar(app: &App) -> bool {
+    matches!(app.input_mode, InputMode::PreviewSearch)
+        || (matches!(app.input_mode, InputMode::PreviewNav)
+            && !app.preview_search.query.is_empty())
+}
+
+fn preview_content_rect(preview_area: Rect, has_search_bar: bool) -> Rect {
+    let inner = Rect::new(
+        preview_area.x.saturating_add(1),
+        preview_area.y.saturating_add(1),
+        preview_area.width.saturating_sub(2),
+        preview_area.height.saturating_sub(2),
+    );
+    if has_search_bar && inner.height > 1 {
+        Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1)
+    } else {
+        inner
+    }
 }
 
 impl App {
@@ -4279,7 +4414,7 @@ impl App {
                 }
             }
             InputMode::GitCommit => InputMode::PreviewNav,
-            InputMode::PreviewNav => InputMode::SessionSearch,
+            InputMode::PreviewNav | InputMode::PreviewSearch => InputMode::SessionSearch,
         }
     }
 
@@ -4294,7 +4429,7 @@ impl App {
                     InputMode::PreviewNav
                 }
             }
-            InputMode::PreviewNav => {
+            InputMode::PreviewNav | InputMode::PreviewSearch => {
                 if self.git_commit_visible {
                     InputMode::GitCommit
                 } else if self.git_graph_visible {
@@ -4429,7 +4564,7 @@ impl App {
     fn showing_session_browser(&self) -> bool {
         self.ready
             && !self.show_telemetry
-            && self.query.trim().is_empty()
+            && self.preview_search.query.trim().is_empty()
             && self.selected_hit().is_some()
     }
 
@@ -5035,12 +5170,16 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+s: all turns  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Tab/Shift+Tab: focus  Enter: resume  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
-                "Tab/Shift+Tab: focus  Esc: search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+s: all turns  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc: search  /: preview search  j/k: prev/next turn  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events".to_string()
             }
+            InputMode::PreviewSearch => format!(
+                "Esc: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
+                self.preview_search.query
+            ),
             InputMode::GitGraph => {
                 "Tab/Shift+Tab: focus  Esc: search  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
             }
@@ -5179,6 +5318,8 @@ impl App {
 
     fn update_results(&mut self) {
         let q = self.query.trim().to_string();
+        self.preview_search.query = q.clone();
+        self.preview_search.cursor_pos = self.preview_search.query.chars().count();
         let started = Instant::now();
         let perf_enabled = self.log_group_enabled(LogGroup::Perf);
         let mut candidate_phase_started = perf_enabled.then(Instant::now);
@@ -5344,12 +5485,19 @@ impl App {
     }
 
     fn reset_preview_scroll_to_match(&mut self) {
+        let preview_synced = self.preview_search.query.trim() == self.query.trim();
         self.selected_preview_record_idx = self.selected_hit().and_then(|hit| {
-            hit.matched_record_idx.or_else(|| {
+            if preview_synced {
+                hit.matched_record_idx.or_else(|| {
+                    self.sessions
+                        .get(hit.session_idx)
+                        .map(|session| session.first_user_idx)
+                })
+            } else {
                 self.sessions
                     .get(hit.session_idx)
                     .map(|session| session.first_user_idx)
-            })
+            }
         });
         self.hovered_preview_record_idx = None;
         if self.showing_session_browser() {
@@ -5409,7 +5557,7 @@ impl App {
             )),
             Line::raw(format!("source: {}", source_label(sess.source))),
             Line::raw(format!(
-                "turns: {} (showing all, filter paused)",
+                "turns: {}",
                 record_idxs.len()
             )),
             Line::raw(""),
@@ -5569,11 +5717,11 @@ impl App {
             return self.build_telemetry_preview_doc();
         }
 
-        let query = self.query.trim();
+        let query = self.preview_search.query.trim();
         let base_style = Style::default();
 
-        if self.preview_show_all_turns && !query.is_empty() {
-            return self.build_all_turns_preview_doc(query);
+        if query.is_empty() {
+            return self.build_all_turns_preview_doc("");
         }
 
         let Some(hit) = self.selected_hit() else {
@@ -5592,64 +5740,6 @@ impl App {
                 line_record_indices: vec![None],
             };
         };
-
-        if query.is_empty() {
-            let Some(rec) = self.selected_record() else {
-                return PreviewDoc {
-                    lines: vec![Line::raw("(no match)")],
-                    first_match_line: 0,
-                    match_lines: Vec::new(),
-                    line_record_indices: vec![None],
-                };
-            };
-
-            let role = match rec.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
-                Role::Unknown => "unknown",
-            };
-
-            let mut lines = vec![
-                Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
-                Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
-                Line::raw(format!("host: {}", rec.machine_name)),
-                Line::raw(format!("machine id: {}", rec.machine_id)),
-                Line::raw(format!("origin: {}", rec.origin)),
-                Line::raw(format!(
-                    "project: {}",
-                    rec.project_slug.as_deref().unwrap_or("")
-                )),
-                Line::raw(format!(
-                    "role: {role}   phase: {}",
-                    rec.phase.as_deref().unwrap_or("")
-                )),
-                Line::raw(format!("cwd: {}", rec.cwd.as_deref().unwrap_or(""))),
-                Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)),
-                Line::raw(format!("source: {}", source_label(rec.source))),
-                Line::raw(""),
-            ];
-            let record_idx = hit.matched_record_idx.unwrap_or(sess.first_user_idx);
-            if !rec.images.is_empty() {
-                lines.push(Line::raw(format!("images: {}", rec.images.len())));
-                for path in materialize_record_images(rec) {
-                    lines.push(Line::raw(format!("image file: {path}")));
-                }
-                lines.push(Line::raw(""));
-            }
-            let mut line_record_indices = vec![Some(record_idx); lines.len()];
-            let rendered_lines = render_preview_message_lines(&rec.text, query, base_style);
-            line_record_indices.extend(std::iter::repeat_n(Some(record_idx), rendered_lines.len()));
-            lines.extend(rendered_lines);
-
-            return PreviewDoc {
-                lines,
-                first_match_line: 0,
-                match_lines: Vec::new(),
-                line_record_indices,
-            };
-        }
 
         let compiled = search::CompiledQuery::new(query);
         let Some(record_idxs) = self.session_records.get(hit.session_idx) else {
@@ -6247,7 +6337,9 @@ impl App {
     }
 
     fn sync_selected_preview_record_from_scroll(&mut self, preview_width: usize) {
-        if preview_width == 0 || (!self.showing_session_browser() && self.query.trim().is_empty()) {
+        if preview_width == 0
+            || (!self.showing_session_browser() && self.preview_search.query.trim().is_empty())
+        {
             return;
         }
         let doc = if self.showing_session_browser() {
@@ -6368,7 +6460,10 @@ impl App {
     }
 
     fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
-        if self.showing_session_browser() || self.show_telemetry || self.query.trim().is_empty() {
+        if self.showing_session_browser()
+            || self.show_telemetry
+            || self.preview_search.query.trim().is_empty()
+        {
             return;
         }
         let doc = self.build_preview_doc();
@@ -6753,8 +6848,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Preview
     let preview_area = geometry.turn_preview;
-    let preview_inner_height = preview_area.height.saturating_sub(2) as usize;
     let preview_inner_width = preview_area.width.saturating_sub(2) as usize;
+    let has_preview_bar = preview_has_search_bar(app);
+    let preview_content = preview_content_rect(preview_area, has_preview_bar);
+    let preview_inner_height = preview_content.height as usize;
     let preview_style = app
         .preview_bgcolor
         .map(|color| Style::default().bg(color))
@@ -6848,7 +6945,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let preview_duration_ms = preview_started.elapsed().as_millis();
     let preview_mode = if app.showing_session_browser() {
         "session_browser_single"
-    } else if query.is_empty() {
+    } else if app.preview_search.query.trim().is_empty() {
         "empty_query"
     } else {
         "query_preview"
@@ -6908,24 +7005,57 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             }),
         );
     }
-    let preview_title = if !app.showing_session_browser() && !query.is_empty() {
+    let preview_query = app.preview_search.query.trim();
+    let preview_title = if !app.showing_session_browser() && !preview_query.is_empty() {
         app.query_preview_title("Preview", selected_preview_record_idx)
     } else if app.showing_session_browser() {
         app.turns_preview_title(selected_preview_record_idx)
     } else {
         app.preview_title("Preview")
     };
+
+    let has_search_bar = preview_has_search_bar(app);
+    let preview_block = Block::default()
+        .style(preview_style)
+        .border_style(preview_border_style)
+        .borders(Borders::ALL)
+        .title(preview_title);
+    f.render_widget(preview_block, preview_area);
+
+    // Render search bar if applicable
+    if has_search_bar {
+        let search_bar_area = Rect::new(
+            preview_area.x + 1,
+            preview_area.y + 1,
+            preview_area.width.saturating_sub(2),
+            1,
+        );
+        let search_prefix = "/ ";
+        let search_display = &app.preview_search.query;
+        let search_style = if matches!(app.input_mode, InputMode::PreviewSearch) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let search_bar = Paragraph::new(format!("{search_prefix}{search_display}"))
+            .style(search_style);
+        f.render_widget(search_bar, search_bar_area);
+        if matches!(app.input_mode, InputMode::PreviewSearch) {
+            let cursor_x = search_bar_area.x
+                + search_prefix.len() as u16
+                + app.preview_search.cursor_pos as u16;
+            f.set_cursor_position((cursor_x, search_bar_area.y));
+        }
+    }
+
+    let content = preview_content_rect(preview_area, has_search_bar);
     let preview = Paragraph::new(Text::from(preview_lines))
         .style(preview_style)
-        .block(
-            Block::default()
-                .style(preview_style)
-                .border_style(preview_border_style)
-                .borders(Borders::ALL)
-                .title(preview_title),
-        )
         .scroll((app.preview_scroll as u16, 0));
-    f.render_widget(preview, preview_area);
+    f.render_widget(preview, content);
 
     render_footer(f, root[1], app.status_text(), app.footer_help_text());
 
@@ -7498,7 +7628,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
-            preview_show_all_turns: false,
+            preview_search: PaneSearchState::default(),
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -8215,7 +8345,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
-            preview_show_all_turns: false,
+            preview_search: PaneSearchState::default(),
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -8316,7 +8446,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
-            preview_show_all_turns: false,
+            preview_search: PaneSearchState::default(),
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
@@ -9984,7 +10114,7 @@ mod tests {
             last_git_graph_anchor: None,
             git_graph_visible: false,
             git_commit_visible: false,
-            preview_show_all_turns: false,
+            preview_search: PaneSearchState::default(),
             input_mode: InputMode::SessionSearch,
             active_split: None,
             layout_state: LayoutState::new(),
