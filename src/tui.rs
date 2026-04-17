@@ -125,6 +125,10 @@ struct PreviewMatch {
     end: usize,
 }
 
+struct RenderedTurnBody {
+    lines: Vec<Line<'static>>,
+}
+
 struct PreviewDoc {
     lines: Vec<Line<'static>>,
     first_match_line: usize,
@@ -1058,6 +1062,62 @@ fn first_non_empty_line(s: &str) -> &str {
 
 fn compact_single_line(s: &str) -> String {
     first_non_empty_line(s).replace(['\t', '\n'], " ")
+}
+
+fn render_session_header(sess: &SessionSummary, turn_count: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::raw(format!("session id: {}", sess.session_id)),
+        Line::raw(format!(
+            "account: {}",
+            sess.account.as_deref().unwrap_or("")
+        )),
+        Line::raw(format!("host: {}", sess.machine_name)),
+        Line::raw(format!("machine id: {}", sess.machine_id)),
+        Line::raw(format!("origin: {}", sess.origin)),
+        Line::raw(format!(
+            "project: {}",
+            sess.project_slug.as_deref().unwrap_or("")
+        )),
+        Line::raw(format!("source: {}", source_label(sess.source))),
+        Line::raw(format!("turns: {turn_count}")),
+        Line::raw(""),
+    ]
+}
+
+fn render_turn_header(rec: &MessageRecord, turn_position_in_scope: usize) -> Line<'static> {
+    let role = match rec.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
+        Role::Unknown => "unknown",
+    };
+    Line::raw(format!(
+        "turn {}   {}   role: {role}   phase: {}",
+        turn_position_in_scope + 1,
+        short_ts(rec.timestamp.as_deref()),
+        rec.phase.as_deref().unwrap_or("")
+    ))
+}
+
+fn render_turn_body(rec: &MessageRecord, is_expanded: bool) -> RenderedTurnBody {
+    let mut lines = Vec::new();
+    if is_expanded {
+        lines.push(Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)));
+        if !rec.images.is_empty() {
+            lines.push(Line::raw(format!("images: {}", rec.images.len())));
+            for path in materialize_record_images(rec) {
+                lines.push(Line::raw(format!("image file: {path}")));
+            }
+        }
+    }
+    lines.extend(render_preview_message_lines(
+        &rec.text,
+        "",
+        Style::default(),
+    ));
+    lines.push(Line::raw(""));
+    RenderedTurnBody { lines }
 }
 
 fn telemetry_metric_u64(data: &Value, key: &str) -> Option<u64> {
@@ -6198,71 +6258,23 @@ impl App {
             };
         };
 
-        let base_style = Style::default();
         let mut line_record_indices = Vec::new();
         let expanded_record_idx = selected_record_idx
             .filter(|record_idx| record_idxs.contains(record_idx))
             .or_else(|| record_idxs.first().copied());
 
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::raw(format!("session id: {}", sess.session_id)),
-            Line::raw(format!(
-                "account: {}",
-                sess.account.as_deref().unwrap_or("")
-            )),
-            Line::raw(format!("host: {}", sess.machine_name)),
-            Line::raw(format!("machine id: {}", sess.machine_id)),
-            Line::raw(format!("origin: {}", sess.origin)),
-            Line::raw(format!(
-                "project: {}",
-                sess.project_slug.as_deref().unwrap_or("")
-            )),
-            Line::raw(format!("source: {}", source_label(sess.source))),
-            Line::raw(format!("turns: {}", record_idxs.len())),
-            Line::raw(""),
-        ];
+        let mut lines = render_session_header(sess, record_idxs.len());
         line_record_indices.resize(lines.len(), None);
 
         for (pos, &idx) in record_idxs.iter().enumerate() {
             let Some(rec) = self.all.get(idx) else {
                 continue;
             };
-            let role = match rec.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
-                Role::Unknown => "unknown",
-            };
-
-            lines.push(Line::raw(format!(
-                "turn {}   {}   role: {role}   phase: {}",
-                pos + 1,
-                short_ts(rec.timestamp.as_deref()),
-                rec.phase.as_deref().unwrap_or("")
-            )));
+            let rendered_body = render_turn_body(rec, Some(idx) == expanded_record_idx);
+            lines.push(render_turn_header(rec, pos));
             line_record_indices.push(Some(idx));
-            if Some(idx) == expanded_record_idx {
-                lines.push(Line::raw(format!(
-                    "file: {}:{}",
-                    rec.file.display(),
-                    rec.line
-                )));
-                line_record_indices.push(Some(idx));
-                if !rec.images.is_empty() {
-                    lines.push(Line::raw(format!("images: {}", rec.images.len())));
-                    line_record_indices.push(Some(idx));
-                    for path in materialize_record_images(rec) {
-                        lines.push(Line::raw(format!("image file: {path}")));
-                        line_record_indices.push(Some(idx));
-                    }
-                }
-            }
-            let rendered_lines = render_preview_message_lines(&rec.text, "", base_style);
-            line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_lines.len()));
-            lines.extend(rendered_lines);
-            lines.push(Line::raw(""));
-            line_record_indices.push(Some(idx));
+            line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_body.lines.len()));
+            lines.extend(rendered_body.lines);
         }
 
         PreviewDoc {
