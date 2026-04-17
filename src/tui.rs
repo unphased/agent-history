@@ -732,6 +732,18 @@ fn preview_record_highlight_colors(preview_bgcolor: Option<Color>) -> (Color, Co
     )
 }
 
+fn preview_active_match_style(preview_bgcolor: Option<Color>) -> Style {
+    let base = preview_bgcolor.unwrap_or(PREVIEW_ACTIVE_MATCH_BG);
+    let bg = if matches!(base, Color::Rgb(..)) {
+        lighten_preview_color(base, 0.18)
+    } else {
+        PREVIEW_ACTIVE_MATCH_BG
+    };
+    Style::default()
+        .bg(bg)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+}
+
 fn wrap_preview_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![line.clone()];
@@ -805,6 +817,29 @@ fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> 
         ));
     } else if spans.is_empty() {
         spans.push(Span::styled(" ".repeat(width), Style::default().bg(bg)));
+    }
+    Line::from(spans)
+}
+
+fn preview_line_with_overlay_style(
+    line: &Line<'static>,
+    width: usize,
+    overlay_style: Style,
+) -> Line<'static> {
+    if width == 0 {
+        return line.clone();
+    }
+    let mut spans = line
+        .spans
+        .iter()
+        .cloned()
+        .map(|span| Span::styled(span.content, span.style.patch(overlay_style)))
+        .collect::<Vec<_>>();
+    let used_width = line.width();
+    if used_width < width {
+        spans.push(Span::styled(" ".repeat(width - used_width), overlay_style));
+    } else if spans.is_empty() {
+        spans.push(Span::styled(" ".repeat(width), overlay_style));
     }
     Line::from(spans)
 }
@@ -1339,6 +1374,7 @@ const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
 const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
+const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(158, 122, 58);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
 const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
@@ -2800,6 +2836,7 @@ struct App {
     selected: usize,
     offset: usize,
     session_preview_states: HashMap<usize, SessionPreviewState>,
+    active_preview_match_idx: Option<usize>,
     selected_preview_record_idx: Option<usize>,
     hovered_preview_record_idx: Option<usize>,
     preview_scroll: usize,
@@ -2917,6 +2954,7 @@ fn run_app(
         selected: 0,
         offset: 0,
         session_preview_states: HashMap::new(),
+        active_preview_match_idx: None,
         selected_preview_record_idx: None,
         hovered_preview_record_idx: None,
         preview_scroll: 0,
@@ -3956,6 +3994,7 @@ fn with_preview_record_highlights(
     preview_width: usize,
     selected_record_idx: Option<usize>,
     hovered_record_idx: Option<usize>,
+    active_match_raw_line: Option<usize>,
     preview_bgcolor: Option<Color>,
 ) -> Vec<Line<'static>> {
     if preview_width == 0 {
@@ -3963,11 +4002,13 @@ fn with_preview_record_highlights(
     }
 
     let (hover_bg, selected_bg) = preview_record_highlight_colors(preview_bgcolor);
+    let active_match_style = preview_active_match_style(preview_bgcolor);
     let mut visual_lines = Vec::new();
-    for (line, record_idx) in lines
+    for (raw_idx, (line, record_idx)) in lines
         .iter()
         .cloned()
         .zip(line_record_indices.iter().copied())
+        .enumerate()
     {
         let highlight_bg = match record_idx {
             Some(record_idx) if Some(record_idx) == selected_record_idx => Some(selected_bg),
@@ -3975,10 +4016,15 @@ fn with_preview_record_highlights(
             _ => None,
         };
         for wrapped_line in wrap_preview_line(&line, preview_width) {
-            visual_lines.push(if let Some(bg) = highlight_bg {
+            let line = if let Some(bg) = highlight_bg {
                 preview_line_with_block_bg(&wrapped_line, preview_width, bg)
             } else {
                 wrapped_line
+            };
+            visual_lines.push(if Some(raw_idx) == active_match_raw_line {
+                preview_line_with_overlay_style(&line, preview_width, active_match_style)
+            } else {
+                line
             });
         }
     }
@@ -5508,6 +5554,7 @@ impl App {
         }
         self.preview_search.query.clear();
         self.preview_search.cursor_pos = 0;
+        self.active_preview_match_idx = None;
         self.reset_preview_scroll_to_match();
     }
 
@@ -5620,6 +5667,7 @@ impl App {
     fn reset_telemetry_search(&mut self) {
         self.preview_scroll = 0;
         self.preview_scroll_reset_pending = true;
+        self.active_preview_match_idx = None;
     }
 
     fn append_event_record(&mut self, record: telemetry::EventRecord) {
@@ -5861,6 +5909,36 @@ impl App {
         self.all.get(session.first_user_idx)
     }
 
+    fn sync_active_preview_match_idx_for_doc(&mut self, doc: &PreviewDoc, preview_width: usize) {
+        if preview_width == 0 || doc.match_lines.is_empty() {
+            self.active_preview_match_idx = None;
+            return;
+        }
+        if let Some(idx) = self
+            .active_preview_match_idx
+            .filter(|idx| *idx < doc.match_lines.len())
+        {
+            self.active_preview_match_idx = Some(idx);
+            return;
+        }
+        let current_raw = preview_raw_line_index_for_visual_offset(
+            &doc.lines,
+            preview_width,
+            self.preview_scroll,
+        );
+        let idx = doc
+            .match_lines
+            .iter()
+            .position(|&line| line >= current_raw)
+            .unwrap_or(doc.match_lines.len().saturating_sub(1));
+        self.active_preview_match_idx = Some(idx);
+    }
+
+    fn active_preview_match_raw_line(&self, doc: &PreviewDoc) -> Option<usize> {
+        self.active_preview_match_idx
+            .and_then(|idx| doc.match_lines.get(idx).copied())
+    }
+
     fn reset_preview_scroll_to_match(&mut self) {
         let preview_synced = self.preview_search.query.trim() == self.query.trim();
         self.selected_preview_record_idx = self.selected_hit().and_then(|hit| {
@@ -5890,6 +5968,7 @@ impl App {
         } else {
             self.preview_scroll_reset_pending = true;
         }
+        self.active_preview_match_idx = None;
         self.git_graph_scroll = 0;
         self.git_commit_scroll = 0;
     }
@@ -6793,12 +6872,14 @@ impl App {
             let cur = self.preview_scroll as i32;
             self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
             self.sync_selected_preview_record_from_scroll(preview_width);
+            self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
             self.preview_scroll_reset_pending = false;
             return;
         }
         let cur = self.preview_scroll as i32;
         self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
         self.sync_selected_preview_record_from_scroll(preview_width);
+        self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
         self.preview_scroll_reset_pending = false;
     }
 
@@ -6811,6 +6892,7 @@ impl App {
         if self.show_telemetry {
             self.preview_scroll = 0;
             self.preview_scroll_reset_pending = false;
+            self.active_preview_match_idx = None;
             return;
         }
         match self.input_mode {
@@ -6823,6 +6905,12 @@ impl App {
             _ => {
                 self.preview_scroll = 0;
                 self.sync_selected_preview_record_from_scroll(preview_width);
+                let doc = if self.showing_session_browser() {
+                    self.session_browser_doc()
+                } else {
+                    self.build_preview_doc()
+                };
+                self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
                 self.preview_scroll_reset_pending = false;
             }
         }
@@ -6837,6 +6925,7 @@ impl App {
             let doc = self.build_telemetry_preview_doc();
             let total_lines = preview_visual_line_count(&doc.lines, preview_width);
             self.preview_scroll = total_lines.saturating_sub(preview_height);
+            self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
             self.preview_scroll_reset_pending = false;
             return;
         }
@@ -6874,6 +6963,7 @@ impl App {
                 let total_lines = preview_visual_line_count(&preview_lines, preview_width);
                 self.preview_scroll = total_lines.saturating_sub(preview_height);
                 self.sync_selected_preview_record_from_scroll(preview_width);
+                self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
                 self.preview_scroll_reset_pending = false;
             }
         }
@@ -6961,26 +7051,21 @@ impl App {
                 None
             },
         );
-        let current_raw = preview_raw_line_index_for_visual_offset(
-            &preview_lines,
-            preview_width,
-            self.preview_scroll,
-        );
-        let target_raw = if dir >= 0 {
-            doc.match_lines
-                .iter()
-                .copied()
-                .find(|&line| line > current_raw)
-                .unwrap_or(doc.match_lines[0])
+        self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
+        let current_idx = self.active_preview_match_idx.unwrap_or(0);
+        let target_idx = if dir >= 0 {
+            if current_idx + 1 < doc.match_lines.len() {
+                current_idx + 1
+            } else {
+                0
+            }
         } else {
-            doc.match_lines
-                .iter()
-                .copied()
-                .rev()
-                .find(|&line| line < current_raw)
-                .unwrap_or(*doc.match_lines.last().unwrap())
+            current_idx
+                .checked_sub(1)
+                .unwrap_or(doc.match_lines.len().saturating_sub(1))
         };
-
+        let target_raw = doc.match_lines[target_idx];
+        self.active_preview_match_idx = Some(target_idx);
         self.preview_scroll =
             preview_visual_line_offset(&preview_lines, target_raw, preview_width).saturating_sub(2);
         self.preview_scroll_reset_pending = false;
@@ -7014,6 +7099,7 @@ impl App {
 
     fn toggle_telemetry_view(&mut self) {
         self.show_telemetry = !self.show_telemetry;
+        self.active_preview_match_idx = None;
         if self.show_telemetry && !self.log_groups_help_emitted {
             self.emit_event(
                 "log_groups_help",
@@ -7144,8 +7230,18 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
             let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
             app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+            app.sync_active_preview_match_idx_for_doc(&telemetry_doc, telemetry_inner_width);
             let telemetry_style = events_preview_style();
-            let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
+            let telemetry_lines = with_preview_record_highlights(
+                &telemetry_doc.lines,
+                &telemetry_doc.line_record_indices,
+                telemetry_inner_width,
+                None,
+                None,
+                app.active_preview_match_raw_line(&telemetry_doc),
+                Some(parse_hex_color(EVENTS_PREVIEW_BGCOLOR).unwrap_or(Color::Rgb(32, 32, 32))),
+            );
+            let telemetry = Paragraph::new(Text::from(telemetry_lines))
                 .style(telemetry_style)
                 .block(
                     Block::default()
@@ -7233,8 +7329,18 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             preview_visual_line_count(&telemetry_doc.lines, telemetry_inner_width);
         let telemetry_max_scroll = telemetry_total_lines.saturating_sub(telemetry_inner_height);
         app.preview_scroll = cmp::min(app.preview_scroll, telemetry_max_scroll);
+        app.sync_active_preview_match_idx_for_doc(&telemetry_doc, telemetry_inner_width);
         let telemetry_style = events_preview_style();
-        let telemetry = Paragraph::new(Text::from(telemetry_doc.lines))
+        let telemetry_lines = with_preview_record_highlights(
+            &telemetry_doc.lines,
+            &telemetry_doc.line_record_indices,
+            telemetry_inner_width,
+            None,
+            None,
+            app.active_preview_match_raw_line(&telemetry_doc),
+            Some(parse_hex_color(EVENTS_PREVIEW_BGCOLOR).unwrap_or(Color::Rgb(32, 32, 32))),
+        );
+        let telemetry = Paragraph::new(Text::from(telemetry_lines))
             .style(telemetry_style)
             .block(
                 Block::default()
@@ -7510,6 +7616,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             preview_inner_height,
         );
     }
+    app.sync_active_preview_match_idx_for_doc(&preview_doc, preview_inner_width);
     app.remember_selected_session_preview_state(preview_inner_width);
     let layout_started = Instant::now();
     let preview_lines = with_preview_record_highlights(
@@ -7518,6 +7625,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         preview_inner_width,
         selected_preview_record_idx,
         app.hovered_preview_record_idx,
+        app.active_preview_match_raw_line(&preview_doc),
         app.preview_bgcolor,
     );
     if app.log_group_enabled(LogGroup::Perf) {
@@ -8143,6 +8251,7 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            active_preview_match_idx: None,
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -8862,6 +8971,7 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            active_preview_match_idx: None,
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -8965,6 +9075,7 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            active_preview_match_idx: None,
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -10923,6 +11034,7 @@ mod tests {
             200,
             Some(1),
             Some(2),
+            None,
             preview_bg,
         );
         let second_line_idx = doc
@@ -10946,7 +11058,8 @@ mod tests {
     #[test]
     fn preview_record_highlight_keeps_existing_match_backgrounds() {
         let line = highlighted_line("alpha beta", "beta", Style::default());
-        let lines = with_preview_record_highlights(&[line], &[Some(0)], 20, Some(0), None, None);
+        let lines =
+            with_preview_record_highlights(&[line], &[Some(0)], 20, Some(0), None, None, None);
         let (_, selected_bg) = preview_record_highlight_colors(None);
 
         let alpha_span = lines[0]
@@ -10963,6 +11076,22 @@ mod tests {
         assert_eq!(alpha_span.style.bg, Some(selected_bg));
         assert_eq!(beta_span.style.bg, query_match_style_for(0).bg);
         assert_eq!(beta_span.style.fg, query_match_style_for(0).fg);
+    }
+
+    #[test]
+    fn preview_active_match_highlight_overlays_current_match_line() {
+        let line = highlighted_line("alpha beta", "beta", Style::default());
+        let lines =
+            with_preview_record_highlights(&[line], &[Some(0)], 20, None, None, Some(0), None);
+        let active_style = preview_active_match_style(None);
+
+        assert_eq!(lines[0].spans[0].style.bg, active_style.bg);
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 
     #[test]
@@ -11111,8 +11240,6 @@ mod tests {
         expected.preview_scroll_reset_pending = false;
         expected.jump_preview_match(1, preview_width);
         let expected_after_next = expected.preview_scroll;
-        expected.jump_preview_match(-1, preview_width);
-        let expected_after_prev = expected.preview_scroll;
 
         handle_key(
             &mut terminal,
@@ -11121,6 +11248,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.preview_scroll, expected_after_next);
+        let after_first_n = app.preview_scroll;
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert!(app.preview_scroll > after_first_n);
 
         handle_key(
             &mut terminal,
@@ -11128,7 +11264,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('N'), KeyModifiers::empty()),
         )
         .unwrap();
-        assert_eq!(app.preview_scroll, expected_after_prev);
+        assert_eq!(app.preview_scroll, after_first_n);
     }
 
     #[test]
@@ -11425,6 +11561,7 @@ mod tests {
             selected: 1,
             offset: 0,
             session_preview_states: HashMap::new(),
+            active_preview_match_idx: None,
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
