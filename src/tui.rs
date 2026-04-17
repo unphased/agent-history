@@ -6918,15 +6918,12 @@ impl App {
 
     fn sync_selected_preview_record_from_scroll(&mut self, preview_width: usize) {
         if preview_width == 0
-            || (!self.showing_session_browser() && self.preview_search.query.trim().is_empty())
+            || self.showing_session_browser()
+            || self.preview_search.query.trim().is_empty()
         {
             return;
         }
-        let doc = if self.showing_session_browser() {
-            self.session_browser_doc()
-        } else {
-            self.build_preview_doc()
-        };
+        let doc = self.build_preview_doc();
         let preview_lines = preview_layout_lines(
             &doc,
             if self.git_graph_visible {
@@ -7643,7 +7640,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     };
 
     let preview_started = Instant::now();
-    let mut preview_doc = if app.showing_session_browser() {
+    let preview_doc = if app.showing_session_browser() {
         app.session_browser_doc()
     } else {
         app.build_preview_doc()
@@ -7655,7 +7652,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         "query_preview"
     };
-    let mut preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
+    let preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
     if app.preview_scroll_reset_pending {
         if !app.restore_selected_session_preview_state(
             &preview_layout,
@@ -7685,25 +7682,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             }
         }
     }
-    if app.showing_session_browser() {
-        let effective_selected_preview_record_idx = app.current_preview_selection(
-            &preview_doc,
-            &preview_layout,
-            preview_inner_width,
-            preview_inner_height,
-        );
-        if effective_selected_preview_record_idx != app.selected_preview_record_idx {
-            app.selected_preview_record_idx = effective_selected_preview_record_idx;
-            preview_doc = app.session_browser_doc();
-            preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
-        }
-    }
     let preview_duration_ms = preview_started.elapsed().as_millis();
     app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
-    let mut preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
-    let mut preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
+    let preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
+    let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
-    let mut selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
+    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
         app.current_preview_selection(
             &preview_doc,
             &preview_layout,
@@ -7713,22 +7697,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         None
     };
-    if app.showing_session_browser()
-        && selected_preview_record_idx != app.selected_preview_record_idx
-    {
-        app.selected_preview_record_idx = selected_preview_record_idx;
-        preview_doc = app.session_browser_doc();
-        preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
-        preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
-        preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
-        app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
-        selected_preview_record_idx = app.current_preview_selection(
-            &preview_doc,
-            &preview_layout,
-            preview_inner_width,
-            preview_inner_height,
-        );
-    }
     app.sync_active_preview_match_idx_for_doc(&preview_doc, preview_inner_width);
     app.remember_selected_session_preview_state(preview_inner_width);
     let layout_started = Instant::now();
@@ -9727,6 +9695,47 @@ mod tests {
     }
 
     #[test]
+    fn sync_selected_preview_record_from_scroll_keeps_session_browser_focus_lazy() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let doc = app.session_browser_doc();
+        let starts = preview_section_start_lines(&doc.line_record_indices);
+
+        app.selected_preview_record_idx = Some(0);
+        app.preview_scroll = preview_visual_line_offset(&doc.lines, starts[1], 80);
+        app.sync_selected_preview_record_from_scroll(80);
+
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(
+            app.current_preview_selection(&doc, &doc.lines, 80, 3),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn preview_selected_record_idx_uses_last_section_start_at_or_before_scroll() {
         let doc = PreviewDoc {
             lines: vec![
@@ -10171,6 +10180,55 @@ mod tests {
         terminal.draw(|f| ui(f, &mut app)).unwrap();
 
         assert_eq!(app.preview_scroll, target_scroll);
+    }
+
+    #[test]
+    fn ui_render_keeps_session_browser_focus_lazy_after_scroll() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        let area = Rect::new(0, 0, 100, 30);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let doc = app.session_browser_doc();
+        let preview_lines = preview_layout_lines(&doc, None);
+        let starts = preview_section_start_lines(&doc.line_record_indices);
+        let target_scroll = preview_visual_line_offset(&preview_lines, starts[1], preview_width);
+        assert!(target_scroll > 0);
+
+        app.selected_preview_record_idx = Some(0);
+        app.preview_scroll = target_scroll;
+        app.preview_scroll_reset_pending = false;
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        assert_eq!(app.selected_preview_record_idx, Some(0));
     }
 
     #[test]
