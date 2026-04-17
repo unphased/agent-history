@@ -3285,16 +3285,6 @@ fn handle_key(
             app.toggle_log_group(LogGroup::Perf);
             return Ok(false);
         }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_match(1, width);
-            return Ok(false);
-        }
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let width = current_preview_inner_width(terminal, app)?;
-            app.jump_preview_match(-1, width);
-            return Ok(false);
-        }
         _ => {}
     }
 
@@ -3641,6 +3631,14 @@ fn handle_key(
             let preview_width = current_preview_inner_width(terminal, app)?;
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.jump_preview_record(1, preview_width, preview_height);
+        }
+        KeyCode::Char('n') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_match(1, width);
+        }
+        KeyCode::Char('N') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let width = current_preview_inner_width(terminal, app)?;
+            app.jump_preview_match(-1, width);
         }
         KeyCode::Char('g')
             if matches!(
@@ -5524,11 +5522,11 @@ impl App {
                     "clear+search"
                 };
                 format!(
-                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+n/p: next/prev match  Ctrl+t: events"
+                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+t: events"
                 )
             }
             InputMode::PreviewSearch => format!(
-                "Esc/F10: clear+exit  Tab: keep+exit  Ctrl+u: clear  Ctrl+n/p: next/prev match  filter: \"{}\"",
+                "Esc/F10: clear+exit  Tab: keep+exit  Ctrl+u: clear  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
@@ -10867,6 +10865,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.selected_preview_record_idx, Some(0));
+    }
+
+    #[test]
+    fn handle_key_n_and_shift_n_jump_preview_matches_in_preview_nav_mode() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "alpha needle",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "beta needle",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "gamma needle",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all.clone());
+        app.query = "needle".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+        let preview_width = current_preview_inner_width(&terminal, &app).unwrap();
+
+        let doc = app.build_preview_doc();
+        let initial_scroll =
+            preview_visual_line_offset(&doc.lines, doc.match_lines[0], preview_width)
+                .saturating_sub(2);
+        app.preview_scroll = initial_scroll;
+        app.preview_scroll_reset_pending = false;
+
+        let mut expected = ready_app_with_indexed_data(all);
+        expected.query = "needle".to_string();
+        expected.cursor_pos = expected.query.chars().count();
+        expected.update_results();
+        expected.input_mode = InputMode::PreviewNav;
+        expected.preview_scroll = initial_scroll;
+        expected.preview_scroll_reset_pending = false;
+        expected.jump_preview_match(1, preview_width);
+        let expected_after_next = expected.preview_scroll;
+        expected.jump_preview_match(-1, preview_width);
+        let expected_after_prev = expected.preview_scroll;
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.preview_scroll, expected_after_next);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('N'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.preview_scroll, expected_after_prev);
     }
 
     #[test]
