@@ -732,16 +732,8 @@ fn preview_record_highlight_colors(preview_bgcolor: Option<Color>) -> (Color, Co
     )
 }
 
-fn preview_active_match_style(preview_bgcolor: Option<Color>) -> Style {
-    let base = preview_bgcolor.unwrap_or(PREVIEW_ACTIVE_MATCH_BG);
-    let bg = if matches!(base, Color::Rgb(..)) {
-        lighten_preview_color(base, 0.18)
-    } else {
-        PREVIEW_ACTIVE_MATCH_BG
-    };
-    Style::default()
-        .bg(bg)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+fn preview_active_match_style(_preview_bgcolor: Option<Color>) -> Style {
+    Style::default().bg(PREVIEW_ACTIVE_MATCH_BG)
 }
 
 fn wrap_preview_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -1374,7 +1366,7 @@ const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
 const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
-const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(158, 122, 58);
+const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(148, 58, 58);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
 const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
@@ -11086,12 +11078,11 @@ mod tests {
         let active_style = preview_active_match_style(None);
 
         assert_eq!(lines[0].spans[0].style.bg, active_style.bg);
-        assert!(
-            lines[0].spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::UNDERLINED)
-        );
+        assert!(!lines[0].spans[0].style.fg.is_some());
+        assert!(!lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
     }
 
     #[test]
