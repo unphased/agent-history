@@ -4731,33 +4731,6 @@ impl App {
         );
     }
 
-    fn reveal_preview_record_at_start(
-        &mut self,
-        preview_lines: &[Line<'_>],
-        line_record_indices: &[Option<usize>],
-        preview_width: usize,
-        record_idx: usize,
-    ) {
-        if preview_width == 0 {
-            self.selected_preview_record_idx = Some(record_idx);
-            self.preview_scroll_reset_pending = false;
-            return;
-        }
-        let Some((section_start, _)) = preview_record_visual_bounds(
-            preview_lines,
-            line_record_indices,
-            preview_width,
-            record_idx,
-        ) else {
-            self.preview_scroll_reset_pending = false;
-            return;
-        };
-        self.selected_preview_record_idx = Some(record_idx);
-        self.preview_scroll = section_start;
-        self.preview_scroll_reset_pending = false;
-        self.remember_selected_session_preview_state(preview_width);
-    }
-
     fn restore_selected_session_preview_state(
         &mut self,
         preview_lines: &[Line<'_>],
@@ -6816,14 +6789,6 @@ impl App {
         );
         let total_lines = preview_visual_line_count(&preview_lines, preview_width);
         let max_scroll = total_lines.saturating_sub(preview_height);
-        if delta < 0 && self.preview_scroll == 0 {
-            self.jump_preview_record_with_strategy(-1, preview_width, preview_height, true);
-            return;
-        }
-        if delta > 0 && self.preview_scroll >= max_scroll {
-            self.jump_preview_record_with_strategy(1, preview_width, preview_height, true);
-            return;
-        }
         if self.showing_session_browser() {
             let cur = self.preview_scroll as i32;
             self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
@@ -6918,20 +6883,6 @@ impl App {
         if self.show_telemetry || preview_width == 0 || preview_height == 0 {
             return;
         }
-
-        self.jump_preview_record_with_strategy(dir, preview_width, preview_height, false);
-    }
-
-    fn jump_preview_record_with_strategy(
-        &mut self,
-        dir: i32,
-        preview_width: usize,
-        preview_height: usize,
-        align_to_start: bool,
-    ) {
-        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
-            return;
-        }
         let doc = if self.showing_session_browser() {
             self.session_browser_doc()
         } else {
@@ -6981,22 +6932,13 @@ impl App {
                 None
             },
         );
-        if align_to_start {
-            self.reveal_preview_record_at_start(
-                &preview_lines,
-                &target_doc.line_record_indices,
-                preview_width,
-                target_record_idx,
-            );
-        } else {
-            self.reveal_preview_record(
-                &preview_lines,
-                &target_doc.line_record_indices,
-                preview_width,
-                preview_height,
-                target_record_idx,
-            );
-        }
+        self.reveal_preview_record(
+            &preview_lines,
+            &target_doc.line_record_indices,
+            preview_width,
+            preview_height,
+            target_record_idx,
+        );
     }
 
     fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
@@ -9884,7 +9826,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_scroll_wraps_up_from_top_to_last_turn() {
+    fn preview_scroll_does_not_wrap_up_from_top_to_last_turn() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:01Z"),
@@ -9916,12 +9858,12 @@ mod tests {
         app.preview_scroll = 0;
         app.scroll_preview_lines(-1, preview_width, preview_height);
 
-        assert_eq!(app.selected_preview_record_idx, Some(2));
-        assert!(app.preview_scroll > 0);
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(app.preview_scroll, 0);
     }
 
     #[test]
-    fn preview_scroll_wraps_down_from_bottom_to_first_turn() {
+    fn preview_scroll_does_not_wrap_down_from_bottom_to_first_turn() {
         let all = vec![
             mr(
                 Some("2026-02-10T00:00:01Z"),
@@ -9954,19 +9896,12 @@ mod tests {
         let preview_lines = preview_layout_lines(&doc, None);
         let max_scroll =
             preview_visual_line_count(&preview_lines, preview_width).saturating_sub(preview_height);
-        let (first_start, _) = preview_record_visual_bounds(
-            &preview_lines,
-            &doc.line_record_indices,
-            preview_width,
-            0,
-        )
-        .expect("expected first turn bounds");
 
         app.preview_scroll = max_scroll;
         app.scroll_preview_lines(1, preview_width, preview_height);
 
-        assert_eq!(app.selected_preview_record_idx, Some(0));
-        assert_eq!(app.preview_scroll, first_start);
+        assert_ne!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(app.preview_scroll, max_scroll);
     }
 
     #[test]
@@ -11073,6 +11008,54 @@ mod tests {
             &mut terminal,
             &mut app,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+    }
+
+    #[test]
+    fn handle_key_j_and_k_wrap_between_first_and_last_turns() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.selected_preview_record_idx, Some(2));
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
         )
         .unwrap();
         assert_eq!(app.selected_preview_record_idx, Some(0));
