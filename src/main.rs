@@ -1,9 +1,11 @@
 mod args;
 mod cache;
 mod config;
+#[path = "indexer.rs"]
 mod indexer;
 mod search;
 mod telemetry;
+#[path = "tui.rs"]
 mod tui;
 
 use anyhow::Context as _;
