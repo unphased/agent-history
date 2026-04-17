@@ -59,6 +59,12 @@ struct SessionTagSpec {
     style: Style,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryFilterTagAdornment {
+    None,
+    Remove,
+}
+
 #[derive(Debug, Default, Clone)]
 struct IndexingProgress {
     total_files: usize,
@@ -1290,6 +1296,40 @@ fn tag_specs_to_spans(specs: Vec<SessionTagSpec>) -> Vec<Span<'static>> {
         spans.push(Span::raw(" "));
     }
     spans
+}
+
+fn query_filter_tag_spans(
+    specs: Vec<SessionTagSpec>,
+    hovered_filter: Option<&TagFilter>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for spec in specs {
+        let adornment = if hovered_filter == Some(&spec.filter) {
+            QueryFilterTagAdornment::Remove
+        } else {
+            QueryFilterTagAdornment::None
+        };
+        spans.extend(query_filter_tag_spec_spans(spec, adornment));
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn query_filter_tag_spec_spans(
+    spec: SessionTagSpec,
+    adornment: QueryFilterTagAdornment,
+) -> Vec<Span<'static>> {
+    match adornment {
+        QueryFilterTagAdornment::None => vec![Span::styled(spec.content, spec.style)],
+        QueryFilterTagAdornment::Remove => {
+            let label = spec.content.trim().to_string();
+            vec![
+                Span::styled(" ".to_string(), spec.style),
+                Span::styled("x".to_string(), spec.style.fg(Color::Rgb(255, 96, 96))),
+                Span::styled(format!(" {label} "), spec.style),
+            ]
+        }
+    }
 }
 
 fn unix_now_secs() -> i64 {
@@ -2802,6 +2842,7 @@ struct App {
     session_preview_states: HashMap<usize, SessionPreviewState>,
     selected_preview_record_idx: Option<usize>,
     hovered_preview_record_idx: Option<usize>,
+    hovered_query_tag_filter: Option<TagFilter>,
     preview_scroll: usize,
     preview_scroll_reset_pending: bool,
     session_browser_start_scroll: usize,
@@ -2919,6 +2960,7 @@ fn run_app(
         session_preview_states: HashMap::new(),
         selected_preview_record_idx: None,
         hovered_preview_record_idx: None,
+        hovered_query_tag_filter: None,
         preview_scroll: 0,
         preview_scroll_reset_pending: false,
         session_browser_start_scroll: 0,
@@ -4110,7 +4152,7 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
 
     let mut cursor = 0;
     for spec in specs {
-        let width = UnicodeWidthStr::width(spec.content.as_str());
+        let width = UnicodeWidthStr::width(app.query_filter_tag_content(&spec).as_str());
         if (cursor..cursor + width).contains(&content_x) {
             return Some(spec.filter);
         }
@@ -4129,7 +4171,7 @@ fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
 
     let content_x = (mouse.column - query_area.x) as usize;
     if let Some(filter) = tag_filter_at_query_column(app, content_x) {
-        app.toggle_tag_filter(filter);
+        app.remove_tag_filter(&filter);
     }
 }
 
@@ -4166,7 +4208,7 @@ fn handle_results_click(app: &mut App, results_area: Rect, mouse: MouseEvent) {
 
     let content_x = (mouse.column - results_area.x - 1) as usize;
     if let Some(filter) = tag_filter_at_result_column(sess, &app.ui_tags, content_x) {
-        app.toggle_tag_filter(filter);
+        app.apply_tag_filter_from_results(filter);
     }
 }
 
@@ -4297,6 +4339,13 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
             }
         }
         MouseEventKind::Moved => {
+            app.hovered_query_tag_filter =
+                if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, geometry.query) {
+                    let content_x = (mouse.column - geometry.query.x) as usize;
+                    tag_filter_at_query_column(app, content_x)
+                } else {
+                    None
+                };
             if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, preview_area) {
                 let preview_doc = if app.showing_session_browser() {
                     app.session_browser_doc()
@@ -5584,6 +5633,14 @@ impl App {
             .collect()
     }
 
+    fn query_filter_tag_content(&self, spec: &SessionTagSpec) -> String {
+        if self.hovered_query_tag_filter.as_ref() == Some(&spec.filter) {
+            format!(" x {} ", spec.content.trim())
+        } else {
+            spec.content.clone()
+        }
+    }
+
     fn query_prompt_line(&self) -> Line<'static> {
         if self.show_telemetry {
             return Line::from(vec![Span::raw("events❯ ")]);
@@ -5592,7 +5649,10 @@ impl App {
             return Line::from(vec![Span::raw("❯ ")]);
         }
 
-        let mut spans = tag_specs_to_spans(self.active_filter_tag_specs());
+        let mut spans = query_filter_tag_spans(
+            self.active_filter_tag_specs(),
+            self.hovered_query_tag_filter.as_ref(),
+        );
         spans.push(Span::raw("❯ "));
         Line::from(spans)
     }
@@ -5676,6 +5736,31 @@ impl App {
             self.active_tag_filters.push(filter);
         }
         self.update_results();
+    }
+
+    fn remove_tag_filter(&mut self, filter: &TagFilter) {
+        if let Some(existing_idx) = self
+            .active_tag_filters
+            .iter()
+            .position(|existing| existing == filter)
+        {
+            self.active_tag_filters.remove(existing_idx);
+            if self.hovered_query_tag_filter.as_ref() == Some(filter) {
+                self.hovered_query_tag_filter = None;
+            }
+            self.update_results();
+        }
+    }
+
+    fn apply_tag_filter_from_results(&mut self, filter: TagFilter) {
+        if self
+            .active_tag_filters
+            .iter()
+            .any(|existing| existing == &filter)
+        {
+            return;
+        }
+        self.toggle_tag_filter(filter);
     }
 
     fn clear_query_and_filters(&mut self) {
@@ -8145,6 +8230,7 @@ mod tests {
             session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
+            hovered_query_tag_filter: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -8864,6 +8950,7 @@ mod tests {
             session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
+            hovered_query_tag_filter: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -8967,6 +9054,7 @@ mod tests {
             session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
+            hovered_query_tag_filter: None,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -10261,6 +10349,136 @@ mod tests {
     }
 
     #[test]
+    fn hovered_query_filter_chip_renders_red_x_affordance() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha]);
+        let filter = TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        };
+        app.active_tag_filters.push(filter.clone());
+        app.hovered_query_tag_filter = Some(filter);
+
+        let prompt = app.query_prompt_line();
+        let rendered = prompt
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, " x alpha  ❯ ");
+        assert_eq!(prompt.spans[1].style.fg, Some(Color::Rgb(255, 96, 96)));
+    }
+
+    #[test]
+    fn moving_mouse_over_query_filter_chip_sets_hovered_filter() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha]);
+        let filter = TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        };
+        app.active_tag_filters.push(filter.clone());
+
+        let area = Rect::new(0, 0, 240, 30);
+        let query_area = app_geometry(area, &app).query;
+        let chip_offset = " x alpha ".find('x').unwrap() as u16;
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: query_area.x + chip_offset,
+                row: query_area.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.hovered_query_tag_filter, Some(filter));
+    }
+
+    #[test]
+    fn clicking_selected_result_tag_keeps_filter_and_selects_row() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut beta = mr(
+            Some("2026-02-10T00:00:02Z"),
+            Role::User,
+            "second",
+            "session-beta",
+            SourceKind::CodexSessionJsonl,
+        );
+        beta.cwd = Some("/tmp/beta".to_string());
+        beta.project_slug = Some("beta".to_string());
+        beta.project_key = Some("/tmp/repos/beta/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha, beta]);
+        let selected_filter = TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        };
+        app.active_tag_filters.push(selected_filter.clone());
+        app.update_results();
+        let alpha_row = 0usize;
+        app.selected = alpha_row;
+
+        let area = Rect::new(0, 0, 240, 30);
+        let results_area = app_geometry(area, &app).results;
+        let hit = app.filtered[alpha_row];
+        let sess = app.sessions.get(hit.session_idx).unwrap();
+        let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let project_offset = rendered.find(" alpha ").unwrap() as u16 + 1;
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: results_area.x + 1 + project_offset,
+                row: results_area.y + 1 + alpha_row as u16,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.selected, alpha_row);
+        assert_eq!(app.active_tag_filters, vec![selected_filter]);
+    }
+
+    #[test]
     fn result_line_includes_match_snippet_and_hit_count() {
         let sess = SessionSummary {
             source: SourceKind::CodexSessionJsonl,
@@ -11423,6 +11641,7 @@ mod tests {
                 },
             ],
             selected: 1,
+            hovered_query_tag_filter: None,
             offset: 0,
             session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
