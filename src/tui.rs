@@ -7539,7 +7539,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
     let preview_duration_ms = preview_started.elapsed().as_millis();
     app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
-    let mut preview_total_lines = preview_layout.len();
+    let mut preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
     let mut preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
     app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
     let mut selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
@@ -7558,7 +7558,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         app.selected_preview_record_idx = selected_preview_record_idx;
         preview_doc = app.session_browser_doc();
         preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
-        preview_total_lines = preview_layout.len();
+        preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
         preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
         app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
         selected_preview_record_idx = app.current_preview_selection(
@@ -9967,6 +9967,48 @@ mod tests {
 
         assert_eq!(app.selected_preview_record_idx, Some(0));
         assert_eq!(app.preview_scroll, first_start);
+    }
+
+    #[test]
+    fn ui_does_not_clamp_preview_scroll_using_raw_line_count() {
+        let wrapped_turn = (1..=18)
+            .map(|n| format!("this is a deliberately long wrapped preview line number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            &wrapped_turn,
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.selected_preview_record_idx = Some(0);
+        app.preview_scroll_reset_pending = false;
+
+        let area = Rect::new(0, 0, 50, 14);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height =
+            preview_content_rect(preview_area, preview_has_search_bar(&app)).height as usize;
+        let doc = app.session_browser_doc();
+        let preview_lines = preview_layout_lines(&doc, None);
+        let visual_max_scroll =
+            preview_visual_line_count(&preview_lines, preview_width).saturating_sub(preview_height);
+        let raw_max_scroll = preview_lines.len().saturating_sub(preview_height);
+
+        assert!(visual_max_scroll > raw_max_scroll);
+        let target_scroll = raw_max_scroll.saturating_add(5).min(visual_max_scroll);
+        assert!(target_scroll > raw_max_scroll);
+        app.preview_scroll = target_scroll;
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        assert_eq!(app.preview_scroll, target_scroll);
     }
 
     #[test]
