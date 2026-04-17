@@ -112,10 +112,17 @@ struct SessionPreviewState {
     turn_scroll_offset: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewMatch {
+    raw_line: usize,
+    start: usize,
+    end: usize,
+}
+
 struct PreviewDoc {
     lines: Vec<Line<'static>>,
     first_match_line: usize,
-    match_lines: Vec<usize>,
+    matches: Vec<PreviewMatch>,
     line_record_indices: Vec<Option<usize>>,
 }
 
@@ -813,25 +820,41 @@ fn preview_line_with_block_bg(line: &Line<'static>, width: usize, bg: Color) -> 
     Line::from(spans)
 }
 
-fn preview_line_with_overlay_style(
+fn preview_line_with_active_match(
     line: &Line<'static>,
-    width: usize,
+    active_match: PreviewMatch,
     overlay_style: Style,
 ) -> Line<'static> {
-    if width == 0 {
+    if active_match.start >= active_match.end {
         return line.clone();
     }
-    let mut spans = line
-        .spans
-        .iter()
-        .cloned()
-        .map(|span| Span::styled(span.content, span.style.patch(overlay_style)))
-        .collect::<Vec<_>>();
-    let used_width = line.width();
-    if used_width < width {
-        spans.push(Span::styled(" ".repeat(width - used_width), overlay_style));
-    } else if spans.is_empty() {
-        spans.push(Span::styled(" ".repeat(width), overlay_style));
+    let mut spans = Vec::new();
+    let mut absolute = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        let content = span.content.as_ref();
+        let span_start = absolute;
+        let span_end = span_start + content.len();
+        if span_end <= active_match.start || span_start >= active_match.end {
+            spans.push(span.clone());
+            absolute = span_end;
+            continue;
+        }
+
+        let highlight_start = active_match.start.max(span_start) - span_start;
+        let highlight_end = active_match.end.min(span_end) - span_start;
+
+        if highlight_start > 0 {
+            spans.push(Span::styled(content[..highlight_start].to_string(), style));
+        }
+        spans.push(Span::styled(
+            content[highlight_start..highlight_end].to_string(),
+            style.patch(overlay_style),
+        ));
+        if highlight_end < content.len() {
+            spans.push(Span::styled(content[highlight_end..].to_string(), style));
+        }
+        absolute = span_end;
     }
     Line::from(spans)
 }
@@ -1366,7 +1389,7 @@ const REMOTE_DESYNC_TAG_FG: Color = Color::Rgb(246, 218, 238);
 const REMOTE_PREVIEW_BORDER_FG: Color = Color::Rgb(36, 36, 36);
 const PREVIEW_HOVER_BG: Color = Color::Rgb(76, 68, 92);
 const PREVIEW_SELECTED_BG: Color = Color::Rgb(92, 80, 110);
-const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(148, 58, 58);
+const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(196, 48, 48);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.10;
 const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
@@ -3986,7 +4009,7 @@ fn with_preview_record_highlights(
     preview_width: usize,
     selected_record_idx: Option<usize>,
     hovered_record_idx: Option<usize>,
-    active_match_raw_line: Option<usize>,
+    active_match: Option<PreviewMatch>,
     preview_bgcolor: Option<Color>,
 ) -> Vec<Line<'static>> {
     if preview_width == 0 {
@@ -4007,17 +4030,18 @@ fn with_preview_record_highlights(
             Some(record_idx) if Some(record_idx) == hovered_record_idx => Some(hover_bg),
             _ => None,
         };
+        let line = if let Some(active_match) = active_match.filter(|m| m.raw_line == raw_idx) {
+            preview_line_with_active_match(&line, active_match, active_match_style)
+        } else {
+            line
+        };
         for wrapped_line in wrap_preview_line(&line, preview_width) {
             let line = if let Some(bg) = highlight_bg {
                 preview_line_with_block_bg(&wrapped_line, preview_width, bg)
             } else {
                 wrapped_line
             };
-            visual_lines.push(if Some(raw_idx) == active_match_raw_line {
-                preview_line_with_overlay_style(&line, preview_width, active_match_style)
-            } else {
-                line
-            });
+            visual_lines.push(line);
         }
     }
     visual_lines
@@ -5902,13 +5926,13 @@ impl App {
     }
 
     fn sync_active_preview_match_idx_for_doc(&mut self, doc: &PreviewDoc, preview_width: usize) {
-        if preview_width == 0 || doc.match_lines.is_empty() {
+        if preview_width == 0 || doc.matches.is_empty() {
             self.active_preview_match_idx = None;
             return;
         }
         if let Some(idx) = self
             .active_preview_match_idx
-            .filter(|idx| *idx < doc.match_lines.len())
+            .filter(|idx| *idx < doc.matches.len())
         {
             self.active_preview_match_idx = Some(idx);
             return;
@@ -5919,16 +5943,16 @@ impl App {
             self.preview_scroll,
         );
         let idx = doc
-            .match_lines
+            .matches
             .iter()
-            .position(|&line| line >= current_raw)
-            .unwrap_or(doc.match_lines.len().saturating_sub(1));
+            .position(|preview_match| preview_match.raw_line >= current_raw)
+            .unwrap_or(doc.matches.len().saturating_sub(1));
         self.active_preview_match_idx = Some(idx);
     }
 
-    fn active_preview_match_raw_line(&self, doc: &PreviewDoc) -> Option<usize> {
+    fn active_preview_match(&self, doc: &PreviewDoc) -> Option<PreviewMatch> {
         self.active_preview_match_idx
-            .and_then(|idx| doc.match_lines.get(idx).copied())
+            .and_then(|idx| doc.matches.get(idx).copied())
     }
 
     fn reset_preview_scroll_to_match(&mut self) {
@@ -5970,7 +5994,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -5978,7 +6002,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -5986,7 +6010,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6015,8 +6039,6 @@ impl App {
         line_record_indices.resize(lines.len(), None);
 
         let mut first_match_line = 0;
-        let mut match_lines = Vec::new();
-
         for (pos, &idx) in record_idxs.iter().enumerate() {
             let Some(rec) = self.all.get(idx) else {
                 continue;
@@ -6043,7 +6065,6 @@ impl App {
                 if first_match_line == 0 {
                     first_match_line = turn_line;
                 }
-                match_lines.push(turn_line);
             }
             lines.push(Line::raw(format!(
                 "file: {}:{}",
@@ -6061,7 +6082,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line,
-            match_lines,
+            matches: Vec::new(),
             line_record_indices,
         }
     }
@@ -6071,7 +6092,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6079,7 +6100,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6087,7 +6108,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6162,7 +6183,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line: 0,
-            match_lines: Vec::new(),
+            matches: Vec::new(),
             line_record_indices,
         }
     }
@@ -6187,7 +6208,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6195,7 +6216,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6205,7 +6226,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("(no match)")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6253,8 +6274,8 @@ impl App {
         ];
         let mut line_record_indices = vec![None; lines.len()];
 
-        let first_match_line = lines.len();
-        let mut match_lines = Vec::new();
+        let mut first_match_line = lines.len();
+        let mut matches = Vec::new();
         let mut shown_matches = 0usize;
         let mut lines_used = lines.len();
         let mut line_limited = false;
@@ -6305,8 +6326,17 @@ impl App {
                     section_record_indices
                         .extend(std::iter::repeat_n(Some(rec_idx), rendered_lines.len()));
                     section.extend(rendered_lines);
-                    if !search::find_match_ranges(query, raw_line).is_empty() {
-                        match_lines.push(lines_used + raw_line_index);
+                    let raw_line_matches = search::find_term_match_ranges(query, raw_line);
+                    if !raw_line_matches.is_empty() {
+                        let doc_raw_line = lines_used + raw_line_index;
+                        if matches.is_empty() {
+                            first_match_line = doc_raw_line;
+                        }
+                        matches.extend(raw_line_matches.into_iter().map(|range| PreviewMatch {
+                            raw_line: doc_raw_line,
+                            start: range.start,
+                            end: range.end,
+                        }));
                     }
                 }
                 section.push(Line::raw(""));
@@ -6341,7 +6371,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line,
-            match_lines,
+            matches,
             line_record_indices,
         }
     }
@@ -6351,7 +6381,7 @@ impl App {
             return PreviewDoc {
                 lines: vec![Line::raw("events disabled")],
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None],
             };
         };
@@ -6375,7 +6405,7 @@ impl App {
             return PreviewDoc {
                 lines,
                 first_match_line: 0,
-                match_lines: Vec::new(),
+                matches: Vec::new(),
                 line_record_indices: vec![None; line_count],
             };
         }
@@ -6466,24 +6496,30 @@ impl App {
         lines.push(Line::raw(""));
 
         let mut first_match_line = lines.len();
-        let mut match_lines = Vec::new();
+        let mut matches = Vec::new();
+        let mut pushed_events = false;
         for record in buffered_records.iter().rev() {
             let rendered = format_telemetry_event_line(record);
-            if !filter_query.is_empty()
-                && search::find_match_ranges(filter_query, &rendered).is_empty()
-            {
+            let rendered_matches = search::find_term_match_ranges(filter_query, &rendered);
+            if !filter_query.is_empty() && rendered_matches.is_empty() {
                 continue;
             }
-            if match_lines.is_empty() {
+            if !pushed_events {
                 first_match_line = lines.len();
+                pushed_events = true;
             }
-            match_lines.push(lines.len());
+            let raw_line = lines.len();
+            matches.extend(rendered_matches.into_iter().map(|range| PreviewMatch {
+                raw_line,
+                start: range.start,
+                end: range.end,
+            }));
             lines.push(highlighted_line(&rendered, filter_query, Style::default()));
         }
-        if filter_query.is_empty() && match_lines.is_empty() {
+        if filter_query.is_empty() && !pushed_events {
             first_match_line = lines.len();
         }
-        if !filter_query.is_empty() && match_lines.is_empty() {
+        if !filter_query.is_empty() && !pushed_events {
             lines.push(Line::raw("(no matching events)"));
         }
 
@@ -6491,7 +6527,7 @@ impl App {
         PreviewDoc {
             lines,
             first_match_line,
-            match_lines,
+            matches,
             line_record_indices: vec![None; line_count],
         }
     }
@@ -7031,7 +7067,7 @@ impl App {
             return;
         }
         let doc = self.build_preview_doc();
-        if doc.match_lines.is_empty() {
+        if doc.matches.is_empty() {
             return;
         }
 
@@ -7046,7 +7082,7 @@ impl App {
         self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
         let current_idx = self.active_preview_match_idx.unwrap_or(0);
         let target_idx = if dir >= 0 {
-            if current_idx + 1 < doc.match_lines.len() {
+            if current_idx + 1 < doc.matches.len() {
                 current_idx + 1
             } else {
                 0
@@ -7054,9 +7090,9 @@ impl App {
         } else {
             current_idx
                 .checked_sub(1)
-                .unwrap_or(doc.match_lines.len().saturating_sub(1))
+                .unwrap_or(doc.matches.len().saturating_sub(1))
         };
-        let target_raw = doc.match_lines[target_idx];
+        let target_raw = doc.matches[target_idx].raw_line;
         self.active_preview_match_idx = Some(target_idx);
         self.preview_scroll =
             preview_visual_line_offset(&preview_lines, target_raw, preview_width).saturating_sub(2);
@@ -7230,7 +7266,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 telemetry_inner_width,
                 None,
                 None,
-                app.active_preview_match_raw_line(&telemetry_doc),
+                app.active_preview_match(&telemetry_doc),
                 Some(parse_hex_color(EVENTS_PREVIEW_BGCOLOR).unwrap_or(Color::Rgb(32, 32, 32))),
             );
             let telemetry = Paragraph::new(Text::from(telemetry_lines))
@@ -7329,7 +7365,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             telemetry_inner_width,
             None,
             None,
-            app.active_preview_match_raw_line(&telemetry_doc),
+            app.active_preview_match(&telemetry_doc),
             Some(parse_hex_color(EVENTS_PREVIEW_BGCOLOR).unwrap_or(Color::Rgb(32, 32, 32))),
         );
         let telemetry = Paragraph::new(Text::from(telemetry_lines))
@@ -7617,7 +7653,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         preview_inner_width,
         selected_preview_record_idx,
         app.hovered_preview_record_idx,
-        app.active_preview_match_raw_line(&preview_doc),
+        app.active_preview_match(&preview_doc),
         app.preview_bgcolor,
     );
     if app.log_group_enabled(LogGroup::Perf) {
@@ -9029,7 +9065,7 @@ mod tests {
 
         app.update_results();
         let doc = app.build_preview_doc();
-        assert_eq!(doc.first_match_line, 12);
+        assert_eq!(doc.first_match_line, doc.matches[0].raw_line);
         assert_eq!(app.preview_scroll, 0);
         assert!(app.preview_scroll_reset_pending);
     }
@@ -9567,7 +9603,7 @@ mod tests {
                 Line::raw("turn 3"),
             ],
             first_match_line: 0,
-            match_lines: Vec::new(),
+            matches: Vec::new(),
             line_record_indices: vec![None, Some(1), Some(1), Some(2), Some(2), Some(3)],
         };
 
@@ -9592,7 +9628,7 @@ mod tests {
                 Line::raw("turn 3"),
             ],
             first_match_line: 0,
-            match_lines: Vec::new(),
+            matches: Vec::new(),
             line_record_indices: vec![None, Some(1), Some(1), Some(2), Some(2), Some(3)],
         };
 
@@ -9613,7 +9649,7 @@ mod tests {
                 Line::raw("line 2"),
             ],
             first_match_line: 0,
-            match_lines: Vec::new(),
+            matches: Vec::new(),
             line_record_indices: vec![None, Some(10), Some(10), Some(20), Some(20)],
         };
 
@@ -9790,7 +9826,7 @@ mod tests {
                 Line::raw("turn 2"),
             ],
             first_match_line: 0,
-            match_lines: Vec::new(),
+            matches: Vec::new(),
             line_record_indices: vec![None, Some(7), Some(8)],
         };
 
@@ -11071,18 +11107,36 @@ mod tests {
     }
 
     #[test]
-    fn preview_active_match_highlight_overlays_current_match_line() {
+    fn preview_active_match_highlight_only_updates_the_matching_span() {
         let line = highlighted_line("alpha beta", "beta", Style::default());
-        let lines =
-            with_preview_record_highlights(&[line], &[Some(0)], 20, None, None, Some(0), None);
+        let lines = with_preview_record_highlights(
+            &[line],
+            &[Some(0)],
+            20,
+            None,
+            None,
+            Some(PreviewMatch {
+                raw_line: 0,
+                start: 6,
+                end: 10,
+            }),
+            None,
+        );
         let active_style = preview_active_match_style(None);
+        let alpha_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "alpha ")
+            .expect("expected non-matching span");
+        let beta_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "beta")
+            .expect("expected active matching span");
 
-        assert_eq!(lines[0].spans[0].style.bg, active_style.bg);
-        assert!(!lines[0].spans[0].style.fg.is_some());
-        assert!(!lines[0].spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::UNDERLINED));
+        assert_eq!(alpha_span.style.bg, None);
+        assert_eq!(beta_span.style.bg, active_style.bg);
+        assert_eq!(beta_span.style.fg, query_match_style_for(0).fg);
     }
 
     #[test]
@@ -11217,7 +11271,7 @@ mod tests {
 
         let doc = app.build_preview_doc();
         let initial_scroll =
-            preview_visual_line_offset(&doc.lines, doc.match_lines[0], preview_width)
+            preview_visual_line_offset(&doc.lines, doc.matches[0].raw_line, preview_width)
                 .saturating_sub(2);
         app.preview_scroll = initial_scroll;
         app.preview_scroll_reset_pending = false;
