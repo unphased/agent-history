@@ -8022,62 +8022,61 @@ fn shell_uses_zsh(shell: &str) -> bool {
     Path::new(shell).file_name().and_then(|name| name.to_str()) == Some("zsh")
 }
 
+fn zsh_bootstrap_source_snippet(file_name: &str) -> String {
+    format!(
+        "_agent_history_orig_zdotdir=\"${{AGENT_HISTORY_ORIG_ZDOTDIR:-$HOME}}\"\nif [[ -r \"$_agent_history_orig_zdotdir/{file_name}\" ]]; then\n  source \"$_agent_history_orig_zdotdir/{file_name}\"\nfi\nunset _agent_history_orig_zdotdir\n"
+    )
+}
+
 fn write_agent_history_zsh_bootstrap(dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create zsh bootstrap dir: {}", dir.display()))?;
 
-    fs::write(
-        dir.join(".zshenv"),
-        "if [[ -r \"$HOME/.zshenv\" ]]; then\n  source \"$HOME/.zshenv\"\nfi\n",
-    )
-    .with_context(|| format!("failed to write {}", dir.join(".zshenv").display()))?;
+    fs::write(dir.join(".zshenv"), zsh_bootstrap_source_snippet(".zshenv"))
+        .with_context(|| format!("failed to write {}", dir.join(".zshenv").display()))?;
     fs::write(
         dir.join(".zprofile"),
-        "if [[ -r \"$HOME/.zprofile\" ]]; then\n  source \"$HOME/.zprofile\"\nfi\n",
+        zsh_bootstrap_source_snippet(".zprofile"),
     )
     .with_context(|| format!("failed to write {}", dir.join(".zprofile").display()))?;
-    fs::write(
-        dir.join(".zlogin"),
-        "if [[ -r \"$HOME/.zlogin\" ]]; then\n  source \"$HOME/.zlogin\"\nfi\n",
-    )
-    .with_context(|| format!("failed to write {}", dir.join(".zlogin").display()))?;
+    fs::write(dir.join(".zlogin"), zsh_bootstrap_source_snippet(".zlogin"))
+        .with_context(|| format!("failed to write {}", dir.join(".zlogin").display()))?;
 
-    let zshrc = r#"if [[ -r "$HOME/.zshrc" ]]; then
-  source "$HOME/.zshrc"
-fi
-
-if [[ -n "${AGENT_HISTORY_RETURN_HINT_TEXT:-}" ]]; then
+    let zshrc = format!(
+        r#"{}if [[ -n "${{AGENT_HISTORY_RETURN_HINT_TEXT:-}}" ]]; then
   autoload -Uz add-zsh-hook 2>/dev/null || true
-  _agent_history_prompt_precmd() {
+  _agent_history_prompt_precmd() {{
     emulate -L zsh
-    local hint="${AGENT_HISTORY_RETURN_HINT_TEXT:-}"
+    local hint="${{AGENT_HISTORY_RETURN_HINT_TEXT:-}}"
     [[ -n "$hint" ]] || return 0
-    case "${PROMPT:-}" in
+    case "${{PROMPT:-}}" in
       *"$hint"*) ;;
-      *) PROMPT="${PROMPT:-}${hint} " ;;
+      *) PROMPT="${{PROMPT:-}}${{hint}} " ;;
     esac
-    case "${PS1:-}" in
+    case "${{PS1:-}}" in
       *"$hint"*) ;;
-      *) PS1="${PS1:-}${hint} " ;;
+      *) PS1="${{PS1:-}}${{hint}} " ;;
     esac
-  }
+  }}
   add-zsh-hook precmd _agent_history_prompt_precmd 2>/dev/null || true
 fi
 
-if [[ -n "${AGENT_HISTORY_PREFILL_ONCE:-}" ]]; then
+if [[ -n "${{AGENT_HISTORY_PREFILL_ONCE:-}}" ]]; then
   autoload -Uz add-zle-hook-widget 2>/dev/null || true
-  _agent_history_prefill_line() {
+  _agent_history_prefill_line() {{
     emulate -L zsh
-    if [[ -n "${AGENT_HISTORY_PREFILL_ONCE:-}" ]]; then
-      BUFFER="${AGENT_HISTORY_PREFILL_ONCE}"
-      CURSOR=${#BUFFER}
+    if [[ -n "${{AGENT_HISTORY_PREFILL_ONCE:-}}" ]]; then
+      BUFFER="${{AGENT_HISTORY_PREFILL_ONCE}}"
+      CURSOR=${{#BUFFER}}
       unset AGENT_HISTORY_PREFILL_ONCE
     fi
     add-zle-hook-widget -d line-init _agent_history_prefill_line 2>/dev/null || true
-  }
+  }}
   add-zle-hook-widget line-init _agent_history_prefill_line 2>/dev/null || true
 fi
-"#;
+"#,
+        zsh_bootstrap_source_snippet(".zshrc")
+    );
 
     fs::write(dir.join(".zshrc"), zshrc)
         .with_context(|| format!("failed to write {}", dir.join(".zshrc").display()))?;
@@ -8108,6 +8107,9 @@ fn configured_resume_command_for_shell(
     let zdotdir_cleanup = if shell_uses_zsh(shell) {
         let dir = std::env::temp_dir().join(format!("agent-history-zsh-boot-{}", unix_now_nanos()));
         write_agent_history_zsh_bootstrap(&dir)?;
+        if let Some(orig_zdotdir) = env::var("ZDOTDIR").ok().filter(|s| !s.trim().is_empty()) {
+            cmd.env("AGENT_HISTORY_ORIG_ZDOTDIR", orig_zdotdir);
+        }
         cmd.env("ZDOTDIR", &dir);
         Some(dir)
     } else {
@@ -8800,11 +8802,22 @@ mod tests {
         assert!(bootstrap.join(".zprofile").is_file());
         assert!(bootstrap.join(".zshrc").is_file());
         assert!(bootstrap.join(".zlogin").is_file());
+        let zshenv = fs::read_to_string(bootstrap.join(".zshenv")).unwrap();
+        assert!(zshenv.contains("AGENT_HISTORY_ORIG_ZDOTDIR"));
         let zshrc = fs::read_to_string(bootstrap.join(".zshrc")).unwrap();
+        assert!(zshrc.contains("AGENT_HISTORY_ORIG_ZDOTDIR"));
         assert!(zshrc.contains("AGENT_HISTORY_RETURN_HINT_TEXT"));
         assert!(zshrc.contains("AGENT_HISTORY_PREFILL_ONCE"));
         assert!(zshrc.contains("add-zle-hook-widget line-init _agent_history_prefill_line"));
         fs::remove_dir_all(bootstrap).unwrap();
+    }
+
+    #[test]
+    fn zsh_bootstrap_source_snippet_prefers_original_zdotdir_with_home_fallback() {
+        let snippet = zsh_bootstrap_source_snippet(".zshrc");
+
+        assert!(snippet.contains("${AGENT_HISTORY_ORIG_ZDOTDIR:-$HOME}"));
+        assert!(snippet.contains("source \"$_agent_history_orig_zdotdir/.zshrc\""));
     }
 
     #[test]
