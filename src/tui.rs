@@ -3661,11 +3661,13 @@ fn handle_key(
         }
         KeyCode::Up if matches!(app.input_mode, InputMode::PreviewNav) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.scroll_preview_lines(-1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_lines(-1, preview_width, preview_height);
         }
         KeyCode::Down if matches!(app.input_mode, InputMode::PreviewNav) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.scroll_preview_lines(1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_lines(1, preview_width, preview_height);
         }
         KeyCode::PageUp if matches!(app.input_mode, InputMode::PreviewNav) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
@@ -3679,11 +3681,13 @@ fn handle_key(
         }
         KeyCode::Up if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.scroll_preview_lines(-1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_lines(-1, preview_width, preview_height);
         }
         KeyCode::Down if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
-            app.scroll_preview_lines(1, preview_width);
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.scroll_preview_lines(1, preview_width, preview_height);
         }
         KeyCode::PageUp if matches!(app.input_mode, InputMode::GitGraph | InputMode::GitCommit) => {
             let preview_width = current_preview_inner_width(terminal, app)?;
@@ -4366,11 +4370,13 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 app.scroll_preview_lines(
                     -preview_line_step,
                     preview_hit_area.width.saturating_sub(2) as usize,
+                    preview_hit_area.height.saturating_sub(2) as usize,
                 );
             } else if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(
                     -preview_line_step,
                     preview_hit_area.width.saturating_sub(2) as usize,
+                    preview_hit_area.height.saturating_sub(2) as usize,
                 );
             } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(-results_line_step);
@@ -4408,11 +4414,13 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                 app.scroll_preview_lines(
                     preview_line_step,
                     preview_hit_area.width.saturating_sub(2) as usize,
+                    preview_hit_area.height.saturating_sub(2) as usize,
                 );
             } else if point_in_rect(mouse.column, mouse.row, preview_hit_area) {
                 app.scroll_preview_lines(
                     preview_line_step,
                     preview_hit_area.width.saturating_sub(2) as usize,
+                    preview_hit_area.height.saturating_sub(2) as usize,
                 );
             } else if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, results_area) {
                 app.move_selection(results_line_step);
@@ -4721,6 +4729,33 @@ impl App {
             preview_height,
             record_idx,
         );
+    }
+
+    fn reveal_preview_record_at_start(
+        &mut self,
+        preview_lines: &[Line<'_>],
+        line_record_indices: &[Option<usize>],
+        preview_width: usize,
+        record_idx: usize,
+    ) {
+        if preview_width == 0 {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let Some((section_start, _)) = preview_record_visual_bounds(
+            preview_lines,
+            line_record_indices,
+            preview_width,
+            record_idx,
+        ) else {
+            self.preview_scroll_reset_pending = false;
+            return;
+        };
+        self.selected_preview_record_idx = Some(record_idx);
+        self.preview_scroll = section_start;
+        self.preview_scroll_reset_pending = false;
+        self.remember_selected_session_preview_state(preview_width);
     }
 
     fn restore_selected_session_preview_state(
@@ -6743,7 +6778,7 @@ impl App {
         );
     }
 
-    fn scroll_preview_lines(&mut self, delta: i32, preview_width: usize) {
+    fn scroll_preview_lines(&mut self, delta: i32, preview_width: usize, preview_height: usize) {
         if self.show_telemetry {
             let cur = self.preview_scroll as i32;
             self.preview_scroll = cmp::max(0, cur + delta) as usize;
@@ -6763,22 +6798,48 @@ impl App {
             }
             _ => {}
         }
+        if preview_width == 0 || preview_height == 0 {
+            return;
+        }
+        let doc = if self.showing_session_browser() {
+            self.session_browser_doc()
+        } else {
+            self.build_preview_doc()
+        };
+        let preview_lines = preview_layout_lines(
+            &doc,
+            if self.git_graph_visible {
+                self.selected_preview_record_idx
+            } else {
+                None
+            },
+        );
+        let total_lines = preview_visual_line_count(&preview_lines, preview_width);
+        let max_scroll = total_lines.saturating_sub(preview_height);
+        if delta < 0 && self.preview_scroll == 0 {
+            self.jump_preview_record_with_strategy(-1, preview_width, preview_height, true);
+            return;
+        }
+        if delta > 0 && self.preview_scroll >= max_scroll {
+            self.jump_preview_record_with_strategy(1, preview_width, preview_height, true);
+            return;
+        }
         if self.showing_session_browser() {
             let cur = self.preview_scroll as i32;
-            self.preview_scroll = cmp::max(0, cur + delta) as usize;
+            self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
             self.sync_selected_preview_record_from_scroll(preview_width);
             self.preview_scroll_reset_pending = false;
             return;
         }
         let cur = self.preview_scroll as i32;
-        self.preview_scroll = cmp::max(0, cur + delta) as usize;
+        self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
         self.sync_selected_preview_record_from_scroll(preview_width);
         self.preview_scroll_reset_pending = false;
     }
 
     fn scroll_preview_page(&mut self, dir: i32, page_height: usize, preview_width: usize) {
         let delta = cmp::max(1, page_height as i32 - 1) * dir;
-        self.scroll_preview_lines(delta, preview_width);
+        self.scroll_preview_lines(delta, preview_width, page_height);
     }
 
     fn scroll_normal_pane_to_start(&mut self, preview_width: usize) {
@@ -6858,6 +6919,19 @@ impl App {
             return;
         }
 
+        self.jump_preview_record_with_strategy(dir, preview_width, preview_height, false);
+    }
+
+    fn jump_preview_record_with_strategy(
+        &mut self,
+        dir: i32,
+        preview_width: usize,
+        preview_height: usize,
+        align_to_start: bool,
+    ) {
+        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
+            return;
+        }
         let doc = if self.showing_session_browser() {
             self.session_browser_doc()
         } else {
@@ -6907,13 +6981,22 @@ impl App {
                 None
             },
         );
-        self.reveal_preview_record(
-            &preview_lines,
-            &target_doc.line_record_indices,
-            preview_width,
-            preview_height,
-            target_record_idx,
-        );
+        if align_to_start {
+            self.reveal_preview_record_at_start(
+                &preview_lines,
+                &target_doc.line_record_indices,
+                preview_width,
+                target_record_idx,
+            );
+        } else {
+            self.reveal_preview_record(
+                &preview_lines,
+                &target_doc.line_record_indices,
+                preview_width,
+                preview_height,
+                target_record_idx,
+            );
+        }
     }
 
     fn jump_preview_match(&mut self, dir: i32, preview_width: usize) {
@@ -9796,8 +9879,94 @@ mod tests {
         let mut app = ready_app_with_indexed_data(all);
         app.preview_scroll = 1;
 
-        app.scroll_preview_lines(-10, 80);
+        app.scroll_preview_lines(-10, 80, 10);
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn preview_scroll_wraps_up_from_top_to_last_turn() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let preview_width = 80;
+        let preview_height = 6;
+
+        app.preview_scroll = 0;
+        app.scroll_preview_lines(-1, preview_width, preview_height);
+
+        assert_eq!(app.selected_preview_record_idx, Some(2));
+        assert!(app.preview_scroll > 0);
+    }
+
+    #[test]
+    fn preview_scroll_wraps_down_from_bottom_to_first_turn() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let preview_width = 80;
+        let preview_height = 6;
+        app.selected_preview_record_idx = Some(2);
+        let doc = app.session_browser_doc();
+        let preview_lines = preview_layout_lines(&doc, None);
+        let max_scroll =
+            preview_visual_line_count(&preview_lines, preview_width).saturating_sub(preview_height);
+        let (first_start, _) = preview_record_visual_bounds(
+            &preview_lines,
+            &doc.line_record_indices,
+            preview_width,
+            0,
+        )
+        .expect("expected first turn bounds");
+
+        app.preview_scroll = max_scroll;
+        app.scroll_preview_lines(1, preview_width, preview_height);
+
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(app.preview_scroll, first_start);
     }
 
     #[test]
@@ -9828,7 +9997,7 @@ mod tests {
         );
 
         assert_eq!(app.session_browser_active_pane, SessionBrowserPane::Start);
-        assert_eq!(app.preview_scroll, 3);
+        assert_eq!(app.preview_scroll, 0);
         assert_eq!(app.selected, 0);
     }
 
