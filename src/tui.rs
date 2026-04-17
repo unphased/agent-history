@@ -112,10 +112,73 @@ struct SessionHit {
     hit_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SessionPreviewState {
-    record_idx: usize,
-    turn_scroll_offset: usize,
+    focused_record_idx: Option<usize>,
+    pin: PersistedPin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ViewportPin {
+    Top,
+    Bottom,
+    Focused {
+        turn_idx: usize,
+        line_offset: usize,
+        anchor_frac: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PersistedPin {
+    Top,
+    Bottom,
+    Focused {
+        anchor_record_idx: usize,
+        line_offset: usize,
+        anchor_frac: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnScope {
+    Session { session_idx: usize },
+    Chrono,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTurn {
+    body_lines: Vec<Line<'static>>,
+    body_height: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TurnCache {
+    entries: HashMap<(usize, bool), CachedTurn>,
+    cached_width: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct ViewportResult {
+    lines: Vec<Line<'static>>,
+    line_turn_map: Vec<Option<(usize, usize)>>,
+    focused_turn_scope_idx: usize,
+    total_turns: usize,
+    pinned_top: bool,
+    pinned_bottom: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserMode {
+    Session,
+    Chrono,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ChronoViewportState {
+    focused_record_idx: Option<usize>,
+    pin: PersistedPin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +405,22 @@ impl LayoutPreset {
             Self::Balanced => "balanced",
             Self::TurnsWide => "turns-wide",
             Self::GitWide => "git-wide",
+        }
+    }
+}
+
+impl BrowserMode {
+    fn from_ui_state(mode: config::BrowserModeState) -> Self {
+        match mode {
+            config::BrowserModeState::Session => Self::Session,
+            config::BrowserModeState::Chrono => Self::Chrono,
+        }
+    }
+
+    fn to_ui_state(self) -> config::BrowserModeState {
+        match self {
+            Self::Session => config::BrowserModeState::Session,
+            Self::Chrono => config::BrowserModeState::Chrono,
         }
     }
 }
@@ -2951,10 +3030,17 @@ struct App {
     selected: usize,
     offset: usize,
     session_preview_states: HashMap<usize, SessionPreviewState>,
+    chrono_viewport_state: Option<ChronoViewportState>,
     active_preview_match_idx: Option<usize>,
     selected_preview_record_idx: Option<usize>,
-    hovered_preview_record_idx: Option<usize>,
+    focused_record_idx: Option<usize>,
+    hovered_record_idx: Option<usize>,
     hovered_query_tag_filter: Option<TagFilter>,
+    viewport_pin: ViewportPin,
+    last_viewport_result: Option<ViewportResult>,
+    turn_cache: TurnCache,
+    chrono_turns: Vec<usize>,
+    browser_mode: BrowserMode,
     preview_scroll: usize,
     preview_scroll_reset_pending: bool,
     session_browser_start_scroll: usize,
@@ -2993,7 +3079,7 @@ struct App {
     remote_sync_states: HashMap<String, cache::RemoteSyncStatus>,
     ui_tags: config::UiTagConfig,
     ui_state_path: PathBuf,
-    layout_state_dirty: bool,
+    ui_state_dirty: bool,
     remotes: HashMap<String, config::RemoteConfig>,
     git_repo_cache: HashMap<PathBuf, GitRepoContext>,
     git_commit_preview_cache: HashMap<(PathBuf, String), Vec<String>>,
@@ -3070,10 +3156,17 @@ fn run_app(
         selected: 0,
         offset: 0,
         session_preview_states: HashMap::new(),
+        chrono_viewport_state: None,
         active_preview_match_idx: None,
         selected_preview_record_idx: None,
-        hovered_preview_record_idx: None,
+        focused_record_idx: None,
+        hovered_record_idx: None,
         hovered_query_tag_filter: None,
+        viewport_pin: ViewportPin::Top,
+        last_viewport_result: None,
+        turn_cache: TurnCache::default(),
+        chrono_turns: Vec::new(),
+        browser_mode: BrowserMode::from_ui_state(ui_state.browser_mode),
         preview_scroll: 0,
         preview_scroll_reset_pending: false,
         session_browser_start_scroll: 0,
@@ -3110,7 +3203,7 @@ fn run_app(
         remote_sync_states: HashMap::new(),
         ui_tags: app_config.ui.tags,
         ui_state_path,
-        layout_state_dirty: false,
+        ui_state_dirty: false,
         remotes,
         git_repo_cache: HashMap::new(),
         git_commit_preview_cache: HashMap::new(),
@@ -3424,6 +3517,10 @@ fn handle_key(
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cycle_layout_preset();
+            return Ok(false);
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_browser_mode();
             return Ok(false);
         }
         KeyCode::Char('r')
@@ -4364,7 +4461,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
         MouseEventKind::Down(_) => {
             app.dragged_split = None;
             if !point_in_rect(mouse.column, mouse.row, preview_area) {
-                app.hovered_preview_record_idx = None;
+                app.hovered_record_idx = None;
             }
             if !app.show_telemetry {
                 if point_near_vertical_split(mouse.column, geometry.turn_preview) {
@@ -4407,11 +4504,6 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     if has_bar && mouse.row == search_bar_row {
                         app.input_mode = InputMode::PreviewSearch;
                     } else {
-                        let preview_doc = if app.showing_session_browser() {
-                            app.session_browser_doc()
-                        } else {
-                            app.build_preview_doc()
-                        };
                         let adjusted_mouse = if has_bar {
                             MouseEvent {
                                 row: mouse.row.saturating_sub(1),
@@ -4423,35 +4515,47 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                         let preview_width = preview_area.width.saturating_sub(2) as usize;
                         let content = preview_content_rect(preview_area, has_bar);
                         let preview_height = content.height as usize;
-                        let anchor_record_idx = if app.git_graph_visible {
-                            app.selected_anchor_record_idx(preview_width, preview_height)
+                        if app.showing_session_browser() {
+                            app.ensure_last_viewport_result(preview_height, preview_width);
+                            app.hovered_record_idx = app
+                                .viewport_hit_at_mouse(content, adjusted_mouse)
+                                .map(|(_, record_idx)| record_idx);
+                            if let Some((_, record_idx)) =
+                                app.viewport_hit_at_mouse(content, adjusted_mouse)
+                            {
+                                let anchor_frac = if preview_height == 0 {
+                                    0.3
+                                } else {
+                                    (adjusted_mouse.row.saturating_sub(content.y) as f32
+                                        / preview_height as f32)
+                                        .clamp(0.0, 1.0)
+                                };
+                                app.reveal_turn_with_anchor(record_idx, anchor_frac);
+                            }
                         } else {
-                            None
-                        };
-                        let preview_lines = preview_layout_lines(&preview_doc, anchor_record_idx);
-                        app.hovered_preview_record_idx = app.preview_record_idx_at_mouse(
-                            &preview_lines,
-                            &preview_doc.line_record_indices,
-                            preview_area,
-                            adjusted_mouse,
-                        );
-                        if let Some(record_idx) = app.hovered_preview_record_idx {
-                            let reveal_doc = if app.showing_session_browser() {
-                                app.session_browser_doc_for(Some(record_idx))
+                            let preview_doc = app.build_preview_doc();
+                            let anchor_record_idx = if app.git_graph_visible {
+                                app.selected_anchor_record_idx(preview_width, preview_height)
                             } else {
-                                preview_doc
+                                None
                             };
-                            let preview_lines = preview_layout_lines(
-                                &reveal_doc,
-                                app.git_graph_visible.then_some(record_idx),
-                            );
-                            app.reveal_preview_record_from_click(
+                            let preview_lines =
+                                preview_layout_lines(&preview_doc, anchor_record_idx);
+                            app.hovered_record_idx = app.preview_record_idx_at_mouse(
                                 &preview_lines,
-                                &reveal_doc.line_record_indices,
-                                preview_width,
-                                preview_height,
-                                record_idx,
+                                &preview_doc.line_record_indices,
+                                preview_area,
+                                adjusted_mouse,
                             );
+                            if let Some(record_idx) = app.hovered_record_idx {
+                                app.reveal_preview_record_from_click(
+                                    &preview_lines,
+                                    &preview_doc.line_record_indices,
+                                    preview_width,
+                                    preview_height,
+                                    record_idx,
+                                );
+                            }
                         }
                         app.input_mode = InputMode::PreviewNav;
                     }
@@ -4469,11 +4573,6 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     None
                 };
             if !app.show_telemetry && point_in_rect(mouse.column, mouse.row, preview_area) {
-                let preview_doc = if app.showing_session_browser() {
-                    app.session_browser_doc()
-                } else {
-                    app.build_preview_doc()
-                };
                 let has_bar = preview_has_search_bar(app);
                 let adjusted_mouse = if has_bar {
                     MouseEvent {
@@ -4484,20 +4583,30 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     mouse
                 };
                 let preview_width = preview_area.width.saturating_sub(2) as usize;
-                let preview_height = preview_content_rect(preview_area, has_bar).height as usize;
-                let anchor_record_idx = if app.git_graph_visible {
-                    app.selected_anchor_record_idx(preview_width, preview_height)
+                let preview_height = preview_content_rect(preview_area, has_bar);
+                app.hovered_record_idx = if app.showing_session_browser() {
+                    app.ensure_last_viewport_result(preview_height.height as usize, preview_width);
+                    app.viewport_hit_at_mouse(preview_height, adjusted_mouse)
+                        .map(|(_, record_idx)| record_idx)
                 } else {
-                    None
+                    let preview_doc = app.build_preview_doc();
+                    let anchor_record_idx = if app.git_graph_visible {
+                        app.selected_anchor_record_idx(
+                            preview_width,
+                            preview_height.height as usize,
+                        )
+                    } else {
+                        None
+                    };
+                    let preview_lines = preview_layout_lines(&preview_doc, anchor_record_idx);
+                    app.preview_record_idx_at_mouse(
+                        &preview_lines,
+                        &preview_doc.line_record_indices,
+                        preview_area,
+                        adjusted_mouse,
+                    )
                 };
-                let preview_lines = preview_layout_lines(&preview_doc, anchor_record_idx);
-                app.hovered_preview_record_idx = app.preview_record_idx_at_mouse(
-                    &preview_lines,
-                    &preview_doc.line_record_indices,
-                    preview_area,
-                    adjusted_mouse,
-                );
-                if app.hovered_preview_record_idx.is_some() {
+                if app.hovered_record_idx.is_some() {
                     if preview_width > 0 {
                         app.preview_scroll_reset_pending = false;
                     }
@@ -4506,7 +4615,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                     }
                 }
             } else if !app.show_telemetry {
-                app.hovered_preview_record_idx = None;
+                app.hovered_record_idx = None;
             }
         }
         MouseEventKind::ScrollUp => {
@@ -4611,7 +4720,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                         };
                         app.layout_state.results_pct =
                             pct.clamp(MIN_RESULTS_PCT as i16, max_results as i16) as u16;
-                        app.layout_state_dirty = true;
+                        app.ui_state_dirty = true;
                     }
                     ActiveSplit::GitTurns => {
                         let git_split_rect = geometry.git_graph.or(geometry.git_commit);
@@ -4627,7 +4736,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             let max_git = 100 - MIN_TURNS_PCT;
                             app.layout_state.git_pct =
                                 git_pct.clamp(MIN_GIT_PCT as i16, max_git as i16) as u16;
-                            app.layout_state_dirty = true;
+                            app.ui_state_dirty = true;
                         }
                     }
                     ActiveSplit::GitColumnVertical => {
@@ -4638,7 +4747,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             let pct = ((rel * 100) / total.max(1) as u32) as i16;
                             app.layout_state.graph_pct =
                                 pct.clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16) as u16;
-                            app.layout_state_dirty = true;
+                            app.ui_state_dirty = true;
                         }
                     }
                 }
@@ -4902,95 +5011,11 @@ impl App {
         );
     }
 
-    fn restore_selected_session_preview_state(
-        &mut self,
-        preview_lines: &[Line<'_>],
-        line_record_indices: &[Option<usize>],
-        preview_width: usize,
-        preview_height: usize,
-    ) -> bool {
-        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
-            return false;
+    fn remember_selected_session_preview_state(&mut self, _preview_width: usize) {
+        if self.showing_session_browser() && self.focused_record_idx.is_none() {
+            self.focused_record_idx = self.selected_preview_record_idx;
         }
-        let Some(hit) = self.selected_hit() else {
-            return false;
-        };
-        let Some(state) = self.session_preview_states.get(&hit.session_idx).copied() else {
-            return false;
-        };
-        let Some((section_start, section_end)) = preview_record_visual_bounds(
-            preview_lines,
-            line_record_indices,
-            preview_width,
-            state.record_idx,
-        ) else {
-            return false;
-        };
-        let total_lines = preview_visual_line_count(preview_lines, preview_width);
-        let max_scroll = total_lines.saturating_sub(preview_height);
-        let turn_height = section_end.saturating_sub(section_start);
-        let turn_scroll_offset = state.turn_scroll_offset.min(turn_height.saturating_sub(1));
-        self.selected_preview_record_idx = Some(state.record_idx);
-        self.preview_scroll = section_start
-            .saturating_add(turn_scroll_offset)
-            .min(max_scroll);
-        self.preview_scroll_reset_pending = false;
-        true
-    }
-
-    fn remember_selected_session_preview_state(&mut self, preview_width: usize) {
-        if self.show_telemetry || preview_width == 0 {
-            return;
-        }
-        let Some(hit) = self.selected_hit() else {
-            return;
-        };
-        let doc = if self.showing_session_browser() {
-            self.session_browser_doc()
-        } else {
-            self.build_preview_doc()
-        };
-        let preview_lines = preview_layout_lines(
-            &doc,
-            if self.git_graph_visible {
-                self.selected_preview_record_idx
-            } else {
-                None
-            },
-        );
-        let Some(record_idx) = self
-            .selected_preview_record_idx
-            .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
-            .or_else(|| {
-                preview_selected_record_idx(
-                    &preview_lines,
-                    &doc.line_record_indices,
-                    preview_width,
-                    self.preview_scroll,
-                )
-            })
-        else {
-            return;
-        };
-        let Some((section_start, section_end)) = preview_record_visual_bounds(
-            &preview_lines,
-            &doc.line_record_indices,
-            preview_width,
-            record_idx,
-        ) else {
-            return;
-        };
-        let turn_scroll_offset = self
-            .preview_scroll
-            .saturating_sub(section_start)
-            .min(section_end.saturating_sub(section_start).saturating_sub(1));
-        self.session_preview_states.insert(
-            hit.session_idx,
-            SessionPreviewState {
-                record_idx,
-                turn_scroll_offset,
-            },
-        );
+        self.remember_current_viewport_state();
     }
 
     fn preview_record_idx_at_mouse(
@@ -5067,7 +5092,7 @@ impl App {
     fn cycle_layout_preset(&mut self) {
         self.layout_state.preset = self.layout_state.preset.next();
         self.layout_state.reset_to_preset();
-        self.layout_state_dirty = true;
+        self.ui_state_dirty = true;
         self.set_ui_status(format!(
             "layout preset {}",
             self.layout_state.preset.label()
@@ -5085,33 +5110,34 @@ impl App {
                 let next = (self.layout_state.results_pct as i16 + delta)
                     .clamp(MIN_RESULTS_PCT as i16, max_results as i16);
                 self.layout_state.results_pct = next as u16;
-                self.layout_state_dirty = true;
+                self.ui_state_dirty = true;
             }
             ActiveSplit::GitTurns => {
                 let max_git = 100 - self.layout_state.results_pct - MIN_TURNS_PCT;
                 let next = (self.layout_state.git_pct as i16 + delta)
                     .clamp(MIN_GIT_PCT as i16, max_git as i16);
                 self.layout_state.git_pct = next as u16;
-                self.layout_state_dirty = true;
+                self.ui_state_dirty = true;
             }
             ActiveSplit::GitColumnVertical => {
                 let next = (self.layout_state.graph_pct as i16 + delta)
                     .clamp(MIN_GRAPH_PCT as i16, MAX_GRAPH_PCT as i16);
                 self.layout_state.graph_pct = next as u16;
-                self.layout_state_dirty = true;
+                self.ui_state_dirty = true;
             }
         }
     }
 
     fn persist_ui_state_if_dirty(&mut self) -> anyhow::Result<()> {
-        if !self.layout_state_dirty {
+        if !self.ui_state_dirty {
             return Ok(());
         }
         let state = config::UiState {
             layout: self.layout_state.to_ui_state(),
+            browser_mode: self.browser_mode.to_ui_state(),
         };
         config::save_ui_state(&self.ui_state_path, &state)?;
-        self.layout_state_dirty = false;
+        self.ui_state_dirty = false;
         Ok(())
     }
 
@@ -5166,14 +5192,7 @@ impl App {
             return None;
         }
         if self.showing_session_browser() {
-            let doc = self.session_browser_doc();
-            if let Some(record_idx) = self
-                .hovered_preview_record_idx
-                .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
-            {
-                return Some(record_idx);
-            }
-            return self.current_preview_selection(&doc, &doc.lines, preview_width, preview_height);
+            return self.hovered_record_idx.or(self.focused_record_idx);
         }
 
         let doc = self.build_preview_doc();
@@ -5567,6 +5586,12 @@ impl App {
         Some((turn_idx + 1, record_idxs.len()))
     }
 
+    fn turn_position_in_current_scope(&self, record_idx: usize) -> Option<(usize, usize)> {
+        let scope_turns = self.resolve_turn_scope_indices();
+        let turn_idx = scope_turns.iter().position(|&idx| idx == record_idx)?;
+        Some((turn_idx + 1, scope_turns.len()))
+    }
+
     fn query_preview_title(&self, label: &str, record_idx: Option<usize>) -> String {
         let Some(record_idx) = record_idx else {
             return self.preview_title(label);
@@ -5582,8 +5607,10 @@ impl App {
         let Some(record_idx) = record_idx else {
             return self.preview_title("Turns");
         };
-        let Some((turn_idx, total_turns)) = self.turn_position_in_selected_session(record_idx)
-        else {
+        let Some((turn_idx, total_turns)) = (match self.browser_mode {
+            BrowserMode::Session => self.turn_position_in_selected_session(record_idx),
+            BrowserMode::Chrono => self.turn_position_in_current_scope(record_idx),
+        }) else {
             return self.preview_title("Turns");
         };
         format!("Turns  turn {turn_idx}/{total_turns}")
@@ -5692,7 +5719,7 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Tab/Shift+Tab: focus  Enter: resume  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
@@ -5702,7 +5729,7 @@ impl App {
                     "clear+search"
                 };
                 format!(
-                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+t: events"
+                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events"
                 )
             }
             InputMode::PreviewSearch => format!(
@@ -6070,6 +6097,597 @@ impl App {
         self.all.get(session.first_user_idx)
     }
 
+    fn current_turn_scope(&self) -> Option<TurnScope> {
+        let hit = self.selected_hit()?;
+        Some(match self.browser_mode {
+            BrowserMode::Session => TurnScope::Session {
+                session_idx: hit.session_idx,
+            },
+            BrowserMode::Chrono => TurnScope::Chrono,
+        })
+    }
+
+    fn resolve_turn_scope_indices(&self) -> &[usize] {
+        match self.current_turn_scope() {
+            Some(TurnScope::Session { session_idx }) => self
+                .session_records
+                .get(session_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            Some(TurnScope::Chrono) => &self.chrono_turns,
+            None => &[],
+        }
+    }
+
+    fn record_session_idx(&self, record_idx: usize) -> Option<usize> {
+        self.session_records
+            .iter()
+            .position(|record_indices| record_indices.contains(&record_idx))
+    }
+
+    fn scope_position_for_record(&self, scope_turns: &[usize], record_idx: usize) -> Option<usize> {
+        scope_turns.iter().position(|&idx| idx == record_idx)
+    }
+
+    fn default_focus_record_idx(&self, scope: TurnScope, preview_synced: bool) -> Option<usize> {
+        match scope {
+            TurnScope::Session { session_idx } => {
+                let hit = self.selected_hit().filter(|hit| hit.session_idx == session_idx)?;
+                if preview_synced {
+                    hit.matched_record_idx.or_else(|| {
+                        self.sessions
+                            .get(session_idx)
+                            .map(|session| session.first_user_idx)
+                    })
+                } else {
+                    self.sessions
+                        .get(session_idx)
+                        .map(|session| session.first_user_idx)
+                }
+            }
+            TurnScope::Chrono => {
+                let hit = self.selected_hit()?;
+                self.session_records
+                    .get(hit.session_idx)
+                    .and_then(|record_indices| record_indices.first().copied())
+                    .or_else(|| self.chrono_turns.first().copied())
+            }
+        }
+    }
+
+    fn restore_viewport_pin(
+        &self,
+        scope_turns: &[usize],
+        pin: PersistedPin,
+    ) -> Option<ViewportPin> {
+        match pin {
+            PersistedPin::Top => Some(ViewportPin::Top),
+            PersistedPin::Bottom => Some(ViewportPin::Bottom),
+            PersistedPin::Focused {
+                anchor_record_idx,
+                line_offset,
+                anchor_frac,
+            } => self
+                .scope_position_for_record(scope_turns, anchor_record_idx)
+                .map(|turn_idx| ViewportPin::Focused {
+                    turn_idx,
+                    line_offset,
+                    anchor_frac,
+                }),
+        }
+    }
+
+    fn persist_viewport_pin(&self, scope_turns: &[usize], pin: ViewportPin) -> PersistedPin {
+        match pin {
+            ViewportPin::Top => PersistedPin::Top,
+            ViewportPin::Bottom => PersistedPin::Bottom,
+            ViewportPin::Focused {
+                turn_idx,
+                line_offset,
+                anchor_frac,
+            } => PersistedPin::Focused {
+                anchor_record_idx: scope_turns
+                    .get(turn_idx)
+                    .copied()
+                    .unwrap_or_else(|| scope_turns.first().copied().unwrap_or_default()),
+                line_offset,
+                anchor_frac,
+            },
+        }
+    }
+
+    fn rebuild_chrono_turns(&mut self) {
+        let mut chrono_turns = Vec::new();
+        let mut missing_timestamps = 0usize;
+        for hit in &self.filtered {
+            let Some(record_indices) = self.session_records.get(hit.session_idx) else {
+                continue;
+            };
+            for &record_idx in record_indices {
+                if self
+                    .all
+                    .get(record_idx)
+                    .and_then(|rec| rec.timestamp.as_deref())
+                    .and_then(parse_timestamp_nanos)
+                    .is_some()
+                {
+                    chrono_turns.push(record_idx);
+                } else {
+                    missing_timestamps += 1;
+                }
+            }
+        }
+        chrono_turns.sort_by(|&a, &b| {
+            parse_timestamp_nanos(
+                self.all
+                    .get(a)
+                    .and_then(|rec| rec.timestamp.as_deref())
+                    .unwrap_or(""),
+            )
+            .cmp(&parse_timestamp_nanos(
+                self.all
+                    .get(b)
+                    .and_then(|rec| rec.timestamp.as_deref())
+                    .unwrap_or(""),
+            ))
+        });
+        self.chrono_turns = chrono_turns;
+        if missing_timestamps > 0 {
+            self.set_ui_status(format!(
+                "chrono skipped {missing_timestamps} turns without timestamps"
+            ));
+        }
+    }
+
+    fn sync_selected_session_from_focus(&mut self) {
+        if !matches!(self.browser_mode, BrowserMode::Chrono) {
+            return;
+        }
+        let Some(record_idx) = self.focused_record_idx else {
+            return;
+        };
+        let Some(session_idx) = self.record_session_idx(record_idx) else {
+            return;
+        };
+        if let Some(selected) = self
+            .filtered
+            .iter()
+            .position(|hit| hit.session_idx == session_idx)
+        {
+            self.selected = selected;
+        }
+    }
+
+    fn apply_browser_selection_reset(&mut self, preview_synced: bool) {
+        if matches!(self.browser_mode, BrowserMode::Chrono) {
+            self.rebuild_chrono_turns();
+        }
+        self.last_viewport_result = None;
+
+        let Some(scope) = self.current_turn_scope() else {
+            self.focused_record_idx = None;
+            self.viewport_pin = ViewportPin::Top;
+            return;
+        };
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        if scope_turns.is_empty() {
+            self.focused_record_idx = None;
+            self.viewport_pin = ViewportPin::Top;
+            return;
+        }
+
+        let (saved_focus, saved_pin) = match scope {
+            TurnScope::Session { session_idx } => self
+                .session_preview_states
+                .get(&session_idx)
+                .map(|state| (state.focused_record_idx, state.pin))
+                .unwrap_or((None, PersistedPin::Top)),
+            TurnScope::Chrono => self
+                .chrono_viewport_state
+                .map(|state| (state.focused_record_idx, state.pin))
+                .unwrap_or((None, PersistedPin::Top)),
+        };
+
+        let focused_record_idx = saved_focus
+            .filter(|record_idx| scope_turns.contains(record_idx))
+            .or_else(|| {
+                self.default_focus_record_idx(scope, preview_synced)
+                    .filter(|record_idx| scope_turns.contains(record_idx))
+            })
+            .or_else(|| scope_turns.first().copied());
+        self.focused_record_idx = focused_record_idx;
+        self.selected_preview_record_idx = focused_record_idx;
+
+        self.viewport_pin = self
+            .restore_viewport_pin(&scope_turns, saved_pin)
+            .unwrap_or_else(|| {
+                let turn_idx = focused_record_idx
+                    .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
+                    .unwrap_or(0);
+                ViewportPin::Focused {
+                    turn_idx,
+                    line_offset: 0,
+                    anchor_frac: 0.3,
+                }
+            });
+
+        if matches!(self.browser_mode, BrowserMode::Chrono) {
+            self.sync_selected_session_from_focus();
+        }
+    }
+
+    fn remember_current_viewport_state(&mut self) {
+        if self.show_telemetry || !self.showing_session_browser() {
+            return;
+        }
+        let Some(scope) = self.current_turn_scope() else {
+            return;
+        };
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        if scope_turns.is_empty() {
+            return;
+        }
+        let pin = self.persist_viewport_pin(&scope_turns, self.viewport_pin);
+        match scope {
+            TurnScope::Session { session_idx } => {
+                self.session_preview_states.insert(
+                    session_idx,
+                    SessionPreviewState {
+                        focused_record_idx: self.focused_record_idx,
+                        pin,
+                    },
+                );
+            }
+            TurnScope::Chrono => {
+                self.chrono_viewport_state = Some(ChronoViewportState {
+                    focused_record_idx: self.focused_record_idx,
+                    pin,
+                });
+            }
+        }
+    }
+
+    fn reveal_turn_with_anchor(&mut self, record_idx: usize, anchor_frac: f32) {
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        let Some(turn_idx) = self.scope_position_for_record(&scope_turns, record_idx) else {
+            return;
+        };
+        self.focused_record_idx = Some(record_idx);
+        self.selected_preview_record_idx = Some(record_idx);
+        self.viewport_pin = ViewportPin::Focused {
+            turn_idx,
+            line_offset: 0,
+            anchor_frac: anchor_frac.clamp(0.0, 1.0),
+        };
+        self.last_viewport_result = None;
+        if matches!(self.browser_mode, BrowserMode::Chrono) {
+            self.sync_selected_session_from_focus();
+        }
+    }
+
+    fn ensure_turn_cached(
+        &mut self,
+        record_idx: usize,
+        is_expanded: bool,
+        width: usize,
+    ) -> Option<&CachedTurn> {
+        if self.turn_cache.cached_width != width {
+            self.turn_cache.entries.clear();
+            self.turn_cache.cached_width = width;
+        }
+        let key = (record_idx, is_expanded);
+        if !self.turn_cache.entries.contains_key(&key) {
+            let rec = self.all.get(record_idx)?;
+            let rendered_body = render_turn_body(rec, is_expanded);
+            let mut body_lines = Vec::new();
+            for line in rendered_body.lines {
+                body_lines.extend(wrap_preview_line(&line, width));
+            }
+            self.turn_cache.entries.insert(
+                key,
+                CachedTurn {
+                    body_height: body_lines.len(),
+                    body_lines,
+                },
+            );
+        }
+        self.turn_cache.entries.get(&key)
+    }
+
+    fn chrono_separator_after(&self, scope_turns: &[usize], scope_idx: usize) -> bool {
+        if !matches!(self.browser_mode, BrowserMode::Chrono) {
+            return false;
+        }
+        let Some(&current) = scope_turns.get(scope_idx) else {
+            return false;
+        };
+        let Some(&next) = scope_turns.get(scope_idx + 1) else {
+            return false;
+        };
+        self.record_session_idx(current) != self.record_session_idx(next)
+    }
+
+    fn chrono_separator_line(&self, scope_turns: &[usize], scope_idx: usize) -> Option<Line<'static>> {
+        let next = scope_turns.get(scope_idx + 1)?;
+        let session_idx = self.record_session_idx(*next)?;
+        let session = self.sessions.get(session_idx)?;
+        Some(Line::styled(
+            format!("-- {} | {} --", session.machine_name, session.dir),
+            Style::default().fg(Color::DarkGray),
+        ))
+    }
+
+    fn render_scope_turn_lines(
+        &mut self,
+        scope_turns: &[usize],
+        scope_idx: usize,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<Option<(usize, usize)>>) {
+        let Some(&record_idx) = scope_turns.get(scope_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(rec) = self.all.get(record_idx).cloned() else {
+            return (Vec::new(), Vec::new());
+        };
+        let header_lines = wrap_preview_line(&render_turn_header(&rec, scope_idx), width);
+        let cached = self
+            .ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
+            .cloned()
+            .unwrap_or(CachedTurn {
+                body_lines: Vec::new(),
+                body_height: 0,
+            });
+        let mut lines = Vec::with_capacity(
+            header_lines.len() + cached.body_height + usize::from(self.chrono_separator_after(scope_turns, scope_idx)),
+        );
+        let mut line_turn_map = Vec::with_capacity(lines.capacity());
+        for line in header_lines {
+            lines.push(line);
+            line_turn_map.push(Some((scope_idx, record_idx)));
+        }
+        for line in cached.body_lines {
+            lines.push(line);
+            line_turn_map.push(Some((scope_idx, record_idx)));
+        }
+        if self.chrono_separator_after(scope_turns, scope_idx)
+            && let Some(separator) = self.chrono_separator_line(scope_turns, scope_idx)
+        {
+            lines.push(separator);
+            line_turn_map.push(None);
+        }
+        (lines, line_turn_map)
+    }
+
+    fn turn_visual_height(&mut self, scope_turns: &[usize], scope_idx: usize, width: usize) -> usize {
+        self.render_scope_turn_lines(scope_turns, scope_idx, width).0.len()
+    }
+
+    fn session_header_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<Option<(usize, usize)>>) {
+        let Some(TurnScope::Session { session_idx }) = self.current_turn_scope() else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(session) = self.sessions.get(session_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut lines = Vec::new();
+        for line in render_session_header(session, self.resolve_turn_scope_indices().len()) {
+            lines.extend(wrap_preview_line(&line, width));
+        }
+        let map = vec![None; lines.len()];
+        (lines, map)
+    }
+
+    fn highlighted_viewport_line(
+        &self,
+        line: &Line<'static>,
+        record_idx: Option<usize>,
+        width: usize,
+    ) -> Line<'static> {
+        let (hover_bg, selected_bg) = preview_record_highlight_colors(self.preview_bgcolor);
+        match record_idx {
+            Some(record_idx) if Some(record_idx) == self.focused_record_idx => {
+                preview_line_with_block_bg(line, width, selected_bg)
+            }
+            Some(record_idx) if Some(record_idx) == self.hovered_record_idx => {
+                preview_line_with_block_bg(line, width, hover_bg)
+            }
+            _ => line.clone(),
+        }
+    }
+
+    fn fill_viewport(&mut self, viewport_h: usize, viewport_w: usize) -> ViewportResult {
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        if viewport_h == 0 || viewport_w == 0 || scope_turns.is_empty() {
+            return ViewportResult {
+                lines: Vec::new(),
+                line_turn_map: Vec::new(),
+                focused_turn_scope_idx: 0,
+                total_turns: scope_turns.len(),
+                pinned_top: true,
+                pinned_bottom: true,
+            };
+        }
+
+        let focused_turn_scope_idx = self
+            .focused_record_idx
+            .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
+            .unwrap_or(0);
+
+        let mut rendered = Vec::new();
+        let mut rendered_map = Vec::new();
+        let mut pinned_top = false;
+        let mut pinned_bottom = false;
+
+        match self.viewport_pin {
+            ViewportPin::Top => {
+                pinned_top = true;
+                let (header_lines, header_map) = self.session_header_lines(viewport_w);
+                rendered.extend(header_lines);
+                rendered_map.extend(header_map);
+                for scope_idx in 0..scope_turns.len() {
+                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, scope_idx, viewport_w);
+                    rendered.extend(lines);
+                    rendered_map.extend(map);
+                    if rendered.len() >= viewport_h {
+                        break;
+                    }
+                }
+                pinned_bottom = rendered.len() <= viewport_h;
+            }
+            ViewportPin::Bottom => {
+                pinned_bottom = true;
+                for scope_idx in (0..scope_turns.len()).rev() {
+                    let (lines, map) =
+                        self.render_scope_turn_lines(&scope_turns, scope_idx, viewport_w);
+                    rendered.splice(0..0, lines);
+                    rendered_map.splice(0..0, map);
+                    if rendered.len() >= viewport_h {
+                        break;
+                    }
+                }
+                if matches!(self.current_turn_scope(), Some(TurnScope::Session { .. })) && rendered.len() < viewport_h {
+                    let (header_lines, header_map) = self.session_header_lines(viewport_w);
+                    rendered.splice(0..0, header_lines);
+                    rendered_map.splice(0..0, header_map);
+                }
+                pinned_top = rendered.len() <= viewport_h;
+            }
+            ViewportPin::Focused {
+                turn_idx,
+                line_offset,
+                anchor_frac,
+            } => {
+                let turn_idx = turn_idx.min(scope_turns.len().saturating_sub(1));
+                let anchor_row = ((viewport_h.saturating_sub(1)) as f32 * anchor_frac.clamp(0.0, 1.0))
+                    .round() as usize;
+                let (anchor_lines, anchor_map) =
+                    self.render_scope_turn_lines(&scope_turns, turn_idx, viewport_w);
+                let line_offset = line_offset.min(anchor_lines.len().saturating_sub(1));
+                let mut upper = anchor_lines[..line_offset].to_vec();
+                let mut upper_map = anchor_map[..line_offset].to_vec();
+                let mut lower = anchor_lines[line_offset..].to_vec();
+                let mut lower_map = anchor_map[line_offset..].to_vec();
+
+                let mut prev_idx = turn_idx;
+                while upper.len() < anchor_row {
+                    if prev_idx == 0 {
+                        if matches!(self.current_turn_scope(), Some(TurnScope::Session { .. })) {
+                            let (header_lines, header_map) = self.session_header_lines(viewport_w);
+                            upper.splice(0..0, header_lines);
+                            upper_map.splice(0..0, header_map);
+                        }
+                        pinned_top = true;
+                        break;
+                    }
+                    prev_idx -= 1;
+                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, prev_idx, viewport_w);
+                    upper.splice(0..0, lines);
+                    upper_map.splice(0..0, map);
+                }
+
+                let mut next_idx = turn_idx + 1;
+                while lower.len() < viewport_h.saturating_sub(anchor_row) {
+                    if next_idx >= scope_turns.len() {
+                        pinned_bottom = true;
+                        break;
+                    }
+                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, next_idx, viewport_w);
+                    lower.extend(lines);
+                    lower_map.extend(map);
+                    next_idx += 1;
+                }
+
+                let needed_upper = anchor_row;
+                let needed_lower = viewport_h.saturating_sub(anchor_row);
+                if upper.len() < needed_upper {
+                    while lower.len() < viewport_h {
+                        if next_idx >= scope_turns.len() {
+                            pinned_bottom = true;
+                            break;
+                        }
+                        let (lines, map) =
+                            self.render_scope_turn_lines(&scope_turns, next_idx, viewport_w);
+                        lower.extend(lines);
+                        lower_map.extend(map);
+                        next_idx += 1;
+                    }
+                }
+                if lower.len() < needed_lower {
+                    while upper.len() + lower.len() < viewport_h {
+                        if prev_idx == 0 {
+                            pinned_top = true;
+                            break;
+                        }
+                        prev_idx -= 1;
+                        let (lines, map) =
+                            self.render_scope_turn_lines(&scope_turns, prev_idx, viewport_w);
+                        upper.splice(0..0, lines);
+                        upper_map.splice(0..0, map);
+                    }
+                }
+
+                let upper_keep = needed_upper.min(upper.len());
+                let lower_keep = viewport_h.saturating_sub(upper_keep).min(lower.len());
+                if upper.len() > upper_keep {
+                    let drop_count = upper.len() - upper_keep;
+                    upper.drain(0..drop_count);
+                    upper_map.drain(0..drop_count);
+                }
+                lower.truncate(lower_keep);
+                lower_map.truncate(lower_keep);
+                rendered.extend(upper);
+                rendered_map.extend(upper_map);
+                rendered.extend(lower);
+                rendered_map.extend(lower_map);
+            }
+        }
+
+        if rendered.len() > viewport_h {
+            let start = rendered.len().saturating_sub(viewport_h);
+            rendered.drain(0..start);
+            rendered_map.drain(0..start);
+        }
+
+        let lines = rendered
+            .iter()
+            .zip(rendered_map.iter().copied())
+            .map(|(line, map)| self.highlighted_viewport_line(line, map.map(|(_, record_idx)| record_idx), viewport_w))
+            .collect();
+
+        ViewportResult {
+            lines,
+            line_turn_map: rendered_map,
+            focused_turn_scope_idx,
+            total_turns: scope_turns.len(),
+            pinned_top,
+            pinned_bottom,
+        }
+    }
+
+    fn viewport_hit_at_mouse(
+        &self,
+        preview_content: Rect,
+        mouse: MouseEvent,
+    ) -> Option<(usize, usize)> {
+        if !point_in_rect(mouse.column, mouse.row, preview_content) {
+            return None;
+        }
+        let row = (mouse.row - preview_content.y) as usize;
+        self.last_viewport_result
+            .as_ref()?
+            .line_turn_map
+            .get(row)
+            .copied()
+            .flatten()
+    }
+
+    fn ensure_last_viewport_result(&mut self, viewport_h: usize, viewport_w: usize) {
+        if self.last_viewport_result.is_none() {
+            let viewport = self.fill_viewport(viewport_h, viewport_w);
+            self.last_viewport_result = Some(viewport);
+        }
+    }
+
     fn sync_active_preview_match_idx_for_doc(&mut self, doc: &PreviewDoc, preview_width: usize) {
         if preview_width == 0 || doc.matches.is_empty() {
             self.active_preview_match_idx = None;
@@ -6105,7 +6723,7 @@ impl App {
         self.selected_preview_record_idx = self.selected_hit().and_then(|hit| {
             self.session_preview_states
                 .get(&hit.session_idx)
-                .map(|state| state.record_idx)
+                .and_then(|state| state.focused_record_idx)
                 .or_else(|| {
                     if preview_synced {
                         hit.matched_record_idx.or_else(|| {
@@ -6120,8 +6738,9 @@ impl App {
                     }
                 })
         });
-        self.hovered_preview_record_idx = None;
+        self.hovered_record_idx = None;
         if self.showing_session_browser() {
+            self.apply_browser_selection_reset(preview_synced);
             self.session_browser_start_scroll = 0;
             self.session_browser_end_scroll = usize::MAX;
             self.session_browser_active_pane = SessionBrowserPane::Start;
@@ -6975,11 +7594,73 @@ impl App {
         if preview_width == 0 || preview_height == 0 {
             return;
         }
-        let doc = if self.showing_session_browser() {
-            self.session_browser_doc()
-        } else {
-            self.build_preview_doc()
-        };
+        if self.showing_session_browser() {
+            let scope_turns = self.resolve_turn_scope_indices().to_vec();
+            if scope_turns.is_empty() {
+                return;
+            }
+            let mut pin = match self.viewport_pin {
+                ViewportPin::Top => ViewportPin::Focused {
+                    turn_idx: 0,
+                    line_offset: 0,
+                    anchor_frac: 0.0,
+                },
+                ViewportPin::Bottom => {
+                    let turn_idx = scope_turns.len().saturating_sub(1);
+                    ViewportPin::Focused {
+                        turn_idx,
+                        line_offset: self
+                            .turn_visual_height(&scope_turns, turn_idx, preview_width)
+                            .saturating_sub(1),
+                        anchor_frac: 1.0,
+                    }
+                }
+                pin => pin,
+            };
+            if let ViewportPin::Focused {
+                mut turn_idx,
+                mut line_offset,
+                anchor_frac,
+            } = pin
+            {
+                let mut target = line_offset as i32 + delta;
+                loop {
+                    let turn_height =
+                        self.turn_visual_height(&scope_turns, turn_idx, preview_width) as i32;
+                    if target < 0 {
+                        if turn_idx == 0 {
+                            target = 0;
+                            break;
+                        }
+                        turn_idx -= 1;
+                        target += self.turn_visual_height(&scope_turns, turn_idx, preview_width)
+                            as i32;
+                        continue;
+                    }
+                    if target >= turn_height {
+                        if turn_idx + 1 >= scope_turns.len() {
+                            target = turn_height.saturating_sub(1);
+                            break;
+                        }
+                        target -= turn_height;
+                        turn_idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                line_offset = target.max(0) as usize;
+                pin = ViewportPin::Focused {
+                    turn_idx,
+                    line_offset,
+                    anchor_frac,
+                };
+            }
+            self.viewport_pin = pin;
+            self.last_viewport_result = None;
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let doc = self.build_preview_doc();
         let preview_lines = preview_layout_lines(
             &doc,
             if self.git_graph_visible {
@@ -6990,14 +7671,6 @@ impl App {
         );
         let total_lines = preview_visual_line_count(&preview_lines, preview_width);
         let max_scroll = total_lines.saturating_sub(preview_height);
-        if self.showing_session_browser() {
-            let cur = self.preview_scroll as i32;
-            self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
-            self.sync_selected_preview_record_from_scroll(preview_width);
-            self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
-            self.preview_scroll_reset_pending = false;
-            return;
-        }
         let cur = self.preview_scroll as i32;
         self.preview_scroll = (cmp::max(0, cur + delta) as usize).min(max_scroll);
         self.sync_selected_preview_record_from_scroll(preview_width);
@@ -7025,15 +7698,17 @@ impl App {
                 self.git_commit_scroll = 0;
             }
             _ => {
-                self.preview_scroll = 0;
-                self.sync_selected_preview_record_from_scroll(preview_width);
-                let doc = if self.showing_session_browser() {
-                    self.session_browser_doc()
+                if self.showing_session_browser() {
+                    self.viewport_pin = ViewportPin::Top;
+                    self.last_viewport_result = None;
+                    self.preview_scroll_reset_pending = false;
                 } else {
-                    self.build_preview_doc()
-                };
-                self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
-                self.preview_scroll_reset_pending = false;
+                    self.preview_scroll = 0;
+                    self.sync_selected_preview_record_from_scroll(preview_width);
+                    let doc = self.build_preview_doc();
+                    self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
+                    self.preview_scroll_reset_pending = false;
+                }
             }
         }
     }
@@ -7069,24 +7744,26 @@ impl App {
                 self.git_commit_scroll = total_lines.saturating_sub(preview_height);
             }
             _ => {
-                let doc = if self.showing_session_browser() {
-                    self.session_browser_doc()
+                if self.showing_session_browser() {
+                    self.viewport_pin = ViewportPin::Bottom;
+                    self.last_viewport_result = None;
+                    self.preview_scroll_reset_pending = false;
                 } else {
-                    self.build_preview_doc()
-                };
-                let preview_lines = preview_layout_lines(
-                    &doc,
-                    if self.git_graph_visible {
-                        self.selected_preview_record_idx
-                    } else {
-                        None
-                    },
-                );
-                let total_lines = preview_visual_line_count(&preview_lines, preview_width);
-                self.preview_scroll = total_lines.saturating_sub(preview_height);
-                self.sync_selected_preview_record_from_scroll(preview_width);
-                self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
-                self.preview_scroll_reset_pending = false;
+                    let doc = self.build_preview_doc();
+                    let preview_lines = preview_layout_lines(
+                        &doc,
+                        if self.git_graph_visible {
+                            self.selected_preview_record_idx
+                        } else {
+                            None
+                        },
+                    );
+                    let total_lines = preview_visual_line_count(&preview_lines, preview_width);
+                    self.preview_scroll = total_lines.saturating_sub(preview_height);
+                    self.sync_selected_preview_record_from_scroll(preview_width);
+                    self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
+                    self.preview_scroll_reset_pending = false;
+                }
             }
         }
     }
@@ -7095,11 +7772,46 @@ impl App {
         if self.show_telemetry || preview_width == 0 || preview_height == 0 {
             return;
         }
-        let doc = if self.showing_session_browser() {
-            self.session_browser_doc()
-        } else {
-            self.build_preview_doc()
-        };
+        if self.showing_session_browser() {
+            let scope_turns = self.resolve_turn_scope_indices().to_vec();
+            if scope_turns.len() <= 1 {
+                return;
+            }
+            let current_pos = match self.viewport_pin {
+                ViewportPin::Top => 0,
+                ViewportPin::Bottom => scope_turns.len().saturating_sub(1),
+                ViewportPin::Focused { .. } => self
+                    .focused_record_idx
+                    .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
+                    .unwrap_or(0),
+            };
+            let target_pos = if dir >= 0 {
+                if current_pos + 1 < scope_turns.len() {
+                    current_pos + 1
+                } else {
+                    0
+                }
+            } else {
+                current_pos
+                    .checked_sub(1)
+                    .unwrap_or(scope_turns.len().saturating_sub(1))
+            };
+            if let Some(&record_idx) = scope_turns.get(target_pos) {
+                self.focused_record_idx = Some(record_idx);
+                self.selected_preview_record_idx = Some(record_idx);
+                self.viewport_pin = ViewportPin::Focused {
+                    turn_idx: target_pos,
+                    line_offset: 0,
+                    anchor_frac: 0.3,
+                };
+                self.last_viewport_result = None;
+                if matches!(self.browser_mode, BrowserMode::Chrono) {
+                    self.sync_selected_session_from_focus();
+                }
+            }
+            return;
+        }
+        let doc = self.build_preview_doc();
         let section_records = preview_section_record_indices(&doc);
         if section_records.len() <= 1 {
             return;
@@ -7131,22 +7843,9 @@ impl App {
                 .unwrap_or(section_records.len() - 1)
         };
         let target_record_idx = section_records[target_pos];
-        let target_doc = if self.showing_session_browser() {
-            self.session_browser_doc_for(Some(target_record_idx))
-        } else {
-            doc
-        };
-        let preview_lines = preview_layout_lines(
-            &target_doc,
-            if self.git_graph_visible {
-                Some(target_record_idx)
-            } else {
-                None
-            },
-        );
         self.reveal_preview_record(
             &preview_lines,
-            &target_doc.line_record_indices,
+            &doc.line_record_indices,
             preview_width,
             preview_height,
             target_record_idx,
@@ -7232,6 +7931,19 @@ impl App {
             self.log_groups_help_emitted = true;
         }
         self.reset_preview_scroll_to_match();
+    }
+
+    fn toggle_browser_mode(&mut self) {
+        self.browser_mode = match self.browser_mode {
+            BrowserMode::Session => BrowserMode::Chrono,
+            BrowserMode::Chrono => BrowserMode::Session,
+        };
+        self.ui_state_dirty = true;
+        self.apply_browser_selection_reset(true);
+        self.set_ui_status(match self.browser_mode {
+            BrowserMode::Session => "browser mode session".to_string(),
+            BrowserMode::Chrono => "browser mode chrono".to_string(),
+        });
     }
 
     fn toggle_log_group(&mut self, group: LogGroup) {
@@ -7645,103 +8357,105 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.render_widget(commit, git_commit_area);
     }
 
-    let turn_anchor_record_idx = if app.git_graph_visible {
-        app.selected_anchor_record_idx(preview_inner_width, preview_inner_height)
+    let preview_query = app.preview_search.query.trim().to_string();
+    let (preview_title, preview_lines, use_scroll) = if app.showing_session_browser() {
+        let viewport_started = Instant::now();
+        let viewport = app.fill_viewport(preview_inner_height, preview_inner_width);
+        let viewport_duration_ms = viewport_started.elapsed().as_millis();
+        if app.log_group_enabled(LogGroup::Perf) {
+            app.emit_group_event(
+                LogGroup::Perf,
+                "perf_preview_phase",
+                json!({
+                    "mode": "viewport_engine",
+                    "phase": "viewport_fill",
+                    "duration_ms": viewport_duration_ms,
+                    "records": viewport.total_turns,
+                    "lines": viewport.lines.len(),
+                    "bytes": 0,
+                }),
+            );
+        }
+        let preview_lines = viewport.lines.clone();
+        app.last_viewport_result = Some(viewport);
+        app.remember_current_viewport_state();
+        (
+            app.turns_preview_title(app.focused_record_idx),
+            preview_lines,
+            false,
+        )
     } else {
-        None
-    };
-
-    let preview_started = Instant::now();
-    let preview_doc = if app.showing_session_browser() {
-        app.session_browser_doc()
-    } else {
-        app.build_preview_doc()
-    };
-    let preview_mode = if app.showing_session_browser() {
-        "session_browser_single"
-    } else if app.preview_search.query.trim().is_empty() {
-        "empty_query"
-    } else {
-        "query_preview"
-    };
-    let preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
-    if app.preview_scroll_reset_pending {
-        if !app.restore_selected_session_preview_state(
+        let turn_anchor_record_idx = if app.git_graph_visible {
+            app.selected_anchor_record_idx(preview_inner_width, preview_inner_height)
+        } else {
+            None
+        };
+        let preview_started = Instant::now();
+        let preview_doc = app.build_preview_doc();
+        let preview_mode = if app.preview_search.query.trim().is_empty() {
+            "empty_query"
+        } else {
+            "query_preview"
+        };
+        let preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
+        if app.preview_scroll_reset_pending {
+            let first_match_visual_line = preview_visual_line_offset(
+                &preview_layout,
+                preview_doc.first_match_line,
+                preview_inner_width,
+            );
+            app.preview_scroll = first_match_visual_line.saturating_sub(2);
+            app.preview_scroll_reset_pending = false;
+        }
+        let preview_duration_ms = preview_started.elapsed().as_millis();
+        app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
+        let preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
+        let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
+        app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
+        let selected_preview_record_idx = if !query.is_empty() {
+            app.current_preview_selection(
+                &preview_doc,
+                &preview_layout,
+                preview_inner_width,
+                preview_inner_height,
+            )
+        } else {
+            None
+        };
+        app.sync_active_preview_match_idx_for_doc(&preview_doc, preview_inner_width);
+        let layout_started = Instant::now();
+        let preview_lines = with_preview_record_highlights(
             &preview_layout,
             &preview_doc.line_record_indices,
             preview_inner_width,
-            preview_inner_height,
-        ) {
-            if let Some(record_idx) = app
-                .selected_preview_record_idx
-                .filter(|record_idx| preview_doc.line_record_indices.contains(&Some(*record_idx)))
-            {
-                app.reveal_preview_record(
-                    &preview_layout,
-                    &preview_doc.line_record_indices,
-                    preview_inner_width,
-                    preview_inner_height,
-                    record_idx,
-                );
-            } else {
-                let first_match_visual_line = preview_visual_line_offset(
-                    &preview_layout,
-                    preview_doc.first_match_line,
-                    preview_inner_width,
-                );
-                app.preview_scroll = first_match_visual_line.saturating_sub(2);
-                app.preview_scroll_reset_pending = false;
-            }
-        }
-    }
-    let preview_duration_ms = preview_started.elapsed().as_millis();
-    app.emit_preview_perf_summary(preview_mode, &preview_doc, preview_duration_ms);
-    let preview_total_lines = preview_visual_line_count(&preview_layout, preview_inner_width);
-    let preview_max_scroll = preview_total_lines.saturating_sub(preview_inner_height);
-    app.preview_scroll = cmp::min(app.preview_scroll, preview_max_scroll);
-    let selected_preview_record_idx = if app.showing_session_browser() || !query.is_empty() {
-        app.current_preview_selection(
-            &preview_doc,
-            &preview_layout,
-            preview_inner_width,
-            preview_inner_height,
-        )
-    } else {
-        None
-    };
-    app.sync_active_preview_match_idx_for_doc(&preview_doc, preview_inner_width);
-    app.remember_selected_session_preview_state(preview_inner_width);
-    let layout_started = Instant::now();
-    let preview_lines = with_preview_record_highlights(
-        &preview_layout,
-        &preview_doc.line_record_indices,
-        preview_inner_width,
-        selected_preview_record_idx,
-        app.hovered_preview_record_idx,
-        app.active_preview_match(&preview_doc),
-        app.preview_bgcolor,
-    );
-    if app.log_group_enabled(LogGroup::Perf) {
-        app.emit_group_event(
-            LogGroup::Perf,
-            "perf_preview_phase",
-            json!({
-                "mode": preview_mode,
-                "phase": "visual_layout",
-                "duration_ms": layout_started.elapsed().as_millis(),
-                "records": 0,
-                "lines": preview_lines.len(),
-                "bytes": 0,
-            }),
+            selected_preview_record_idx,
+            app.hovered_record_idx,
+            app.active_preview_match(&preview_doc),
+            app.preview_bgcolor,
         );
-    }
-    let preview_query = app.preview_search.query.trim();
-    let preview_title = if !app.showing_session_browser() && !preview_query.is_empty() {
-        app.query_preview_title("Preview", selected_preview_record_idx)
-    } else if app.showing_session_browser() {
-        app.turns_preview_title(selected_preview_record_idx)
-    } else {
-        app.preview_title("Preview")
+        if app.log_group_enabled(LogGroup::Perf) {
+            app.emit_group_event(
+                LogGroup::Perf,
+                "perf_preview_phase",
+                json!({
+                    "mode": preview_mode,
+                    "phase": "visual_layout",
+                    "duration_ms": layout_started.elapsed().as_millis(),
+                    "records": 0,
+                    "lines": preview_lines.len(),
+                    "bytes": 0,
+                }),
+            );
+        }
+        (
+            if !preview_query.is_empty() {
+                app.query_preview_title("Preview", selected_preview_record_idx)
+            } else {
+                app.preview_title("Preview")
+            },
+            preview_lines,
+            true,
+        )
     };
 
     let has_search_bar = preview_has_search_bar(app);
@@ -7779,9 +8493,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let content = preview_content_rect(preview_area, has_search_bar);
-    let preview = Paragraph::new(Text::from(preview_lines))
-        .style(preview_style)
-        .scroll((app.preview_scroll as u16, 0));
+    let mut preview = Paragraph::new(Text::from(preview_lines)).style(preview_style);
+    if use_scroll {
+        preview = preview.scroll((app.preview_scroll as u16, 0));
+    }
     f.render_widget(preview, content);
 
     render_footer(f, root[1], app.status_text(), app.footer_help_text());
@@ -8346,10 +9061,17 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            chrono_viewport_state: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
-            hovered_preview_record_idx: None,
+            focused_record_idx: None,
+            hovered_record_idx: None,
             hovered_query_tag_filter: None,
+            viewport_pin: ViewportPin::Top,
+            last_viewport_result: None,
+            turn_cache: TurnCache::default(),
+            chrono_turns: Vec::new(),
+            browser_mode: BrowserMode::Session,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -8386,7 +9108,7 @@ mod tests {
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             ui_state_path: config::default_ui_state_path(),
-            layout_state_dirty: false,
+            ui_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -9078,10 +9800,17 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            chrono_viewport_state: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
-            hovered_preview_record_idx: None,
+            focused_record_idx: None,
+            hovered_record_idx: None,
             hovered_query_tag_filter: None,
+            viewport_pin: ViewportPin::Top,
+            last_viewport_result: None,
+            turn_cache: TurnCache::default(),
+            chrono_turns: Vec::new(),
+            browser_mode: BrowserMode::Session,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -9118,7 +9847,7 @@ mod tests {
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             ui_state_path: config::default_ui_state_path(),
-            layout_state_dirty: false,
+            ui_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -9183,10 +9912,17 @@ mod tests {
             selected: 0,
             offset: 0,
             session_preview_states: HashMap::new(),
+            chrono_viewport_state: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
-            hovered_preview_record_idx: None,
+            focused_record_idx: None,
+            hovered_record_idx: None,
             hovered_query_tag_filter: None,
+            viewport_pin: ViewportPin::Top,
+            last_viewport_result: None,
+            turn_cache: TurnCache::default(),
+            chrono_turns: Vec::new(),
+            browser_mode: BrowserMode::Session,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -9223,7 +9959,7 @@ mod tests {
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             ui_state_path: config::default_ui_state_path(),
-            layout_state_dirty: false,
+            ui_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),
@@ -9999,7 +10735,7 @@ mod tests {
             git_pct: 24,
             graph_pct: 61,
         };
-        app.layout_state_dirty = true;
+        app.ui_state_dirty = true;
 
         app.persist_ui_state_if_dirty().unwrap();
 
@@ -10008,7 +10744,7 @@ mod tests {
         assert_eq!(state.layout.results_pct, Some(27));
         assert_eq!(state.layout.git_pct, Some(24));
         assert_eq!(state.layout.graph_pct, Some(61));
-        assert!(!app.layout_state_dirty);
+        assert!(!app.ui_state_dirty);
     }
 
     #[test]
@@ -10848,7 +11584,16 @@ mod tests {
         assert!(app.showing_session_browser());
 
         app.jump_preview_record(1, 80, 6);
-        assert!(app.preview_scroll > 0);
+        assert_eq!(app.focused_record_idx, Some(1));
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -10878,23 +11623,26 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let doc = app.session_browser_doc_for(Some(1));
-        let preview_lines = preview_layout_lines(&doc, None);
-        let initial_scroll = preview_visual_line_offset(&preview_lines, 1, 80);
-        app.preview_scroll = initial_scroll;
-        let preview_height = 3;
-        let (target_start, target_end) =
-            preview_record_visual_bounds(&preview_lines, &doc.line_record_indices, 80, 1)
-                .expect("expected second turn bounds");
+        app.focused_record_idx = Some(0);
+        app.selected_preview_record_idx = Some(0);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: 0,
+            line_offset: 0,
+            anchor_frac: 0.3,
+        };
 
-        app.jump_preview_record(1, 80, preview_height);
+        app.jump_preview_record(1, 80, 3);
 
-        let min_scroll = cmp::min(target_start, target_end.saturating_sub(preview_height));
-        let max_scroll = cmp::max(target_start, target_end.saturating_sub(preview_height));
-        assert_eq!(
-            app.preview_scroll,
-            initial_scroll.clamp(min_scroll, max_scroll)
-        );
+        assert_eq!(app.focused_record_idx, Some(1));
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -10924,17 +11672,26 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let doc = app.session_browser_doc();
-        let starts = preview_section_start_lines(&doc.line_record_indices);
-        app.preview_scroll = preview_visual_line_offset(&doc.lines, *starts.last().unwrap(), 80);
-        app.sync_selected_preview_record_from_scroll(80);
+        app.focused_record_idx = Some(2);
+        app.selected_preview_record_idx = Some(2);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: 2,
+            line_offset: 0,
+            anchor_frac: 0.3,
+        };
 
         app.jump_preview_record(1, 80, 6);
 
-        assert_eq!(
-            app.preview_scroll,
-            preview_visual_line_offset(&doc.lines, starts[0], 80)
-        );
+        assert_eq!(app.focused_record_idx, Some(0));
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 0,
+                line_offset: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -10989,7 +11746,7 @@ mod tests {
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(0));
-        assert_eq!(app.hovered_preview_record_idx, Some(1));
+        assert_eq!(app.hovered_record_idx, Some(1));
         assert_eq!(app.preview_scroll, 0);
     }
 
@@ -11050,7 +11807,7 @@ mod tests {
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(0));
-        assert_eq!(app.hovered_preview_record_idx, Some(1));
+        assert_eq!(app.hovered_record_idx, Some(1));
     }
 
     #[test]
@@ -11082,7 +11839,7 @@ mod tests {
         app.git_graph_visible = true;
         app.update_results();
         app.selected_preview_record_idx = Some(0);
-        app.hovered_preview_record_idx = Some(1);
+        app.hovered_record_idx = Some(1);
 
         assert_eq!(app.selected_anchor_record_idx(80, 20), Some(1));
     }
@@ -11114,34 +11871,20 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let area = Rect::new(0, 0, 100, 10);
+        let area = Rect::new(0, 0, 100, 20);
         let geometry = app_geometry(area, &app);
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
-        let current_doc = app.session_browser_doc();
-        let current_preview_lines = preview_layout_lines(&current_doc, None);
-        let (current_second_start, _) = preview_record_visual_bounds(
-            &current_preview_lines,
-            &current_doc.line_record_indices,
-            preview_width,
-            1,
-        )
-        .expect("expected collapsed second preview record bounds");
-        let target_doc = app.session_browser_doc_for(Some(1));
-        let target_preview_lines = preview_layout_lines(&target_doc, None);
-        let (second_start, second_end) = preview_record_visual_bounds(
-            &target_preview_lines,
-            &target_doc.line_record_indices,
-            preview_width,
-            1,
-        )
-        .expect("expected second preview record bounds");
-        let second_height = second_end.saturating_sub(second_start);
-        assert!(second_height <= preview_height);
-
-        app.preview_scroll = current_second_start;
-        let click_row = preview_area.y + 1;
+        app.viewport_pin = ViewportPin::Top;
+        let viewport = app.fill_viewport(preview_height, preview_width);
+        let second_row = viewport
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(1))
+            .expect("expected visible second turn row");
+        app.last_viewport_result = Some(viewport);
+        let click_row = preview_area.y + 1 + second_row as u16;
 
         route_mouse(
             &mut app,
@@ -11155,8 +11898,16 @@ mod tests {
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(1));
-        assert_eq!(app.hovered_preview_record_idx, Some(1));
-        assert_eq!(app.preview_scroll, second_start);
+        assert_eq!(app.hovered_record_idx, Some(1));
+        assert_eq!(app.focused_record_idx, Some(1));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset: 0,
+                ..
+            }
+        ));
         assert_eq!(app.input_mode, InputMode::PreviewNav);
     }
 
@@ -11191,25 +11942,19 @@ mod tests {
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
-        let area = Rect::new(0, 0, 100, 10);
+        let area = Rect::new(0, 0, 100, 20);
         let geometry = app_geometry(area, &app);
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
-        app.selected_preview_record_idx = Some(1);
-        let doc = app.session_browser_doc();
-        let preview_lines = preview_layout_lines(&doc, None);
-        let (second_start, second_end) = preview_record_visual_bounds(
-            &preview_lines,
-            &doc.line_record_indices,
-            preview_width,
-            1,
-        )
-        .expect("expected second preview record bounds");
-        let second_height = second_end.saturating_sub(second_start);
-        assert!(second_height > preview_height);
-
-        app.preview_scroll = second_end.saturating_sub(1);
+        app.viewport_pin = ViewportPin::Top;
+        let viewport = app.fill_viewport(preview_height, preview_width);
+        let second_row = viewport
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(1))
+            .expect("expected visible second turn row");
+        app.last_viewport_result = Some(viewport);
 
         route_mouse(
             &mut app,
@@ -11217,14 +11962,22 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: preview_area.x + 2,
-                row: preview_area.y + 1,
+                row: preview_area.y + 1 + second_row as u16,
                 modifiers: KeyModifiers::empty(),
             },
         );
 
         assert_eq!(app.selected_preview_record_idx, Some(1));
-        assert_eq!(app.hovered_preview_record_idx, Some(1));
-        assert_eq!(app.preview_scroll, second_start);
+        assert_eq!(app.hovered_record_idx, Some(1));
+        assert_eq!(app.focused_record_idx, Some(1));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -11287,19 +12040,14 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
 
-        app.selected_preview_record_idx = Some(1);
-        let session_a_doc = app.session_browser_doc();
-        let session_a_lines = preview_layout_lines(&session_a_doc, None);
-        let (session_a_start, session_a_end) = preview_record_visual_bounds(
-            &session_a_lines,
-            &session_a_doc.line_record_indices,
-            preview_width,
-            1,
-        )
-        .expect("expected second turn bounds for session a");
         let saved_offset = 4;
-        assert!(session_a_end.saturating_sub(session_a_start) > saved_offset);
-        app.preview_scroll = session_a_start + saved_offset;
+        app.selected_preview_record_idx = Some(1);
+        app.focused_record_idx = Some(1);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: 1,
+            line_offset: saved_offset,
+            anchor_frac: 0.3,
+        };
         app.remember_selected_session_preview_state(preview_width);
 
         app.selected = session_b_selected;
@@ -11311,19 +12059,43 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui(f, &mut app)).unwrap();
 
-        let restored_doc = app.session_browser_doc();
-        let restored_lines = preview_layout_lines(&restored_doc, None);
-        let (restored_start, restored_end) = preview_record_visual_bounds(
-            &restored_lines,
-            &restored_doc.line_record_indices,
-            preview_width,
-            1,
-        )
-        .expect("expected restored second turn bounds for session a");
-        assert!(restored_end.saturating_sub(restored_start) > saved_offset);
         assert_eq!(app.selected, session_a_selected);
+        assert_eq!(app.focused_record_idx, Some(1));
         assert_eq!(app.selected_preview_record_idx, Some(1));
-        assert_eq!(app.preview_scroll, restored_start + saved_offset);
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset,
+                ..
+            } if line_offset == saved_offset
+        ));
+    }
+
+    #[test]
+    fn chrono_turns_sort_by_subsecond_timestamp_precision() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T12:00:00.900Z"),
+                Role::User,
+                "later",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T12:00:00.100Z"),
+                Role::User,
+                "earlier",
+                "session-b",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.browser_mode = BrowserMode::Chrono;
+
+        app.update_results();
+
+        assert_eq!(app.chrono_turns, vec![1, 0]);
     }
 
     #[test]
@@ -11775,10 +12547,24 @@ mod tests {
         app.update_results();
 
         app.scroll_preview_page(1, 6, 80);
-        assert_eq!(app.preview_scroll, 5);
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 0,
+                line_offset: 5,
+                ..
+            }
+        ));
 
         app.scroll_preview_page(-1, 6, 80);
-        assert_eq!(app.preview_scroll, 0);
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 0,
+                line_offset: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -11795,14 +12581,11 @@ mod tests {
         app.input_mode = InputMode::PreviewNav;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).unwrap();
-
-        let preview_width = current_preview_inner_width(&mut terminal, &app).unwrap();
-        let preview_height = current_preview_inner_height(&mut terminal, &app).unwrap();
-        let doc = app.session_browser_doc();
-        let preview_lines = preview_layout_lines(&doc, None);
-        let max_scroll =
-            preview_visual_line_count(&preview_lines, preview_width).saturating_sub(preview_height);
-        app.preview_scroll = 3;
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: 0,
+            line_offset: 3,
+            anchor_frac: 0.3,
+        };
 
         handle_key(
             &mut terminal,
@@ -11810,7 +12593,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
         )
         .unwrap();
-        assert_eq!(app.preview_scroll, 0);
+        assert!(matches!(app.viewport_pin, ViewportPin::Top));
 
         handle_key(
             &mut terminal,
@@ -11818,7 +12601,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('G'), KeyModifiers::empty()),
         )
         .unwrap();
-        assert_eq!(app.preview_scroll, max_scroll);
+        assert!(matches!(app.viewport_pin, ViewportPin::Bottom));
     }
 
     #[test]
@@ -11908,9 +12691,16 @@ mod tests {
             hovered_query_tag_filter: None,
             offset: 0,
             session_preview_states: HashMap::new(),
+            chrono_viewport_state: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
-            hovered_preview_record_idx: None,
+            focused_record_idx: None,
+            hovered_record_idx: None,
+            viewport_pin: ViewportPin::Top,
+            last_viewport_result: None,
+            turn_cache: TurnCache::default(),
+            chrono_turns: Vec::new(),
+            browser_mode: BrowserMode::Session,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -11947,7 +12737,7 @@ mod tests {
             remote_sync_states: HashMap::new(),
             ui_tags: config::UiTagConfig::default(),
             ui_state_path: config::default_ui_state_path(),
-            layout_state_dirty: false,
+            ui_state_dirty: false,
             remotes: HashMap::new(),
             git_repo_cache: HashMap::new(),
             git_commit_preview_cache: HashMap::new(),

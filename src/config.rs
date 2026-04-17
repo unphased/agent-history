@@ -19,6 +19,8 @@ pub struct AppConfig {
 pub struct UiState {
     #[serde(default)]
     pub layout: UiLayoutState,
+    #[serde(default)]
+    pub browser_mode: BrowserModeState,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -27,6 +29,14 @@ pub struct UiLayoutState {
     pub results_pct: Option<u16>,
     pub git_pct: Option<u16>,
     pub graph_pct: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserModeState {
+    #[default]
+    Session,
+    Chrono,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -205,6 +215,7 @@ mod tests {
                 git_pct: Some(31),
                 graph_pct: Some(67),
             },
+            browser_mode: BrowserModeState::Chrono,
         };
 
         save_ui_state(&tmp, &state).unwrap();
