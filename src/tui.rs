@@ -158,15 +158,11 @@ struct TurnCache {
     cached_width: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ViewportResult {
     lines: Vec<Line<'static>>,
     line_turn_map: Vec<Option<(usize, usize)>>,
-    focused_turn_scope_idx: usize,
     total_turns: usize,
-    pinned_top: bool,
-    pinned_bottom: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +649,21 @@ fn build_session_index(all: &[MessageRecord]) -> (Vec<SessionSummary>, Vec<Vec<u
 
     let (sessions, records): (Vec<_>, Vec<_>) = items.into_iter().unzip();
     (sessions, records)
+}
+
+fn build_record_session_idx_map(
+    session_records: &[Vec<usize>],
+    total_records: usize,
+) -> Vec<Option<usize>> {
+    let mut out = vec![None; total_records];
+    for (session_idx, record_indices) in session_records.iter().enumerate() {
+        for &record_idx in record_indices {
+            if let Some(slot) = out.get_mut(record_idx) {
+                *slot = Some(session_idx);
+            }
+        }
+    }
+    out
 }
 
 fn source_sort_key(source: SourceKind) -> u8 {
@@ -3026,6 +3037,7 @@ struct App {
     all: Vec<MessageRecord>,
     sessions: Vec<SessionSummary>,
     session_records: Vec<Vec<usize>>,
+    record_session_idx_by_record: Vec<Option<usize>>,
     filtered: Vec<SessionHit>,
     selected: usize,
     offset: usize,
@@ -3152,6 +3164,7 @@ fn run_app(
         all: Vec::new(),
         sessions: Vec::new(),
         session_records: Vec::new(),
+        record_session_idx_by_record: Vec::new(),
         filtered: Vec::new(),
         selected: 0,
         offset: 0,
@@ -3421,6 +3434,7 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
 fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
     app.all = records;
     let (sessions, session_records) = build_session_index(&app.all);
+    app.record_session_idx_by_record = build_record_session_idx_map(&session_records, app.all.len());
     app.indexing.records = app.all.len();
     app.indexing.sessions = sessions.len();
     app.sessions = sessions;
@@ -6120,9 +6134,10 @@ impl App {
     }
 
     fn record_session_idx(&self, record_idx: usize) -> Option<usize> {
-        self.session_records
-            .iter()
-            .position(|record_indices| record_indices.contains(&record_idx))
+        self.record_session_idx_by_record
+            .get(record_idx)
+            .copied()
+            .flatten()
     }
 
     fn scope_position_for_record(&self, scope_turns: &[usize], record_idx: usize) -> Option<usize> {
@@ -6204,34 +6219,25 @@ impl App {
                 continue;
             };
             for &record_idx in record_indices {
-                if self
+                if let Some(nanos) = self
                     .all
                     .get(record_idx)
                     .and_then(|rec| rec.timestamp.as_deref())
                     .and_then(parse_timestamp_nanos)
-                    .is_some()
                 {
-                    chrono_turns.push(record_idx);
+                    chrono_turns.push((nanos, record_idx));
                 } else {
                     missing_timestamps += 1;
                 }
             }
         }
-        chrono_turns.sort_by(|&a, &b| {
-            parse_timestamp_nanos(
-                self.all
-                    .get(a)
-                    .and_then(|rec| rec.timestamp.as_deref())
-                    .unwrap_or(""),
-            )
-            .cmp(&parse_timestamp_nanos(
-                self.all
-                    .get(b)
-                    .and_then(|rec| rec.timestamp.as_deref())
-                    .unwrap_or(""),
-            ))
+        chrono_turns.sort_by(|(a_nanos, a_idx), (b_nanos, b_idx)| {
+            a_nanos.cmp(b_nanos).then_with(|| a_idx.cmp(b_idx))
         });
-        self.chrono_turns = chrono_turns;
+        self.chrono_turns = chrono_turns
+            .into_iter()
+            .map(|(_, record_idx)| record_idx)
+            .collect();
         if missing_timestamps > 0 {
             self.set_ui_status(format!(
                 "chrono skipped {missing_timestamps} turns without timestamps"
@@ -6259,7 +6265,7 @@ impl App {
     }
 
     fn apply_browser_selection_reset(&mut self, preview_synced: bool) {
-        if matches!(self.browser_mode, BrowserMode::Chrono) {
+        if matches!(self.browser_mode, BrowserMode::Chrono) && self.showing_session_browser() {
             self.rebuild_chrono_turns();
         }
         self.last_viewport_result = None;
@@ -6430,24 +6436,28 @@ impl App {
             return (Vec::new(), Vec::new());
         };
         let header_lines = wrap_preview_line(&render_turn_header(&rec, scope_idx), width);
-        let cached = self
-            .ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
-            .cloned()
-            .unwrap_or(CachedTurn {
-                body_lines: Vec::new(),
-                body_height: 0,
-            });
         let mut lines = Vec::with_capacity(
-            header_lines.len() + cached.body_height + usize::from(self.chrono_separator_after(scope_turns, scope_idx)),
+            header_lines.len()
+                + self
+                    .ensure_turn_cached(
+                        record_idx,
+                        self.focused_record_idx == Some(record_idx),
+                        width,
+                    )
+                    .map(|cached| cached.body_height)
+                    .unwrap_or(0)
+                + usize::from(self.chrono_separator_after(scope_turns, scope_idx)),
         );
         let mut line_turn_map = Vec::with_capacity(lines.capacity());
         for line in header_lines {
             lines.push(line);
             line_turn_map.push(Some((scope_idx, record_idx)));
         }
-        for line in cached.body_lines {
-            lines.push(line);
-            line_turn_map.push(Some((scope_idx, record_idx)));
+        if let Some(cached) =
+            self.ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
+        {
+            lines.extend(cached.body_lines.iter().cloned());
+            line_turn_map.extend(std::iter::repeat_n(Some((scope_idx, record_idx)), cached.body_height));
         }
         if self.chrono_separator_after(scope_turns, scope_idx)
             && let Some(separator) = self.chrono_separator_line(scope_turns, scope_idx)
@@ -6459,7 +6469,20 @@ impl App {
     }
 
     fn turn_visual_height(&mut self, scope_turns: &[usize], scope_idx: usize, width: usize) -> usize {
-        self.render_scope_turn_lines(scope_turns, scope_idx, width).0.len()
+        let Some(&record_idx) = scope_turns.get(scope_idx) else {
+            return 0;
+        };
+        let Some(rec) = self.all.get(record_idx).cloned() else {
+            return 0;
+        };
+        let header_height = wrap_preview_line(&render_turn_header(&rec, scope_idx), width).len();
+        let body_height = self
+            .ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
+            .map(|cached| cached.body_height)
+            .unwrap_or(0);
+        header_height
+            + body_height
+            + usize::from(self.chrono_separator_after(scope_turns, scope_idx))
     }
 
     fn session_header_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<Option<(usize, usize)>>) {
@@ -6501,26 +6524,15 @@ impl App {
             return ViewportResult {
                 lines: Vec::new(),
                 line_turn_map: Vec::new(),
-                focused_turn_scope_idx: 0,
                 total_turns: scope_turns.len(),
-                pinned_top: true,
-                pinned_bottom: true,
             };
         }
 
-        let focused_turn_scope_idx = self
-            .focused_record_idx
-            .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
-            .unwrap_or(0);
-
         let mut rendered = Vec::new();
         let mut rendered_map = Vec::new();
-        let mut pinned_top = false;
-        let mut pinned_bottom = false;
 
         match self.viewport_pin {
             ViewportPin::Top => {
-                pinned_top = true;
                 let (header_lines, header_map) = self.session_header_lines(viewport_w);
                 rendered.extend(header_lines);
                 rendered_map.extend(header_map);
@@ -6532,10 +6544,8 @@ impl App {
                         break;
                     }
                 }
-                pinned_bottom = rendered.len() <= viewport_h;
             }
             ViewportPin::Bottom => {
-                pinned_bottom = true;
                 for scope_idx in (0..scope_turns.len()).rev() {
                     let (lines, map) =
                         self.render_scope_turn_lines(&scope_turns, scope_idx, viewport_w);
@@ -6550,7 +6560,6 @@ impl App {
                     rendered.splice(0..0, header_lines);
                     rendered_map.splice(0..0, header_map);
                 }
-                pinned_top = rendered.len() <= viewport_h;
             }
             ViewportPin::Focused {
                 turn_idx,
@@ -6576,7 +6585,6 @@ impl App {
                             upper.splice(0..0, header_lines);
                             upper_map.splice(0..0, header_map);
                         }
-                        pinned_top = true;
                         break;
                     }
                     prev_idx -= 1;
@@ -6588,7 +6596,6 @@ impl App {
                 let mut next_idx = turn_idx + 1;
                 while lower.len() < viewport_h.saturating_sub(anchor_row) {
                     if next_idx >= scope_turns.len() {
-                        pinned_bottom = true;
                         break;
                     }
                     let (lines, map) = self.render_scope_turn_lines(&scope_turns, next_idx, viewport_w);
@@ -6602,7 +6609,6 @@ impl App {
                 if upper.len() < needed_upper {
                     while lower.len() < viewport_h {
                         if next_idx >= scope_turns.len() {
-                            pinned_bottom = true;
                             break;
                         }
                         let (lines, map) =
@@ -6615,7 +6621,6 @@ impl App {
                 if lower.len() < needed_lower {
                     while upper.len() + lower.len() < viewport_h {
                         if prev_idx == 0 {
-                            pinned_top = true;
                             break;
                         }
                         prev_idx -= 1;
@@ -6657,10 +6662,7 @@ impl App {
         ViewportResult {
             lines,
             line_turn_map: rendered_map,
-            focused_turn_scope_idx,
             total_turns: scope_turns.len(),
-            pinned_top,
-            pinned_bottom,
         }
     }
 
@@ -9057,6 +9059,7 @@ mod tests {
             all: Vec::new(),
             sessions: Vec::new(),
             session_records: Vec::new(),
+            record_session_idx_by_record: Vec::new(),
             filtered: vec![],
             selected: 0,
             offset: 0,
@@ -9130,6 +9133,7 @@ mod tests {
         session_records: Vec<Vec<usize>>,
     ) -> App {
         let mut app = empty_app();
+        app.record_session_idx_by_record = build_record_session_idx_map(&session_records, all.len());
         app.ready = true;
         app.all = all;
         app.sessions = sessions;
@@ -9786,6 +9790,8 @@ mod tests {
             ),
         ];
         let (sessions, session_records) = build_session_index(&all);
+        let record_session_idx_by_record =
+            build_record_session_idx_map(&session_records, all.len());
         let mut app = App {
             query: String::new(),
             cursor_pos: 0,
@@ -9796,6 +9802,7 @@ mod tests {
             all,
             sessions,
             session_records,
+            record_session_idx_by_record,
             filtered: vec![],
             selected: 0,
             offset: 0,
@@ -9898,6 +9905,8 @@ mod tests {
             ),
         ];
         let (sessions, session_records) = build_session_index(&all);
+        let record_session_idx_by_record =
+            build_record_session_idx_map(&session_records, all.len());
         let mut app = App {
             query: "needle".to_string(),
             cursor_pos: 6,
@@ -9908,6 +9917,7 @@ mod tests {
             all,
             sessions,
             session_records,
+            record_session_idx_by_record,
             filtered: vec![],
             selected: 0,
             offset: 0,
@@ -12662,6 +12672,8 @@ mod tests {
             ),
         ];
         let (mut sessions, session_records) = build_session_index(&all);
+        let record_session_idx_by_record =
+            build_record_session_idx_map(&session_records, all.len());
         sessions[0].cwd = Some("/tmp/project-b".to_string());
         sessions[1].cwd = Some("/tmp/project-a".to_string());
 
@@ -12675,6 +12687,7 @@ mod tests {
             all,
             sessions,
             session_records,
+            record_session_idx_by_record,
             filtered: vec![
                 SessionHit {
                     session_idx: 0,
