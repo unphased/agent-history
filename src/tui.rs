@@ -106,6 +106,12 @@ struct SessionHit {
     hit_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionPreviewState {
+    record_idx: usize,
+    turn_scroll_offset: usize,
+}
+
 struct PreviewDoc {
     lines: Vec<Line<'static>>,
     first_match_line: usize,
@@ -2793,6 +2799,7 @@ struct App {
     filtered: Vec<SessionHit>,
     selected: usize,
     offset: usize,
+    session_preview_states: HashMap<usize, SessionPreviewState>,
     selected_preview_record_idx: Option<usize>,
     hovered_preview_record_idx: Option<usize>,
     preview_scroll: usize,
@@ -2909,6 +2916,7 @@ fn run_app(
         filtered: Vec::new(),
         selected: 0,
         offset: 0,
+        session_preview_states: HashMap::new(),
         selected_preview_record_idx: None,
         hovered_preview_record_idx: None,
         preview_scroll: 0,
@@ -4271,7 +4279,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                                 &reveal_doc,
                                 app.git_graph_visible.then_some(record_idx),
                             );
-                            app.reveal_preview_record(
+                            app.reveal_preview_record_from_click(
                                 &preview_lines,
                                 &reveal_doc.line_record_indices,
                                 preview_width,
@@ -4676,6 +4684,136 @@ impl App {
         let max_scroll = cmp::max(section_start, section_end.saturating_sub(preview_height));
         self.preview_scroll = self.preview_scroll.clamp(min_scroll, max_scroll);
         self.preview_scroll_reset_pending = false;
+        self.remember_selected_session_preview_state(preview_width);
+    }
+
+    fn reveal_preview_record_from_click(
+        &mut self,
+        preview_lines: &[Line<'_>],
+        line_record_indices: &[Option<usize>],
+        preview_width: usize,
+        preview_height: usize,
+        record_idx: usize,
+    ) {
+        if preview_width == 0 || preview_height == 0 {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let Some((section_start, section_end)) = preview_record_visual_bounds(
+            preview_lines,
+            line_record_indices,
+            preview_width,
+            record_idx,
+        ) else {
+            self.preview_scroll_reset_pending = false;
+            return;
+        };
+        if section_end.saturating_sub(section_start) > preview_height {
+            self.selected_preview_record_idx = Some(record_idx);
+            self.preview_scroll = section_start;
+            self.preview_scroll_reset_pending = false;
+            self.remember_selected_session_preview_state(preview_width);
+            return;
+        }
+        self.reveal_preview_record(
+            preview_lines,
+            line_record_indices,
+            preview_width,
+            preview_height,
+            record_idx,
+        );
+    }
+
+    fn restore_selected_session_preview_state(
+        &mut self,
+        preview_lines: &[Line<'_>],
+        line_record_indices: &[Option<usize>],
+        preview_width: usize,
+        preview_height: usize,
+    ) -> bool {
+        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
+            return false;
+        }
+        let Some(hit) = self.selected_hit() else {
+            return false;
+        };
+        let Some(state) = self.session_preview_states.get(&hit.session_idx).copied() else {
+            return false;
+        };
+        let Some((section_start, section_end)) = preview_record_visual_bounds(
+            preview_lines,
+            line_record_indices,
+            preview_width,
+            state.record_idx,
+        ) else {
+            return false;
+        };
+        let total_lines = preview_visual_line_count(preview_lines, preview_width);
+        let max_scroll = total_lines.saturating_sub(preview_height);
+        let turn_height = section_end.saturating_sub(section_start);
+        let turn_scroll_offset = state.turn_scroll_offset.min(turn_height.saturating_sub(1));
+        self.selected_preview_record_idx = Some(state.record_idx);
+        self.preview_scroll = section_start
+            .saturating_add(turn_scroll_offset)
+            .min(max_scroll);
+        self.preview_scroll_reset_pending = false;
+        true
+    }
+
+    fn remember_selected_session_preview_state(&mut self, preview_width: usize) {
+        if self.show_telemetry || preview_width == 0 {
+            return;
+        }
+        let Some(hit) = self.selected_hit() else {
+            return;
+        };
+        let doc = if self.showing_session_browser() {
+            self.session_browser_doc()
+        } else {
+            self.build_preview_doc()
+        };
+        let preview_lines = preview_layout_lines(
+            &doc,
+            if self.git_graph_visible {
+                self.selected_preview_record_idx
+            } else {
+                None
+            },
+        );
+        let Some(record_idx) = self
+            .selected_preview_record_idx
+            .filter(|record_idx| doc.line_record_indices.contains(&Some(*record_idx)))
+            .or_else(|| {
+                preview_selected_record_idx(
+                    &preview_lines,
+                    &doc.line_record_indices,
+                    preview_width,
+                    self.preview_scroll,
+                )
+            })
+        else {
+            return;
+        };
+        let Some((section_start, section_end)) = preview_record_visual_bounds(
+            &preview_lines,
+            &doc.line_record_indices,
+            preview_width,
+            record_idx,
+        ) else {
+            return;
+        };
+        let turn_scroll_offset = self
+            .preview_scroll
+            .saturating_sub(section_start)
+            .min(section_end.saturating_sub(section_start).saturating_sub(1));
+        self.session_preview_states.insert(
+            hit.session_idx,
+            SessionPreviewState {
+                record_idx,
+                turn_scroll_offset,
+            },
+        );
     }
 
     fn preview_record_idx_at_mouse(
@@ -5720,17 +5858,22 @@ impl App {
     fn reset_preview_scroll_to_match(&mut self) {
         let preview_synced = self.preview_search.query.trim() == self.query.trim();
         self.selected_preview_record_idx = self.selected_hit().and_then(|hit| {
-            if preview_synced {
-                hit.matched_record_idx.or_else(|| {
-                    self.sessions
-                        .get(hit.session_idx)
-                        .map(|session| session.first_user_idx)
+            self.session_preview_states
+                .get(&hit.session_idx)
+                .map(|state| state.record_idx)
+                .or_else(|| {
+                    if preview_synced {
+                        hit.matched_record_idx.or_else(|| {
+                            self.sessions
+                                .get(hit.session_idx)
+                                .map(|session| session.first_user_idx)
+                        })
+                    } else {
+                        self.sessions
+                            .get(hit.session_idx)
+                            .map(|session| session.first_user_idx)
+                    }
                 })
-            } else {
-                self.sessions
-                    .get(hit.session_idx)
-                    .map(|session| session.first_user_idx)
-            }
         });
         self.hovered_preview_record_idx = None;
         if self.showing_session_browser() {
@@ -7272,25 +7415,32 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     };
     let mut preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
     if app.preview_scroll_reset_pending {
-        if let Some(record_idx) = app
-            .selected_preview_record_idx
-            .filter(|record_idx| preview_doc.line_record_indices.contains(&Some(*record_idx)))
-        {
-            app.reveal_preview_record(
-                &preview_layout,
-                &preview_doc.line_record_indices,
-                preview_inner_width,
-                preview_inner_height,
-                record_idx,
-            );
-        } else {
-            let first_match_visual_line = preview_visual_line_offset(
-                &preview_layout,
-                preview_doc.first_match_line,
-                preview_inner_width,
-            );
-            app.preview_scroll = first_match_visual_line.saturating_sub(2);
-            app.preview_scroll_reset_pending = false;
+        if !app.restore_selected_session_preview_state(
+            &preview_layout,
+            &preview_doc.line_record_indices,
+            preview_inner_width,
+            preview_inner_height,
+        ) {
+            if let Some(record_idx) = app
+                .selected_preview_record_idx
+                .filter(|record_idx| preview_doc.line_record_indices.contains(&Some(*record_idx)))
+            {
+                app.reveal_preview_record(
+                    &preview_layout,
+                    &preview_doc.line_record_indices,
+                    preview_inner_width,
+                    preview_inner_height,
+                    record_idx,
+                );
+            } else {
+                let first_match_visual_line = preview_visual_line_offset(
+                    &preview_layout,
+                    preview_doc.first_match_line,
+                    preview_inner_width,
+                );
+                app.preview_scroll = first_match_visual_line.saturating_sub(2);
+                app.preview_scroll_reset_pending = false;
+            }
         }
     }
     if app.showing_session_browser() {
@@ -7337,6 +7487,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             preview_inner_height,
         );
     }
+    app.remember_selected_session_preview_state(preview_inner_width);
     let layout_started = Instant::now();
     let preview_lines = with_preview_record_highlights(
         &preview_layout,
@@ -7968,6 +8119,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -8686,6 +8838,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -8788,6 +8941,7 @@ mod tests {
             filtered: vec![],
             selected: 0,
             offset: 0,
+            session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
@@ -10486,10 +10640,106 @@ mod tests {
 
         assert_eq!(app.selected_preview_record_idx, Some(1));
         assert_eq!(app.hovered_preview_record_idx, Some(1));
-        assert_eq!(
-            app.preview_scroll,
-            second_end.saturating_sub(preview_height)
-        );
+        assert_eq!(app.preview_scroll, second_start);
+    }
+
+    #[test]
+    fn preview_position_is_restored_when_returning_to_a_session() {
+        let session_a_turn = (1..=18)
+            .map(|line| format!("session a line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session_b_turn = (1..=6)
+            .map(|line| format!("session b line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "session a first",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                &session_a_turn,
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "session b first",
+                "session-b",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:04Z"),
+                Role::Assistant,
+                &session_b_turn,
+                "session-b",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let session_a_selected = app
+            .filtered
+            .iter()
+            .position(|hit| app.sessions[hit.session_idx].session_id == "session-a")
+            .expect("expected session-a in filtered results");
+        let session_b_selected = app
+            .filtered
+            .iter()
+            .position(|hit| app.sessions[hit.session_idx].session_id == "session-b")
+            .expect("expected session-b in filtered results");
+        app.selected = session_a_selected;
+        app.reset_preview_scroll_to_match();
+
+        let area = Rect::new(0, 0, 100, 10);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+
+        app.selected_preview_record_idx = Some(1);
+        let session_a_doc = app.session_browser_doc();
+        let session_a_lines = preview_layout_lines(&session_a_doc, None);
+        let (session_a_start, session_a_end) = preview_record_visual_bounds(
+            &session_a_lines,
+            &session_a_doc.line_record_indices,
+            preview_width,
+            1,
+        )
+        .expect("expected second turn bounds for session a");
+        let saved_offset = 4;
+        assert!(session_a_end.saturating_sub(session_a_start) > saved_offset);
+        app.preview_scroll = session_a_start + saved_offset;
+        app.remember_selected_session_preview_state(preview_width);
+
+        app.selected = session_b_selected;
+        app.reset_preview_scroll_to_match();
+        app.selected = session_a_selected;
+        app.reset_preview_scroll_to_match();
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let restored_doc = app.session_browser_doc();
+        let restored_lines = preview_layout_lines(&restored_doc, None);
+        let (restored_start, restored_end) = preview_record_visual_bounds(
+            &restored_lines,
+            &restored_doc.line_record_indices,
+            preview_width,
+            1,
+        )
+        .expect("expected restored second turn bounds for session a");
+        assert!(restored_end.saturating_sub(restored_start) > saved_offset);
+        assert_eq!(app.selected, session_a_selected);
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.preview_scroll, restored_start + saved_offset);
     }
 
     #[test]
@@ -10912,6 +11162,7 @@ mod tests {
             ],
             selected: 1,
             offset: 0,
+            session_preview_states: HashMap::new(),
             selected_preview_record_idx: None,
             hovered_preview_record_idx: None,
             preview_scroll: 0,
