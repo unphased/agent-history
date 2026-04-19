@@ -4665,19 +4665,30 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             if let Some((_, record_idx)) =
                                 app.viewport_hit_at_mouse(content, adjusted_mouse)
                             {
+                                let top_row =
+                                    app.viewport_turn_top_row(record_idx).unwrap_or_else(|| {
+                                        adjusted_mouse.row.saturating_sub(content.y) as usize
+                                    });
                                 if app.focused_record_idx == Some(record_idx)
                                     && app.last_clicked_record_idx == Some(record_idx)
                                 {
                                     app.cycle_turn_expansion(record_idx);
-                                }
-                                let anchor_frac = if preview_height == 0 {
-                                    0.3
+                                    app.reveal_turn_top_near_row(
+                                        record_idx,
+                                        top_row,
+                                        preview_width,
+                                        preview_height,
+                                    );
                                 } else {
-                                    (adjusted_mouse.row.saturating_sub(content.y) as f32
-                                        / preview_height as f32)
-                                        .clamp(0.0, 1.0)
-                                };
-                                app.reveal_turn_with_anchor(record_idx, anchor_frac);
+                                    let anchor_frac = if preview_height == 0 {
+                                        0.3
+                                    } else {
+                                        (adjusted_mouse.row.saturating_sub(content.y) as f32
+                                            / preview_height as f32)
+                                            .clamp(0.0, 1.0)
+                                    };
+                                    app.reveal_turn_with_anchor(record_idx, anchor_frac);
+                                }
                                 app.last_clicked_record_idx = Some(record_idx);
                             }
                         } else {
@@ -6513,6 +6524,52 @@ impl App {
         self.last_viewport_result = None;
     }
 
+    fn viewport_turn_top_row(&self, record_idx: usize) -> Option<usize> {
+        self.last_viewport_result
+            .as_ref()?
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, idx)| idx) == Some(record_idx))
+    }
+
+    fn reveal_turn_top_near_row(
+        &mut self,
+        record_idx: usize,
+        desired_top_row: usize,
+        preview_width: usize,
+        preview_height: usize,
+    ) {
+        if preview_width == 0 || preview_height == 0 {
+            return;
+        }
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        let Some(turn_idx) = self.scope_position_for_record(&scope_turns, record_idx) else {
+            return;
+        };
+        let turn_height = self.turn_visual_height(&scope_turns, turn_idx, preview_width);
+        let top_row = if turn_height > preview_height {
+            0
+        } else {
+            desired_top_row.min(preview_height.saturating_sub(turn_height))
+        };
+        let anchor_frac = if preview_height <= 1 {
+            0.0
+        } else {
+            top_row as f32 / preview_height.saturating_sub(1) as f32
+        };
+        self.focused_record_idx = Some(record_idx);
+        self.selected_preview_record_idx = Some(record_idx);
+        self.viewport_pin = ViewportPin::Focused {
+            turn_idx,
+            line_offset: 0,
+            anchor_frac,
+        };
+        self.last_viewport_result = None;
+        if matches!(self.browser_mode, BrowserMode::Chrono) {
+            self.sync_selected_session_from_focus();
+        }
+    }
+
     fn cycle_focused_turn_expansion(&mut self, preview_width: usize, preview_height: usize) {
         if self.show_telemetry || preview_width == 0 || preview_height == 0 {
             return;
@@ -6529,8 +6586,9 @@ impl App {
         else {
             return;
         };
+        let top_row = self.viewport_turn_top_row(record_idx).unwrap_or(0);
         self.cycle_turn_expansion(record_idx);
-        self.reveal_turn_with_anchor(record_idx, 0.3);
+        self.reveal_turn_top_near_row(record_idx, top_row, preview_width, preview_height);
     }
 
     fn ensure_turn_cached(
@@ -12476,6 +12534,170 @@ mod tests {
             }
         ));
         assert_eq!(app.input_mode, InputMode::PreviewNav);
+    }
+
+    fn visible_turn_top_row(
+        app: &mut App,
+        record_idx: usize,
+        preview_height: usize,
+        preview_width: usize,
+    ) -> usize {
+        let viewport = app.fill_viewport(preview_height, preview_width);
+        let row = viewport
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, idx)| idx) == Some(record_idx))
+            .expect("expected visible turn row");
+        app.last_viewport_result = Some(viewport);
+        row
+    }
+
+    fn click_visible_preview_turn(app: &mut App, area: Rect, preview_area: Rect, top_row: usize) {
+        route_mouse(
+            app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: preview_area.x + 2,
+                row: preview_area.y + 1 + top_row as u16,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+    }
+
+    #[test]
+    fn clicking_focused_turn_cycle_preserves_top_row_when_expanded_turn_still_fits() {
+        let all = (1..=8)
+            .map(|idx| {
+                mr(
+                    Some("2026-02-10T00:00:01Z"),
+                    Role::User,
+                    &format!("turn {idx} first line\nturn {idx} second line"),
+                    "a",
+                    SourceKind::CodexSessionJsonl,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let area = Rect::new(0, 0, 100, 20);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let record_idx = 4;
+        app.focused_record_idx = Some(record_idx);
+        app.selected_preview_record_idx = Some(record_idx);
+        app.last_clicked_record_idx = Some(record_idx);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: record_idx,
+            line_offset: 0,
+            anchor_frac: 0.45,
+        };
+        let before_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+
+        click_visible_preview_turn(&mut app, area, preview_area, before_row);
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+        let after_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+        assert_eq!(after_row, before_row);
+    }
+
+    #[test]
+    fn clicking_focused_turn_cycle_shifts_up_only_to_fit_expanded_turn() {
+        let all = (1..=14)
+            .map(|idx| {
+                mr(
+                    Some("2026-02-10T00:00:01Z"),
+                    Role::User,
+                    &format!("turn {idx} first line\nturn {idx} second line"),
+                    "a",
+                    SourceKind::CodexSessionJsonl,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let area = Rect::new(0, 0, 100, 14);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let record_idx = 9;
+        app.focused_record_idx = Some(record_idx);
+        app.selected_preview_record_idx = Some(record_idx);
+        app.last_clicked_record_idx = Some(record_idx);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: record_idx,
+            line_offset: 0,
+            anchor_frac: 1.0,
+        };
+        let before_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+
+        click_visible_preview_turn(&mut app, area, preview_area, before_row);
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+        let scope_turns = app.resolve_turn_scope_indices().to_vec();
+        let turn_idx = app
+            .scope_position_for_record(&scope_turns, record_idx)
+            .expect("expected record in scope");
+        let turn_height = app.turn_visual_height(&scope_turns, turn_idx, preview_width);
+        let after_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+        assert!(after_row < before_row);
+        assert_eq!(after_row + turn_height, preview_height);
+    }
+
+    #[test]
+    fn clicking_focused_turn_cycle_pins_taller_expanded_turn_to_top() {
+        let tall_compact_turn = (1..=12)
+            .map(|idx| format!("paragraph {idx} first line"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let all = (1..=10)
+            .map(|idx| {
+                let text = if idx == 6 {
+                    tall_compact_turn.clone()
+                } else {
+                    format!("turn {idx}")
+                };
+                mr(
+                    Some("2026-02-10T00:00:01Z"),
+                    Role::User,
+                    &text,
+                    "a",
+                    SourceKind::CodexSessionJsonl,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let area = Rect::new(0, 0, 100, 14);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let record_idx = 5;
+        app.focused_record_idx = Some(record_idx);
+        app.selected_preview_record_idx = Some(record_idx);
+        app.last_clicked_record_idx = Some(record_idx);
+        app.viewport_pin = ViewportPin::Focused {
+            turn_idx: record_idx,
+            line_offset: 0,
+            anchor_frac: 0.5,
+        };
+        let before_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+        assert!(before_row > 0);
+
+        click_visible_preview_turn(&mut app, area, preview_area, before_row);
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+        let scope_turns = app.resolve_turn_scope_indices().to_vec();
+        let turn_idx = app
+            .scope_position_for_record(&scope_turns, record_idx)
+            .expect("expected record in scope");
+        assert!(app.turn_visual_height(&scope_turns, turn_idx, preview_width) > preview_height);
+        let after_row = visible_turn_top_row(&mut app, record_idx, preview_height, preview_width);
+        assert_eq!(after_row, 0);
     }
 
     #[test]
