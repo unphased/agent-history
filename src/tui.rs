@@ -6170,28 +6170,6 @@ impl App {
         }
     }
 
-    fn restore_viewport_pin(
-        &self,
-        scope_turns: &[usize],
-        pin: PersistedPin,
-    ) -> Option<ViewportPin> {
-        match pin {
-            PersistedPin::Top => Some(ViewportPin::Top),
-            PersistedPin::Bottom => Some(ViewportPin::Bottom),
-            PersistedPin::Focused {
-                anchor_record_idx,
-                line_offset,
-                anchor_frac,
-            } => self
-                .scope_position_for_record(scope_turns, anchor_record_idx)
-                .map(|turn_idx| ViewportPin::Focused {
-                    turn_idx,
-                    line_offset,
-                    anchor_frac,
-                }),
-        }
-    }
-
     fn persist_viewport_pin(&self, scope_turns: &[usize], pin: ViewportPin) -> PersistedPin {
         match pin {
             ViewportPin::Top => PersistedPin::Top,
@@ -6282,16 +6260,14 @@ impl App {
             return;
         }
 
-        let (saved_focus, saved_pin) = match scope {
+        let saved_focus = match scope {
             TurnScope::Session { session_idx } => self
                 .session_preview_states
                 .get(&session_idx)
-                .map(|state| (state.focused_record_idx, state.pin))
-                .unwrap_or((None, PersistedPin::Top)),
+                .and_then(|state| state.focused_record_idx),
             TurnScope::Chrono => self
                 .chrono_viewport_state
-                .map(|state| (state.focused_record_idx, state.pin))
-                .unwrap_or((None, PersistedPin::Top)),
+                .and_then(|state| state.focused_record_idx),
         };
 
         let focused_record_idx = saved_focus
@@ -6303,19 +6279,7 @@ impl App {
             .or_else(|| scope_turns.first().copied());
         self.focused_record_idx = focused_record_idx;
         self.selected_preview_record_idx = focused_record_idx;
-
-        self.viewport_pin = self
-            .restore_viewport_pin(&scope_turns, saved_pin)
-            .unwrap_or_else(|| {
-                let turn_idx = focused_record_idx
-                    .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
-                    .unwrap_or(0);
-                ViewportPin::Focused {
-                    turn_idx,
-                    line_offset: 0,
-                    anchor_frac: 0.3,
-                }
-            });
+        self.viewport_pin = ViewportPin::Top;
 
         if matches!(self.browser_mode, BrowserMode::Chrono) {
             self.sync_selected_session_from_focus();
@@ -8401,12 +8365,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         };
         let preview_layout = preview_layout_lines(&preview_doc, turn_anchor_record_idx);
         if app.preview_scroll_reset_pending {
-            let first_match_visual_line = preview_visual_line_offset(
-                &preview_layout,
-                preview_doc.first_match_line,
-                preview_inner_width,
-            );
-            app.preview_scroll = first_match_visual_line.saturating_sub(2);
+            app.preview_scroll = 0;
             app.preview_scroll_reset_pending = false;
         }
         let preview_duration_ms = preview_started.elapsed().as_millis();
@@ -9868,11 +9827,11 @@ mod tests {
     }
 
     #[test]
-    fn update_results_sets_preview_scroll_near_first_matching_line() {
+    fn preview_reset_starts_at_top_even_when_first_match_is_lower() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
             Role::User,
-            "line 1\nline 2\nneedle here\nline 4",
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nneedle here\nline 8",
             "a",
             SourceKind::CodexSessionJsonl,
         )];
@@ -9884,6 +9843,14 @@ mod tests {
         assert_eq!(doc.first_match_line, doc.matches[0].raw_line);
         assert_eq!(app.preview_scroll, 0);
         assert!(app.preview_scroll_reset_pending);
+
+        let area = Rect::new(0, 0, 100, 10);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        assert_eq!(app.preview_scroll, 0);
+        assert!(!app.preview_scroll_reset_pending);
     }
 
     #[test]
@@ -11991,7 +11958,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_position_is_restored_when_returning_to_a_session() {
+    fn session_browser_reset_starts_at_top_when_returning_to_a_session() {
         let session_a_turn = (1..=18)
             .map(|line| format!("session a line {line}"))
             .collect::<Vec<_>>()
@@ -12072,14 +12039,7 @@ mod tests {
         assert_eq!(app.selected, session_a_selected);
         assert_eq!(app.focused_record_idx, Some(1));
         assert_eq!(app.selected_preview_record_idx, Some(1));
-        assert!(matches!(
-            app.viewport_pin,
-            ViewportPin::Focused {
-                turn_idx: 1,
-                line_offset,
-                ..
-            } if line_offset == saved_offset
-        ));
+        assert!(matches!(app.viewport_pin, ViewportPin::Top));
     }
 
     #[test]
