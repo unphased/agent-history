@@ -1206,21 +1206,102 @@ fn render_turn_header_with_expansion(
     rec: &MessageRecord,
     turn_position_in_scope: usize,
     expansion: TurnExpansion,
+    previous_timestamp: Option<&str>,
 ) -> Line<'static> {
-    let role = match rec.role {
+    let role = role_label(rec.role);
+    let timestamp = match expansion {
+        TurnExpansion::OneLine | TurnExpansion::Compact => {
+            compact_turn_timestamp(rec.timestamp.as_deref(), previous_timestamp)
+        }
+        TurnExpansion::Simple | TurnExpansion::Full => short_ts(rec.timestamp.as_deref()),
+    };
+    let size = turn_size_indicator(&rec.text);
+    match expansion {
+        TurnExpansion::OneLine => Line::raw(format!(
+            "{} {} {} {} {}",
+            expansion.indicator(),
+            turn_position_in_scope + 1,
+            timestamp,
+            size,
+            compact_single_line(&rec.text)
+        )),
+        TurnExpansion::Compact => Line::raw(format!(
+            "{} {} {} {} phase:{} {}",
+            expansion.indicator(),
+            turn_position_in_scope + 1,
+            timestamp,
+            role_abbrev(rec.role),
+            abbrev_field(rec.phase.as_deref().unwrap_or("")),
+            size
+        )),
+        TurnExpansion::Simple | TurnExpansion::Full => Line::raw(format!(
+            "{} {}   {}   role: {role}   phase: {}   {}",
+            expansion.indicator(),
+            turn_position_in_scope + 1,
+            timestamp,
+            rec.phase.as_deref().unwrap_or(""),
+            size
+        )),
+    }
+}
+
+fn role_label(role: Role) -> &'static str {
+    match role {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::System => "system",
         Role::Tool => "tool",
         Role::Unknown => "unknown",
+    }
+}
+
+fn role_abbrev(role: Role) -> &'static str {
+    match role {
+        Role::User => "u",
+        Role::Assistant => "a",
+        Role::System => "s",
+        Role::Tool => "t",
+        Role::Unknown => "?",
+    }
+}
+
+fn abbrev_field(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    let max_chars = 12;
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        out.push('~');
+    }
+    out
+}
+
+fn turn_size_indicator(text: &str) -> String {
+    let lines = text.lines().count().max(usize::from(!text.is_empty()));
+    let chars = text.chars().count();
+    format!("[{lines}l {chars}c]")
+}
+
+fn compact_turn_timestamp(ts: Option<&str>, previous_ts: Option<&str>) -> String {
+    let current = short_ts(ts);
+    if current.is_empty() {
+        return current;
+    }
+    let Some(previous_ts) = previous_ts else {
+        return current;
     };
-    Line::raw(format!(
-        "{} {}   {}   role: {role}   phase: {}",
-        expansion.indicator(),
-        turn_position_in_scope + 1,
-        short_ts(rec.timestamp.as_deref()),
-        rec.phase.as_deref().unwrap_or("")
-    ))
+    let previous = short_ts(Some(previous_ts));
+    if current.len() >= 19 && previous.len() >= 19 {
+        if current.get(0..13) == previous.get(0..13) {
+            return current.get(14..19).unwrap_or(&current).to_string();
+        }
+        if current.get(0..10) == previous.get(0..10) {
+            return current.get(11..19).unwrap_or(&current).to_string();
+        }
+    }
+    current
 }
 
 fn render_compact_turn_body(text: &str) -> Vec<Line<'static>> {
@@ -6547,8 +6628,13 @@ impl App {
             return (Vec::new(), Vec::new());
         };
         let expansion = self.turn_expansion(record_idx);
+        let previous_timestamp = scope_idx
+            .checked_sub(1)
+            .and_then(|previous_idx| scope_turns.get(previous_idx))
+            .and_then(|&previous_record_idx| self.all.get(previous_record_idx))
+            .and_then(|previous| previous.timestamp.as_deref());
         let header_lines = wrap_preview_line(
-            &render_turn_header_with_expansion(&rec, scope_idx, expansion),
+            &render_turn_header_with_expansion(&rec, scope_idx, expansion, previous_timestamp),
             width,
         );
         let mut lines = Vec::with_capacity(
@@ -6593,8 +6679,13 @@ impl App {
             return 0;
         };
         let expansion = self.turn_expansion(record_idx);
+        let previous_timestamp = scope_idx
+            .checked_sub(1)
+            .and_then(|previous_idx| scope_turns.get(previous_idx))
+            .and_then(|&previous_record_idx| self.all.get(previous_record_idx))
+            .and_then(|previous| previous.timestamp.as_deref());
         let header_height = wrap_preview_line(
-            &render_turn_header_with_expansion(&rec, scope_idx, expansion),
+            &render_turn_header_with_expansion(&rec, scope_idx, expansion, previous_timestamp),
             width,
         )
         .len();
@@ -7039,7 +7130,17 @@ impl App {
                 TurnExpansion::OneLine
             };
             let rendered_body = render_turn_body(rec, expansion);
-            lines.push(render_turn_header_with_expansion(rec, pos, expansion));
+            let previous_timestamp = pos
+                .checked_sub(1)
+                .and_then(|previous_pos| record_idxs.get(previous_pos))
+                .and_then(|&previous_idx| self.all.get(previous_idx))
+                .and_then(|previous| previous.timestamp.as_deref());
+            lines.push(render_turn_header_with_expansion(
+                rec,
+                pos,
+                expansion,
+                previous_timestamp,
+            ));
             line_record_indices.push(Some(idx));
             line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_body.lines.len()));
             lines.extend(rendered_body.lines);
@@ -10621,8 +10722,8 @@ mod tests {
             1
         );
         assert!(rendered.iter().any(|line| line.contains("second body")));
-        assert!(!rendered.iter().any(|line| line.contains("first body")));
-        assert!(!rendered.iter().any(|line| line.contains("third body")));
+        assert!(!rendered.iter().any(|line| line == "first body"));
+        assert!(!rendered.iter().any(|line| line == "third body"));
     }
 
     #[test]
@@ -10674,6 +10775,46 @@ mod tests {
     }
 
     #[test]
+    fn compact_turn_headers_use_condensed_time_size_and_abbreviated_metadata() {
+        let mut rec = mr(
+            Some("2026-04-13T12:34:56Z"),
+            Role::Assistant,
+            "first content line\nsecond content line",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        rec.phase = Some("assistant-reply-phase".to_string());
+
+        let one_line = line_text(&render_turn_header_with_expansion(
+            &rec,
+            1,
+            TurnExpansion::OneLine,
+            Some("2026-04-13T12:33:00Z"),
+        ));
+        assert!(one_line.starts_with(". 2 34:56 [2l "));
+        assert!(one_line.contains("first content line"));
+        assert!(!one_line.contains("role:"));
+        assert!(!one_line.contains("phase:"));
+
+        let compact = line_text(&render_turn_header_with_expansion(
+            &rec,
+            1,
+            TurnExpansion::Compact,
+            Some("2026-04-13T12:33:00Z"),
+        ));
+        assert!(compact.starts_with(": 2 34:56 a phase:assistant-re~ [2l "));
+
+        let simple = line_text(&render_turn_header_with_expansion(
+            &rec,
+            1,
+            TurnExpansion::Simple,
+            Some("2026-04-13T12:33:00Z"),
+        ));
+        assert!(simple.contains("2026-04-13T12:34:56"));
+        assert!(simple.contains("role: assistant"));
+    }
+
+    #[test]
     fn session_browser_turns_start_one_line_and_click_cycles_expansion() {
         let all = vec![
             mr(
@@ -10696,7 +10837,8 @@ mod tests {
         let viewport = app.fill_viewport(20, 80);
         let rendered = viewport.lines.iter().map(line_text).collect::<Vec<_>>();
         assert!(rendered.iter().any(|line| line.starts_with(". 1")));
-        assert!(!rendered.iter().any(|line| line.contains("first body line")));
+        assert!(rendered.iter().any(|line| line.contains("first body line")));
+        assert!(!rendered.iter().any(|line| line == "second body line"));
 
         let area = Rect::new(0, 0, 100, 20);
         let geometry = app_geometry(area, &app);
