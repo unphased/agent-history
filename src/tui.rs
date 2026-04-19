@@ -6157,14 +6157,14 @@ impl App {
                     .filter(|hit| hit.session_idx == session_idx)?;
                 if preview_synced {
                     hit.matched_record_idx.or_else(|| {
-                        self.session_records
+                        self.sessions
                             .get(session_idx)
-                            .and_then(|record_indices| record_indices.first().copied())
+                            .map(|session| session.first_user_idx)
                     })
                 } else {
-                    self.session_records
+                    self.sessions
                         .get(session_idx)
-                        .and_then(|record_indices| record_indices.first().copied())
+                        .map(|session| session.first_user_idx)
                 }
             }
             TurnScope::Chrono => {
@@ -7813,14 +7813,16 @@ impl App {
             if scope_turns.len() <= 1 {
                 return;
             }
-            let current_pos = match self.viewport_pin {
-                ViewportPin::Top => 0,
-                ViewportPin::Bottom => scope_turns.len().saturating_sub(1),
-                ViewportPin::Focused { .. } => self
-                    .focused_record_idx
-                    .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
-                    .unwrap_or(0),
-            };
+            let current_pos = self
+                .focused_record_idx
+                .and_then(|record_idx| self.scope_position_for_record(&scope_turns, record_idx))
+                .unwrap_or_else(|| match self.viewport_pin {
+                    ViewportPin::Top => 0,
+                    ViewportPin::Bottom => scope_turns.len().saturating_sub(1),
+                    ViewportPin::Focused { turn_idx, .. } => {
+                        turn_idx.min(scope_turns.len().saturating_sub(1))
+                    }
+                });
             let target_pos = if dir >= 0 {
                 if current_pos + 1 < scope_turns.len() {
                     current_pos + 1
@@ -10405,7 +10407,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_session_browser_focus_uses_first_record_not_session_opener() {
+    fn empty_session_browser_focus_uses_session_opener_but_nav_starts_from_focus() {
         let all = vec![
             mr(
                 Some("2026-04-13T00:00:01Z"),
@@ -10421,6 +10423,13 @@ mod tests {
                 "session-a",
                 SourceKind::CodexSessionJsonl,
             ),
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::Assistant,
+                "assistant response",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
         ];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
@@ -10429,11 +10438,21 @@ mod tests {
             app.selected_record().map(|record| record.role),
             Some(Role::User)
         );
-        assert_eq!(app.focused_record_idx, Some(0));
-        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(app.focused_record_idx, Some(1));
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert!(matches!(app.viewport_pin, ViewportPin::Top));
         assert_eq!(
             app.turns_preview_title(app.focused_record_idx),
-            "Turns  turn 1/2"
+            "Turns  turn 2/3"
+        );
+
+        app.jump_preview_record(1, 80, 10);
+
+        assert_eq!(app.focused_record_idx, Some(2));
+        assert_eq!(app.selected_preview_record_idx, Some(2));
+        assert_eq!(
+            app.turns_preview_title(app.focused_record_idx),
+            "Turns  turn 3/3"
         );
     }
 
