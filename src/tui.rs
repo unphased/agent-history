@@ -152,9 +152,37 @@ struct CachedTurn {
     body_height: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TurnExpansion {
+    OneLine,
+    Compact,
+    Simple,
+    Full,
+}
+
+impl TurnExpansion {
+    fn next(self) -> Self {
+        match self {
+            Self::OneLine => Self::Compact,
+            Self::Compact => Self::Simple,
+            Self::Simple => Self::Full,
+            Self::Full => Self::OneLine,
+        }
+    }
+
+    fn indicator(self) -> char {
+        match self {
+            Self::OneLine => '.',
+            Self::Compact => ':',
+            Self::Simple => '+',
+            Self::Full => '*',
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct TurnCache {
-    entries: HashMap<(usize, bool), CachedTurn>,
+    entries: HashMap<(usize, TurnExpansion), CachedTurn>,
     cached_width: usize,
 }
 
@@ -1174,7 +1202,11 @@ fn render_session_header(sess: &SessionSummary, turn_count: usize) -> Vec<Line<'
     ]
 }
 
-fn render_turn_header(rec: &MessageRecord, turn_position_in_scope: usize) -> Line<'static> {
+fn render_turn_header_with_expansion(
+    rec: &MessageRecord,
+    turn_position_in_scope: usize,
+    expansion: TurnExpansion,
+) -> Line<'static> {
     let role = match rec.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -1183,34 +1215,86 @@ fn render_turn_header(rec: &MessageRecord, turn_position_in_scope: usize) -> Lin
         Role::Unknown => "unknown",
     };
     Line::raw(format!(
-        "turn {}   {}   role: {role}   phase: {}",
+        "{} {}   {}   role: {role}   phase: {}",
+        expansion.indicator(),
         turn_position_in_scope + 1,
         short_ts(rec.timestamp.as_deref()),
         rec.phase.as_deref().unwrap_or("")
     ))
 }
 
-fn render_turn_body(rec: &MessageRecord, is_expanded: bool) -> RenderedTurnBody {
+fn render_compact_turn_body(text: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if is_expanded {
-        lines.push(Line::raw(format!(
-            "file: {}:{}",
-            rec.file.display(),
-            rec.line
-        )));
-        if !rec.images.is_empty() {
-            lines.push(Line::raw(format!("images: {}", rec.images.len())));
-            for path in materialize_record_images(rec) {
-                lines.push(Line::raw(format!("image file: {path}")));
-            }
+    for paragraph in text.split("\n\n") {
+        let mut paragraph_lines = paragraph.lines().filter(|line| !line.trim().is_empty());
+        let Some(first_line) = paragraph_lines.next() else {
+            continue;
+        };
+        let remainder = paragraph_lines.collect::<Vec<_>>();
+        let remaining_lines = remainder.len();
+        let remaining_chars = remainder
+            .iter()
+            .map(|line| line.chars().count())
+            .sum::<usize>();
+        let suffix = if remaining_lines == 0 && remaining_chars == 0 {
+            String::new()
+        } else {
+            format!("  [... {remaining_lines} lines, {remaining_chars} chars more]")
+        };
+        lines.push(highlighted_line(
+            &format!("{}{}", first_line.trim_end(), suffix),
+            "",
+            Style::default(),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw("(empty)"));
+    }
+    lines
+}
+
+fn render_turn_metadata_lines(rec: &MessageRecord) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw(format!(
+        "file: {}:{}",
+        rec.file.display(),
+        rec.line
+    ))];
+    if !rec.images.is_empty() {
+        lines.push(Line::raw(format!("images: {}", rec.images.len())));
+        for path in materialize_record_images(rec) {
+            lines.push(Line::raw(format!("image file: {path}")));
         }
     }
-    lines.extend(render_preview_message_lines(
-        &rec.text,
-        "",
-        Style::default(),
-    ));
-    lines.push(Line::raw(""));
+    lines
+}
+
+fn render_turn_body(rec: &MessageRecord, expansion: TurnExpansion) -> RenderedTurnBody {
+    let mut lines = Vec::new();
+    match expansion {
+        TurnExpansion::OneLine => {}
+        TurnExpansion::Compact => {
+            lines.extend(render_compact_turn_body(&rec.text));
+            lines.push(Line::raw(""));
+        }
+        TurnExpansion::Simple => {
+            lines.extend(render_preview_message_lines(
+                &rec.text,
+                "",
+                Style::default(),
+            ));
+            lines.push(Line::raw(""));
+        }
+        TurnExpansion::Full => {
+            lines.extend(render_turn_metadata_lines(rec));
+            lines.push(Line::raw(""));
+            lines.extend(render_preview_message_lines(
+                &rec.text,
+                "",
+                Style::default(),
+            ));
+            lines.push(Line::raw(""));
+        }
+    }
     RenderedTurnBody { lines }
 }
 
@@ -3051,10 +3135,12 @@ struct App {
     selected_preview_record_idx: Option<usize>,
     focused_record_idx: Option<usize>,
     hovered_record_idx: Option<usize>,
+    last_clicked_record_idx: Option<usize>,
     hovered_query_tag_filter: Option<TagFilter>,
     viewport_pin: ViewportPin,
     last_viewport_result: Option<ViewportResult>,
     turn_cache: TurnCache,
+    turn_expansions: HashMap<usize, TurnExpansion>,
     chrono_turns: Vec<usize>,
     browser_mode: BrowserMode,
     preview_scroll: usize,
@@ -3178,10 +3264,12 @@ fn run_app(
         selected_preview_record_idx: None,
         focused_record_idx: None,
         hovered_record_idx: None,
+        last_clicked_record_idx: None,
         hovered_query_tag_filter: None,
         viewport_pin: ViewportPin::Top,
         last_viewport_result: None,
         turn_cache: TurnCache::default(),
+        turn_expansions: HashMap::new(),
         chrono_turns: Vec::new(),
         browser_mode: BrowserMode::from_ui_state(ui_state.browser_mode),
         preview_scroll: 0,
@@ -4542,6 +4630,11 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                             if let Some((_, record_idx)) =
                                 app.viewport_hit_at_mouse(content, adjusted_mouse)
                             {
+                                if app.focused_record_idx == Some(record_idx)
+                                    && app.last_clicked_record_idx == Some(record_idx)
+                                {
+                                    app.cycle_turn_expansion(record_idx);
+                                }
                                 let anchor_frac = if preview_height == 0 {
                                     0.3
                                 } else {
@@ -4550,6 +4643,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                                         .clamp(0.0, 1.0)
                                 };
                                 app.reveal_turn_with_anchor(record_idx, anchor_frac);
+                                app.last_clicked_record_idx = Some(record_idx);
                             }
                         } else {
                             let preview_doc = app.build_preview_doc();
@@ -6367,20 +6461,37 @@ impl App {
         }
     }
 
+    fn turn_expansion(&self, record_idx: usize) -> TurnExpansion {
+        self.turn_expansions
+            .get(&record_idx)
+            .copied()
+            .unwrap_or(TurnExpansion::OneLine)
+    }
+
+    fn cycle_turn_expansion(&mut self, record_idx: usize) {
+        let next = self.turn_expansion(record_idx).next();
+        if matches!(next, TurnExpansion::OneLine) {
+            self.turn_expansions.remove(&record_idx);
+        } else {
+            self.turn_expansions.insert(record_idx, next);
+        }
+        self.last_viewport_result = None;
+    }
+
     fn ensure_turn_cached(
         &mut self,
         record_idx: usize,
-        is_expanded: bool,
+        expansion: TurnExpansion,
         width: usize,
     ) -> Option<&CachedTurn> {
         if self.turn_cache.cached_width != width {
             self.turn_cache.entries.clear();
             self.turn_cache.cached_width = width;
         }
-        let key = (record_idx, is_expanded);
+        let key = (record_idx, expansion);
         if !self.turn_cache.entries.contains_key(&key) {
             let rec = self.all.get(record_idx)?;
-            let rendered_body = render_turn_body(rec, is_expanded);
+            let rendered_body = render_turn_body(rec, expansion);
             let mut body_lines = Vec::new();
             for line in rendered_body.lines {
                 body_lines.extend(wrap_preview_line(&line, width));
@@ -6435,15 +6546,15 @@ impl App {
         let Some(rec) = self.all.get(record_idx).cloned() else {
             return (Vec::new(), Vec::new());
         };
-        let header_lines = wrap_preview_line(&render_turn_header(&rec, scope_idx), width);
+        let expansion = self.turn_expansion(record_idx);
+        let header_lines = wrap_preview_line(
+            &render_turn_header_with_expansion(&rec, scope_idx, expansion),
+            width,
+        );
         let mut lines = Vec::with_capacity(
             header_lines.len()
                 + self
-                    .ensure_turn_cached(
-                        record_idx,
-                        self.focused_record_idx == Some(record_idx),
-                        width,
-                    )
+                    .ensure_turn_cached(record_idx, expansion, width)
                     .map(|cached| cached.body_height)
                     .unwrap_or(0)
                 + usize::from(self.chrono_separator_after(scope_turns, scope_idx)),
@@ -6453,11 +6564,7 @@ impl App {
             lines.push(line);
             line_turn_map.push(Some((scope_idx, record_idx)));
         }
-        if let Some(cached) = self.ensure_turn_cached(
-            record_idx,
-            self.focused_record_idx == Some(record_idx),
-            width,
-        ) {
+        if let Some(cached) = self.ensure_turn_cached(record_idx, expansion, width) {
             lines.extend(cached.body_lines.iter().cloned());
             line_turn_map.extend(std::iter::repeat_n(
                 Some((scope_idx, record_idx)),
@@ -6485,13 +6592,14 @@ impl App {
         let Some(rec) = self.all.get(record_idx).cloned() else {
             return 0;
         };
-        let header_height = wrap_preview_line(&render_turn_header(&rec, scope_idx), width).len();
+        let expansion = self.turn_expansion(record_idx);
+        let header_height = wrap_preview_line(
+            &render_turn_header_with_expansion(&rec, scope_idx, expansion),
+            width,
+        )
+        .len();
         let body_height = self
-            .ensure_turn_cached(
-                record_idx,
-                self.focused_record_idx == Some(record_idx),
-                width,
-            )
+            .ensure_turn_cached(record_idx, expansion, width)
             .map(|cached| cached.body_height)
             .unwrap_or(0);
         header_height
@@ -6925,8 +7033,13 @@ impl App {
             let Some(rec) = self.all.get(idx) else {
                 continue;
             };
-            let rendered_body = render_turn_body(rec, Some(idx) == expanded_record_idx);
-            lines.push(render_turn_header(rec, pos));
+            let expansion = if Some(idx) == expanded_record_idx {
+                TurnExpansion::Full
+            } else {
+                TurnExpansion::OneLine
+            };
+            let rendered_body = render_turn_body(rec, expansion);
+            lines.push(render_turn_header_with_expansion(rec, pos, expansion));
             line_record_indices.push(Some(idx));
             line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_body.lines.len()));
             lines.extend(rendered_body.lines);
@@ -7835,6 +7948,7 @@ impl App {
                     .unwrap_or(scope_turns.len().saturating_sub(1))
             };
             if let Some(&record_idx) = scope_turns.get(target_pos) {
+                self.last_clicked_record_idx = None;
                 self.focused_record_idx = Some(record_idx);
                 self.selected_preview_record_idx = Some(record_idx);
                 self.viewport_pin = ViewportPin::Focused {
@@ -9100,10 +9214,12 @@ mod tests {
             selected_preview_record_idx: None,
             focused_record_idx: None,
             hovered_record_idx: None,
+            last_clicked_record_idx: None,
             hovered_query_tag_filter: None,
             viewport_pin: ViewportPin::Top,
             last_viewport_result: None,
             turn_cache: TurnCache::default(),
+            turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
             preview_scroll: 0,
@@ -9844,10 +9960,12 @@ mod tests {
             selected_preview_record_idx: None,
             focused_record_idx: None,
             hovered_record_idx: None,
+            last_clicked_record_idx: None,
             hovered_query_tag_filter: None,
             viewport_pin: ViewportPin::Top,
             last_viewport_result: None,
             turn_cache: TurnCache::default(),
+            turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
             preview_scroll: 0,
@@ -9967,10 +10085,12 @@ mod tests {
             selected_preview_record_idx: None,
             focused_record_idx: None,
             hovered_record_idx: None,
+            last_clicked_record_idx: None,
             hovered_query_tag_filter: None,
             viewport_pin: ViewportPin::Top,
             last_viewport_result: None,
             turn_cache: TurnCache::default(),
+            turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
             preview_scroll: 0,
@@ -10457,7 +10577,7 @@ mod tests {
     }
 
     #[test]
-    fn session_browser_doc_only_expands_selected_turn_metadata() {
+    fn session_browser_doc_expands_only_selected_turn_fully() {
         let mut second = mr(
             Some("2026-04-13T00:00:02Z"),
             Role::Assistant,
@@ -10490,9 +10610,9 @@ mod tests {
         let doc = app.session_browser_doc();
         let rendered = doc.lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert!(rendered.iter().any(|line| line.contains("turn 1")));
-        assert!(rendered.iter().any(|line| line.contains("turn 2")));
-        assert!(rendered.iter().any(|line| line.contains("turn 3")));
+        assert!(rendered.iter().any(|line| line.starts_with(". 1")));
+        assert!(rendered.iter().any(|line| line.starts_with("* 2")));
+        assert!(rendered.iter().any(|line| line.starts_with(". 3")));
         assert_eq!(
             rendered
                 .iter()
@@ -10500,9 +10620,135 @@ mod tests {
                 .count(),
             1
         );
-        assert!(rendered.iter().any(|line| line.contains("first body")));
         assert!(rendered.iter().any(|line| line.contains("second body")));
-        assert!(rendered.iter().any(|line| line.contains("third body")));
+        assert!(!rendered.iter().any(|line| line.contains("first body")));
+        assert!(!rendered.iter().any(|line| line.contains("third body")));
+    }
+
+    #[test]
+    fn turn_expansion_modes_render_distinct_detail_levels() {
+        let mut rec = mr(
+            Some("2026-04-13T00:00:01Z"),
+            Role::User,
+            "para one line 1\npara one line 2\n\npara two line 1\npara two line 2",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        rec.phase = Some("prompt".to_string());
+
+        let one_line = render_turn_body(&rec, TurnExpansion::OneLine);
+        assert!(one_line.lines.is_empty());
+
+        let compact = render_turn_body(&rec, TurnExpansion::Compact);
+        let compact_text = compact.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(
+            compact_text
+                .iter()
+                .any(|line| line.contains("para one line 1"))
+        );
+        assert!(
+            compact_text
+                .iter()
+                .any(|line| line.contains("para two line 1"))
+        );
+        assert!(compact_text.iter().any(|line| line.contains("chars more")));
+        assert!(!compact_text.iter().any(|line| line.contains("file: ")));
+
+        let simple = render_turn_body(&rec, TurnExpansion::Simple);
+        let simple_text = simple.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(
+            simple_text
+                .iter()
+                .any(|line| line.contains("para one line 2"))
+        );
+        assert!(!simple_text.iter().any(|line| line.contains("file: ")));
+
+        let full = render_turn_body(&rec, TurnExpansion::Full);
+        let full_text = full.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(full_text.iter().any(|line| line.starts_with("file: ")));
+        assert!(
+            full_text
+                .iter()
+                .any(|line| line.contains("para two line 2"))
+        );
+    }
+
+    #[test]
+    fn session_browser_turns_start_one_line_and_click_cycles_expansion() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first body line\nsecond body line",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "assistant body",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let viewport = app.fill_viewport(20, 80);
+        let rendered = viewport.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line.starts_with(". 1")));
+        assert!(!rendered.iter().any(|line| line.contains("first body line")));
+
+        let area = Rect::new(0, 0, 100, 20);
+        let geometry = app_geometry(area, &app);
+        let preview_area = geometry.turn_preview;
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        app.viewport_pin = ViewportPin::Top;
+        let viewport = app.fill_viewport(preview_height, preview_width);
+        let first_row = viewport
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(0))
+            .expect("expected visible first turn row");
+        app.last_viewport_result = Some(viewport);
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: preview_area.x + 2,
+                row: preview_area.y + 1 + first_row as u16,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.turn_expansion(0), TurnExpansion::OneLine);
+        assert_eq!(app.focused_record_idx, Some(0));
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+
+        let viewport = app.fill_viewport(preview_height, preview_width);
+        let first_row = viewport
+            .line_turn_map
+            .iter()
+            .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(0))
+            .expect("expected visible first turn row");
+        app.last_viewport_result = Some(viewport);
+
+        route_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: preview_area.x + 2,
+                row: preview_area.y + 1 + first_row as u16,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.turn_expansion(0), TurnExpansion::Compact);
+        assert_eq!(app.focused_record_idx, Some(0));
+        assert_eq!(app.selected_preview_record_idx, Some(0));
     }
 
     #[test]
@@ -11863,15 +12109,17 @@ mod tests {
         let area = Rect::new(0, 0, 100, 30);
         let geometry = app_geometry(area, &app);
         let preview_area = geometry.turn_preview;
-        let doc = app.session_browser_doc();
-        let starts = preview_section_start_lines(&doc.line_record_indices);
+        let preview_width = preview_area.width.saturating_sub(2) as usize;
+        let preview_height = preview_area.height.saturating_sub(2) as usize;
+        let viewport = app.fill_viewport(preview_height, preview_width);
         let second_turn_y = preview_area.y
             + 1
-            + preview_visual_line_offset(
-                &doc.lines,
-                starts[1],
-                preview_area.width.saturating_sub(2) as usize,
-            ) as u16;
+            + viewport
+                .line_turn_map
+                .iter()
+                .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(1))
+                .expect("expected visible second turn row") as u16;
+        app.last_viewport_result = Some(viewport);
         route_mouse(
             &mut app,
             area,
@@ -11925,13 +12173,15 @@ mod tests {
         let preview_area = geometry.turn_preview;
         let preview_width = preview_area.width.saturating_sub(2) as usize;
         let preview_height = preview_area.height.saturating_sub(2) as usize;
-        let doc = app.session_browser_doc();
-        let anchor_record_idx = app.selected_anchor_record_idx(preview_width, preview_height);
-        let preview_lines = preview_layout_lines(&doc, anchor_record_idx);
-        let starts = preview_section_start_lines(&doc.line_record_indices);
+        let viewport = app.fill_viewport(preview_height, preview_width);
         let second_turn_y = preview_area.y
             + 1
-            + preview_visual_line_offset(&preview_lines, starts[1], preview_width) as u16;
+            + viewport
+                .line_turn_map
+                .iter()
+                .position(|entry| entry.map(|(_, record_idx)| record_idx) == Some(1))
+                .expect("expected visible second turn row") as u16;
+        app.last_viewport_result = Some(viewport);
 
         route_mouse(
             &mut app,
@@ -12685,6 +12935,7 @@ mod tests {
         )];
         let mut app = ready_app_with_indexed_data(all);
         app.update_results();
+        app.turn_expansions.insert(0, TurnExpansion::Simple);
 
         app.scroll_preview_page(1, 6, 80);
         assert!(matches!(
@@ -12839,9 +13090,11 @@ mod tests {
             selected_preview_record_idx: None,
             focused_record_idx: None,
             hovered_record_idx: None,
+            last_clicked_record_idx: None,
             viewport_pin: ViewportPin::Top,
             last_viewport_result: None,
             turn_cache: TurnCache::default(),
+            turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
             preview_scroll: 0,
