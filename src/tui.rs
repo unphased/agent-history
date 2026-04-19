@@ -6157,14 +6157,14 @@ impl App {
                     .filter(|hit| hit.session_idx == session_idx)?;
                 if preview_synced {
                     hit.matched_record_idx.or_else(|| {
-                        self.sessions
+                        self.session_records
                             .get(session_idx)
-                            .map(|session| session.first_user_idx)
+                            .and_then(|record_indices| record_indices.first().copied())
                     })
                 } else {
-                    self.sessions
+                    self.session_records
                         .get(session_idx)
-                        .map(|session| session.first_user_idx)
+                        .and_then(|record_indices| record_indices.first().copied())
                 }
             }
             TurnScope::Chrono => {
@@ -10402,6 +10402,39 @@ mod tests {
         app.update_results();
 
         assert_eq!(app.turns_preview_title(Some(1)), "Turns  turn 2/3");
+    }
+
+    #[test]
+    fn empty_session_browser_focus_uses_first_record_not_session_opener() {
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::System,
+                "system context",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::User,
+                "first user prompt",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+
+        assert_eq!(
+            app.selected_record().map(|record| record.role),
+            Some(Role::User)
+        );
+        assert_eq!(app.focused_record_idx, Some(0));
+        assert_eq!(app.selected_preview_record_idx, Some(0));
+        assert_eq!(
+            app.turns_preview_title(app.focused_record_idx),
+            "Turns  turn 1/2"
+        );
     }
 
     #[test]
