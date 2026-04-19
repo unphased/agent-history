@@ -1193,7 +1193,11 @@ fn render_turn_header(rec: &MessageRecord, turn_position_in_scope: usize) -> Lin
 fn render_turn_body(rec: &MessageRecord, is_expanded: bool) -> RenderedTurnBody {
     let mut lines = Vec::new();
     if is_expanded {
-        lines.push(Line::raw(format!("file: {}:{}", rec.file.display(), rec.line)));
+        lines.push(Line::raw(format!(
+            "file: {}:{}",
+            rec.file.display(),
+            rec.line
+        )));
         if !rec.images.is_empty() {
             lines.push(Line::raw(format!("images: {}", rec.images.len())));
             for path in materialize_record_images(rec) {
@@ -3434,7 +3438,8 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
 fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
     app.all = records;
     let (sessions, session_records) = build_session_index(&app.all);
-    app.record_session_idx_by_record = build_record_session_idx_map(&session_records, app.all.len());
+    app.record_session_idx_by_record =
+        build_record_session_idx_map(&session_records, app.all.len());
     app.indexing.records = app.all.len();
     app.indexing.sessions = sessions.len();
     app.sessions = sessions;
@@ -6147,7 +6152,9 @@ impl App {
     fn default_focus_record_idx(&self, scope: TurnScope, preview_synced: bool) -> Option<usize> {
         match scope {
             TurnScope::Session { session_idx } => {
-                let hit = self.selected_hit().filter(|hit| hit.session_idx == session_idx)?;
+                let hit = self
+                    .selected_hit()
+                    .filter(|hit| hit.session_idx == session_idx)?;
                 if preview_synced {
                     hit.matched_record_idx.or_else(|| {
                         self.sessions
@@ -6167,6 +6174,28 @@ impl App {
                     .and_then(|record_indices| record_indices.first().copied())
                     .or_else(|| self.chrono_turns.first().copied())
             }
+        }
+    }
+
+    fn restore_viewport_pin(
+        &self,
+        scope_turns: &[usize],
+        pin: PersistedPin,
+    ) -> Option<ViewportPin> {
+        match pin {
+            PersistedPin::Top => Some(ViewportPin::Top),
+            PersistedPin::Bottom => Some(ViewportPin::Bottom),
+            PersistedPin::Focused {
+                anchor_record_idx,
+                line_offset,
+                anchor_frac,
+            } => self
+                .scope_position_for_record(scope_turns, anchor_record_idx)
+                .map(|turn_idx| ViewportPin::Focused {
+                    turn_idx,
+                    line_offset,
+                    anchor_frac,
+                }),
         }
     }
 
@@ -6260,16 +6289,17 @@ impl App {
             return;
         }
 
-        let saved_focus = match scope {
+        let saved_state = match scope {
             TurnScope::Session { session_idx } => self
                 .session_preview_states
                 .get(&session_idx)
-                .and_then(|state| state.focused_record_idx),
+                .map(|state| (state.focused_record_idx, state.pin)),
             TurnScope::Chrono => self
                 .chrono_viewport_state
-                .and_then(|state| state.focused_record_idx),
+                .map(|state| (state.focused_record_idx, state.pin)),
         };
 
+        let saved_focus = saved_state.and_then(|(focused_record_idx, _)| focused_record_idx);
         let focused_record_idx = saved_focus
             .filter(|record_idx| scope_turns.contains(record_idx))
             .or_else(|| {
@@ -6279,7 +6309,9 @@ impl App {
             .or_else(|| scope_turns.first().copied());
         self.focused_record_idx = focused_record_idx;
         self.selected_preview_record_idx = focused_record_idx;
-        self.viewport_pin = ViewportPin::Top;
+        self.viewport_pin = saved_state
+            .and_then(|(_, pin)| self.restore_viewport_pin(&scope_turns, pin))
+            .unwrap_or(ViewportPin::Top);
 
         if matches!(self.browser_mode, BrowserMode::Chrono) {
             self.sync_selected_session_from_focus();
@@ -6377,7 +6409,11 @@ impl App {
         self.record_session_idx(current) != self.record_session_idx(next)
     }
 
-    fn chrono_separator_line(&self, scope_turns: &[usize], scope_idx: usize) -> Option<Line<'static>> {
+    fn chrono_separator_line(
+        &self,
+        scope_turns: &[usize],
+        scope_idx: usize,
+    ) -> Option<Line<'static>> {
         let next = scope_turns.get(scope_idx + 1)?;
         let session_idx = self.record_session_idx(*next)?;
         let session = self.sessions.get(session_idx)?;
@@ -6417,11 +6453,16 @@ impl App {
             lines.push(line);
             line_turn_map.push(Some((scope_idx, record_idx)));
         }
-        if let Some(cached) =
-            self.ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
-        {
+        if let Some(cached) = self.ensure_turn_cached(
+            record_idx,
+            self.focused_record_idx == Some(record_idx),
+            width,
+        ) {
             lines.extend(cached.body_lines.iter().cloned());
-            line_turn_map.extend(std::iter::repeat_n(Some((scope_idx, record_idx)), cached.body_height));
+            line_turn_map.extend(std::iter::repeat_n(
+                Some((scope_idx, record_idx)),
+                cached.body_height,
+            ));
         }
         if self.chrono_separator_after(scope_turns, scope_idx)
             && let Some(separator) = self.chrono_separator_line(scope_turns, scope_idx)
@@ -6432,7 +6473,12 @@ impl App {
         (lines, line_turn_map)
     }
 
-    fn turn_visual_height(&mut self, scope_turns: &[usize], scope_idx: usize, width: usize) -> usize {
+    fn turn_visual_height(
+        &mut self,
+        scope_turns: &[usize],
+        scope_idx: usize,
+        width: usize,
+    ) -> usize {
         let Some(&record_idx) = scope_turns.get(scope_idx) else {
             return 0;
         };
@@ -6441,7 +6487,11 @@ impl App {
         };
         let header_height = wrap_preview_line(&render_turn_header(&rec, scope_idx), width).len();
         let body_height = self
-            .ensure_turn_cached(record_idx, self.focused_record_idx == Some(record_idx), width)
+            .ensure_turn_cached(
+                record_idx,
+                self.focused_record_idx == Some(record_idx),
+                width,
+            )
             .map(|cached| cached.body_height)
             .unwrap_or(0);
         header_height
@@ -6449,7 +6499,10 @@ impl App {
             + usize::from(self.chrono_separator_after(scope_turns, scope_idx))
     }
 
-    fn session_header_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<Option<(usize, usize)>>) {
+    fn session_header_lines(
+        &self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<Option<(usize, usize)>>) {
         let Some(TurnScope::Session { session_idx }) = self.current_turn_scope() else {
             return (Vec::new(), Vec::new());
         };
@@ -6501,7 +6554,8 @@ impl App {
                 rendered.extend(header_lines);
                 rendered_map.extend(header_map);
                 for scope_idx in 0..scope_turns.len() {
-                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, scope_idx, viewport_w);
+                    let (lines, map) =
+                        self.render_scope_turn_lines(&scope_turns, scope_idx, viewport_w);
                     rendered.extend(lines);
                     rendered_map.extend(map);
                     if rendered.len() >= viewport_h {
@@ -6519,7 +6573,9 @@ impl App {
                         break;
                     }
                 }
-                if matches!(self.current_turn_scope(), Some(TurnScope::Session { .. })) && rendered.len() < viewport_h {
+                if matches!(self.current_turn_scope(), Some(TurnScope::Session { .. }))
+                    && rendered.len() < viewport_h
+                {
                     let (header_lines, header_map) = self.session_header_lines(viewport_w);
                     rendered.splice(0..0, header_lines);
                     rendered_map.splice(0..0, header_map);
@@ -6531,8 +6587,9 @@ impl App {
                 anchor_frac,
             } => {
                 let turn_idx = turn_idx.min(scope_turns.len().saturating_sub(1));
-                let anchor_row = ((viewport_h.saturating_sub(1)) as f32 * anchor_frac.clamp(0.0, 1.0))
-                    .round() as usize;
+                let anchor_row = ((viewport_h.saturating_sub(1)) as f32
+                    * anchor_frac.clamp(0.0, 1.0))
+                .round() as usize;
                 let (anchor_lines, anchor_map) =
                     self.render_scope_turn_lines(&scope_turns, turn_idx, viewport_w);
                 let line_offset = line_offset.min(anchor_lines.len().saturating_sub(1));
@@ -6552,7 +6609,8 @@ impl App {
                         break;
                     }
                     prev_idx -= 1;
-                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, prev_idx, viewport_w);
+                    let (lines, map) =
+                        self.render_scope_turn_lines(&scope_turns, prev_idx, viewport_w);
                     upper.splice(0..0, lines);
                     upper_map.splice(0..0, map);
                 }
@@ -6562,7 +6620,8 @@ impl App {
                     if next_idx >= scope_turns.len() {
                         break;
                     }
-                    let (lines, map) = self.render_scope_turn_lines(&scope_turns, next_idx, viewport_w);
+                    let (lines, map) =
+                        self.render_scope_turn_lines(&scope_turns, next_idx, viewport_w);
                     lower.extend(lines);
                     lower_map.extend(map);
                     next_idx += 1;
@@ -6612,15 +6671,26 @@ impl App {
         }
 
         if rendered.len() > viewport_h {
-            let start = rendered.len().saturating_sub(viewport_h);
-            rendered.drain(0..start);
-            rendered_map.drain(0..start);
+            if matches!(self.viewport_pin, ViewportPin::Top) {
+                rendered.truncate(viewport_h);
+                rendered_map.truncate(viewport_h);
+            } else {
+                let start = rendered.len().saturating_sub(viewport_h);
+                rendered.drain(0..start);
+                rendered_map.drain(0..start);
+            }
         }
 
         let lines = rendered
             .iter()
             .zip(rendered_map.iter().copied())
-            .map(|(line, map)| self.highlighted_viewport_line(line, map.map(|(_, record_idx)| record_idx), viewport_w))
+            .map(|(line, map)| {
+                self.highlighted_viewport_line(
+                    line,
+                    map.map(|(_, record_idx)| record_idx),
+                    viewport_w,
+                )
+            })
             .collect();
 
         ViewportResult {
@@ -7599,8 +7669,8 @@ impl App {
                             break;
                         }
                         turn_idx -= 1;
-                        target += self.turn_visual_height(&scope_turns, turn_idx, preview_width)
-                            as i32;
+                        target +=
+                            self.turn_visual_height(&scope_turns, turn_idx, preview_width) as i32;
                         continue;
                     }
                     if target >= turn_height {
@@ -9092,7 +9162,8 @@ mod tests {
         session_records: Vec<Vec<usize>>,
     ) -> App {
         let mut app = empty_app();
-        app.record_session_idx_by_record = build_record_session_idx_map(&session_records, all.len());
+        app.record_session_idx_by_record =
+            build_record_session_idx_map(&session_records, all.len());
         app.ready = true;
         app.all = all;
         app.sessions = sessions;
@@ -10380,6 +10451,44 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("first body")));
         assert!(rendered.iter().any(|line| line.contains("second body")));
         assert!(rendered.iter().any(|line| line.contains("third body")));
+    }
+
+    #[test]
+    fn top_pinned_session_browser_viewport_keeps_first_lines_visible() {
+        let long_first_turn = (1..=18)
+            .map(|line| format!("first turn line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                &long_first_turn,
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::Assistant,
+                "second body",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.viewport_pin = ViewportPin::Top;
+
+        let viewport = app.fill_viewport(8, 80);
+        let rendered = viewport.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(rendered[0].starts_with("session id: session-a"));
+        assert!(rendered.iter().any(|line| line.starts_with("source: ")));
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("first turn line 18"))
+        );
     }
 
     #[test]
@@ -11958,7 +12067,7 @@ mod tests {
     }
 
     #[test]
-    fn session_browser_reset_starts_at_top_when_returning_to_a_session() {
+    fn session_browser_reset_starts_at_top_until_session_has_saved_position() {
         let session_a_turn = (1..=18)
             .map(|line| format!("session a line {line}"))
             .collect::<Vec<_>>()
@@ -12012,6 +12121,8 @@ mod tests {
         app.selected = session_a_selected;
         app.reset_preview_scroll_to_match();
 
+        assert!(matches!(app.viewport_pin, ViewportPin::Top));
+
         let area = Rect::new(0, 0, 100, 10);
         let geometry = app_geometry(area, &app);
         let preview_area = geometry.turn_preview;
@@ -12039,7 +12150,14 @@ mod tests {
         assert_eq!(app.selected, session_a_selected);
         assert_eq!(app.focused_record_idx, Some(1));
         assert_eq!(app.selected_preview_record_idx, Some(1));
-        assert!(matches!(app.viewport_pin, ViewportPin::Top));
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused {
+                turn_idx: 1,
+                line_offset,
+                ..
+            } if line_offset == saved_offset
+        ));
     }
 
     #[test]
