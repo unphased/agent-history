@@ -3996,67 +3996,21 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(rec) = app.selected_record() {
                 open_in_pager(terminal, app, rec)?;
             }
         }
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            resume_selected_session(terminal, app)?;
+        }
         KeyCode::Enter => {
-            if let Some(rec) = app.selected_record() {
-                match resume_target_for_record(app, rec) {
-                    Some(target) => {
-                        let sid = rec.session_id.as_deref().unwrap_or("");
-                        let status = run_with_tui_suspended(terminal, || {
-                            let configured = configured_resume_command(&target)?;
-                            let cleanup_dir = configured.zdotdir_cleanup.clone();
-                            let mut cmd = configured.command;
-
-                            for line in resume_loading_lines(&target, sid) {
-                                eprintln!("{line}");
-                            }
-
-                            let mut child = match cmd.spawn() {
-                                Ok(child) => child,
-                                Err(err) => {
-                                    if let Some(dir) = cleanup_dir {
-                                        let _ = fs::remove_dir_all(dir);
-                                    }
-                                    return Err(err).context("failed to start resume shell");
-                                }
-                            };
-                            let status = child
-                                .wait()
-                                .context("failed while waiting for resume shell")?;
-                            if let Some(dir) = cleanup_dir {
-                                let _ = fs::remove_dir_all(dir);
-                            }
-                            Ok(status)
-                        });
-
-                        match status {
-                            Ok(st) if st.success() => {
-                                app.indexing.last_warn = None;
-                            }
-                            Ok(st) => {
-                                app.indexing.last_warn = Some(format!(
-                                    "resume failed: {} (code={})",
-                                    target.program,
-                                    st.code()
-                                        .map(|c| c.to_string())
-                                        .unwrap_or_else(|| "?".to_string())
-                                ));
-                            }
-                            Err(e) => {
-                                app.indexing.last_warn =
-                                    Some(format!("resume failed: {}: {e}", target.program));
-                            }
-                        }
-                    }
-                    None => {
-                        app.indexing.last_warn =
-                            Some("the selected row cannot be resumed".to_string());
-                    }
-                }
+            if matches!(app.input_mode, InputMode::PreviewNav) {
+                let preview_width = current_preview_inner_width(terminal, app)?;
+                let preview_height = current_preview_inner_height(terminal, app)?;
+                app.cycle_focused_turn_expansion(preview_width, preview_height);
+            } else if matches!(app.input_mode, InputMode::SessionSearch) {
+                app.input_mode = InputMode::PreviewNav;
             }
         }
         KeyCode::Char('/') if matches!(app.input_mode, InputMode::PreviewNav) => {
@@ -5913,7 +5867,7 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Tab/Shift+Tab: focus  Enter: resume  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Enter/Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
@@ -5923,7 +5877,7 @@ impl App {
                     "clear+search"
                 };
                 format!(
-                    "Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events"
+                    "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events"
                 )
             }
             InputMode::PreviewSearch => format!(
@@ -6557,6 +6511,26 @@ impl App {
             self.turn_expansions.insert(record_idx, next);
         }
         self.last_viewport_result = None;
+    }
+
+    fn cycle_focused_turn_expansion(&mut self, preview_width: usize, preview_height: usize) {
+        if self.show_telemetry || preview_width == 0 || preview_height == 0 {
+            return;
+        }
+        let scope_turns = self.resolve_turn_scope_indices().to_vec();
+        let Some(record_idx) = self
+            .focused_record_idx
+            .filter(|record_idx| scope_turns.contains(record_idx))
+            .or_else(|| {
+                self.selected_preview_record_idx
+                    .filter(|record_idx| scope_turns.contains(record_idx))
+            })
+            .or_else(|| scope_turns.first().copied())
+        else {
+            return;
+        };
+        self.cycle_turn_expansion(record_idx);
+        self.reveal_turn_with_anchor(record_idx, 0.3);
     }
 
     fn ensure_turn_cached(
@@ -8855,6 +8829,69 @@ fn open_in_pager(
     });
     if let Some(path) = file_path {
         let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn resume_selected_session(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    let Some(rec) = app.selected_record() else {
+        return Ok(());
+    };
+    match resume_target_for_record(app, rec) {
+        Some(target) => {
+            let sid = rec.session_id.as_deref().unwrap_or("");
+            let status = run_with_tui_suspended(terminal, || {
+                let configured = configured_resume_command(&target)?;
+                let cleanup_dir = configured.zdotdir_cleanup.clone();
+                let mut cmd = configured.command;
+
+                for line in resume_loading_lines(&target, sid) {
+                    eprintln!("{line}");
+                }
+
+                let mut child = match cmd.spawn() {
+                    Ok(child) => child,
+                    Err(err) => {
+                        if let Some(dir) = cleanup_dir {
+                            let _ = fs::remove_dir_all(dir);
+                        }
+                        return Err(err).context("failed to start resume shell");
+                    }
+                };
+                let status = child
+                    .wait()
+                    .context("failed while waiting for resume shell")?;
+                if let Some(dir) = cleanup_dir {
+                    let _ = fs::remove_dir_all(dir);
+                }
+                Ok(status)
+            });
+
+            match status {
+                Ok(st) if st.success() => {
+                    app.indexing.last_warn = None;
+                }
+                Ok(st) => {
+                    app.indexing.last_warn = Some(format!(
+                        "resume failed: {} (code={})",
+                        target.program,
+                        st.code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ));
+                }
+                Err(e) => {
+                    app.indexing.last_warn =
+                        Some(format!("resume failed: {}: {e}", target.program));
+                }
+            }
+        }
+        None => {
+            app.indexing.last_warn = Some("the selected row cannot be resumed".to_string());
+        }
     }
     Ok(())
 }
@@ -12915,6 +12952,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.preview_scroll, after_first_n);
+    }
+
+    #[test]
+    fn handle_key_enter_in_search_focuses_preview_without_resuming() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.input_mode = InputMode::SessionSearch;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
+        assert_eq!(app.indexing.last_warn, None);
+    }
+
+    #[test]
+    fn enter_preview_action_cycles_focused_turn_and_reveals_it() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "line 1\nline 2",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        let record_idx = app.resolve_turn_scope_indices()[0];
+        assert_eq!(record_idx, 0);
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::OneLine);
+        app.cycle_focused_turn_expansion(80, 10);
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+        assert!(matches!(
+            app.viewport_pin,
+            ViewportPin::Focused { turn_idx: 0, .. }
+        ));
     }
 
     #[test]

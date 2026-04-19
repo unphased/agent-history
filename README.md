@@ -38,12 +38,12 @@ cargo install --path .
 
 ## Requirements
 - Rust toolchain (to build/install from source)
-- Optional: `codex` CLI (for `Enter` resume on OpenAI/Codex sessions)
-- Optional: `codex-account` wrapper (for `Enter` resume on account-scoped Codex sessions such as `~/.codex-work`)
-- Optional: `claude` CLI (for `Enter` resume on Claude sessions)
-- Optional: `claude-account` wrapper (for `Enter` resume on account-scoped Claude sessions such as `~/.claude-work`)
-- Optional: `opencode` CLI (for `Enter` resume on OpenCode sessions)
-- Optional: `$PAGER` (defaults to `less -R`) for `Ctrl+o`
+- Optional: `codex` CLI (for `Ctrl+o` resume on OpenAI/Codex sessions)
+- Optional: `codex-account` wrapper (for `Ctrl+o` resume on account-scoped Codex sessions such as `~/.codex-work`)
+- Optional: `claude` CLI (for `Ctrl+o` resume on Claude sessions)
+- Optional: `claude-account` wrapper (for `Ctrl+o` resume on account-scoped Claude sessions such as `~/.claude-work`)
+- Optional: `opencode` CLI (for `Ctrl+o` resume on OpenCode sessions)
+- Optional: `$PAGER` (defaults to `less -R`) for `Ctrl+p`
 
 No external fuzzy finder (e.g. `fzf`) is required.
 
@@ -201,8 +201,9 @@ agent-history --query "GitHub Actions"
 - `Ctrl+u`: clear query
 - `↑/↓`: move selection
 - `PageUp/PageDown`: move by page
-- `Enter`: open a login-shell handoff for the selected session; local sessions resume locally, remote sessions SSH to the owning host
-- `Ctrl+o`: open raw JSONL around the selected item in `$PAGER` (defaults to `less -R`)
+- `Enter`: focus the preview pane from search; cycle the focused turn view from preview
+- `Ctrl+o`: open a login-shell handoff for the selected session; local sessions resume locally, remote sessions SSH to the owning host
+- `Ctrl+p`: open raw JSONL around the selected item in `$PAGER` (defaults to `less -R`)
 - `Ctrl+t`: toggle the log/events view
 - `Esc` / `Ctrl+c`: quit
 
