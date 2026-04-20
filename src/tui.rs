@@ -1741,6 +1741,8 @@ fn should_show_host_tag(sess: &SessionSummary, tags: &config::UiTagConfig) -> bo
 }
 
 const REMOTE_ACCENT: Color = Color::Rgb(138, 112, 144);
+const CHRONO_ACCENT: Color = Color::Rgb(92, 132, 126);
+const CHRONO_BORDER_FG: Color = Color::Rgb(18, 24, 24);
 const REMOTE_TAG_BG: Color = Color::Rgb(82, 70, 88);
 const REMOTE_TAG_FG: Color = Color::Rgb(224, 216, 228);
 const REMOTE_DESYNC_TAG_BG: Color = Color::Rgb(104, 54, 92);
@@ -5738,6 +5740,33 @@ impl App {
         format!("{label}  {turns} {turn_label}")
     }
 
+    fn chrono_browser_active(&self) -> bool {
+        self.showing_session_browser() && matches!(self.browser_mode, BrowserMode::Chrono)
+    }
+
+    fn results_title(&self) -> String {
+        let label = if self.chrono_browser_active() {
+            "Chrono Results"
+        } else {
+            "Results"
+        };
+        format!(
+            "{label} (sessions {}/{} turns {}/{})",
+            self.filtered.len(),
+            self.sessions.len(),
+            self.matched_turn_count(),
+            self.total_turn_count()
+        )
+    }
+
+    fn session_browser_preview_label(&self) -> &'static str {
+        if self.chrono_browser_active() {
+            "Chrono"
+        } else {
+            "Turns"
+        }
+    }
+
     fn turn_position_in_selected_session(&self, record_idx: usize) -> Option<(usize, usize)> {
         let hit = self.selected_hit()?;
         let record_idxs = self.session_records.get(hit.session_idx)?;
@@ -5763,16 +5792,17 @@ impl App {
     }
 
     fn turns_preview_title(&self, record_idx: Option<usize>) -> String {
+        let label = self.session_browser_preview_label();
         let Some(record_idx) = record_idx else {
-            return self.preview_title("Turns");
+            return self.preview_title(label);
         };
         let Some((turn_idx, total_turns)) = (match self.browser_mode {
             BrowserMode::Session => self.turn_position_in_selected_session(record_idx),
             BrowserMode::Chrono => self.turn_position_in_current_scope(record_idx),
         }) else {
-            return self.preview_title("Turns");
+            return self.preview_title(label);
         };
-        format!("Turns  turn {turn_idx}/{total_turns}")
+        format!("{label}  turn {turn_idx}/{total_turns}")
     }
 
     fn git_graph_title(&self) -> String {
@@ -8537,24 +8567,31 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ));
     }
 
-    let results_border_style = if matches!(app.input_mode, InputMode::SessionSearch) {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+    let chrono_border_style = if app.chrono_browser_active() {
+        Some(
+            Style::default()
+                .fg(CHRONO_BORDER_FG)
+                .bg(CHRONO_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Style::default()
+        None
+    };
+    let results_base_border_style = chrono_border_style.unwrap_or_default();
+    let results_border_style = if matches!(app.input_mode, InputMode::SessionSearch) {
+        results_base_border_style.patch(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        results_base_border_style
     };
     let results = Paragraph::new(Text::from(lines)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(results_border_style)
-            .title(format!(
-                "Results (sessions {}/{} turns {}/{})",
-                app.filtered.len(),
-                app.sessions.len(),
-                app.matched_turn_count(),
-                app.total_turn_count()
-            )),
+            .title(app.results_title()),
     );
     f.render_widget(results, results_area);
 
@@ -8568,7 +8605,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .preview_bgcolor
         .map(|color| Style::default().bg(color))
         .unwrap_or_default();
-    let preview_base_border_style = if app.preview_remote_style {
+    let preview_base_border_style = if let Some(chrono_border_style) = chrono_border_style {
+        chrono_border_style
+    } else if app.preview_remote_style {
         Style::default()
             .fg(REMOTE_PREVIEW_BORDER_FG)
             .bg(REMOTE_ACCENT)
@@ -10720,6 +10759,39 @@ mod tests {
         app.update_results();
 
         assert_eq!(app.turns_preview_title(Some(1)), "Turns  turn 2/3");
+    }
+
+    #[test]
+    fn chrono_titles_switch_to_chrono_label() {
+        let all = vec![
+            mr(
+                Some("2026-04-13T00:00:01Z"),
+                Role::User,
+                "first",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-04-13T00:00:03Z"),
+                Role::User,
+                "third",
+                "session-a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.browser_mode = BrowserMode::Chrono;
+        app.update_results();
+
+        assert!(app.results_title().starts_with("Chrono Results ("));
+        assert_eq!(app.turns_preview_title(Some(1)), "Chrono  turn 2/3");
     }
 
     #[test]
