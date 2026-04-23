@@ -4012,7 +4012,7 @@ fn handle_key(
                 let preview_height = current_preview_inner_height(terminal, app)?;
                 app.cycle_focused_turn_expansion(preview_width, preview_height);
             } else if matches!(app.input_mode, InputMode::SessionSearch) {
-                app.input_mode = InputMode::PreviewNav;
+                resume_selected_session(terminal, app)?;
             }
         }
         KeyCode::Char('/') if matches!(app.input_mode, InputMode::PreviewNav) => {
@@ -5908,7 +5908,7 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Enter/Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
             InputMode::PreviewNav => {
@@ -13249,15 +13249,9 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_enter_in_search_focuses_preview_without_resuming() {
-        let all = vec![mr(
-            Some("2026-02-10T00:00:01Z"),
-            Role::User,
-            "first",
-            "a",
-            SourceKind::CodexSessionJsonl,
-        )];
-        let mut app = ready_app_with_indexed_data(all);
+    fn handle_key_enter_in_search_does_not_focus_preview() {
+        let mut app = empty_app();
+        app.ready = true;
         app.input_mode = InputMode::SessionSearch;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).unwrap();
@@ -13266,6 +13260,25 @@ mod tests {
             &mut terminal,
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
+        assert_eq!(app.indexing.last_warn, None);
+    }
+
+    #[test]
+    fn handle_key_tab_in_search_focuses_preview() {
+        let mut app = empty_app();
+        app.ready = true;
+        app.input_mode = InputMode::SessionSearch;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         )
         .unwrap();
 
