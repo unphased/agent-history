@@ -59,6 +59,12 @@ struct SessionTagSpec {
     style: Style,
 }
 
+#[derive(Debug, Clone)]
+struct StartupProjectFilter {
+    project_key: String,
+    applied: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryFilterTagAdornment {
     None,
@@ -2955,6 +2961,48 @@ fn dir_name_from_cwd(cwd: &str) -> String {
         .to_string()
 }
 
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn absolute_git_common_dir(cwd: &Path) -> Option<String> {
+    let normalized_cwd = normalize_existing_path(cwd);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&normalized_cwd)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common_dir.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(&common_dir);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        normalized_cwd.join(path)
+    };
+    Some(
+        normalize_existing_path(&absolute)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+fn startup_project_filter_for_cwd(cwd: &Path) -> Option<StartupProjectFilter> {
+    Some(StartupProjectFilter {
+        project_key: absolute_git_common_dir(cwd)?,
+        applied: false,
+    })
+}
+
 fn is_agents_instructions(text: &str) -> bool {
     let t = text.trim_start();
     let first = t.lines().next().unwrap_or("").trim_start();
@@ -3204,6 +3252,7 @@ struct App {
     telemetry_cursor_pos: usize,
     max_results: usize,
     active_tag_filters: Vec<TagFilter>,
+    startup_project_filter: Option<StartupProjectFilter>,
 
     all: Vec<MessageRecord>,
     sessions: Vec<SessionSummary>,
@@ -3327,6 +3376,9 @@ fn run_app(
         .and_then(|path| telemetry::TelemetrySink::open(path).ok());
     let initial_query = args.query.unwrap_or_default();
     let initial_cursor = initial_query.len();
+    let startup_project_filter = env::current_dir()
+        .ok()
+        .and_then(|cwd| startup_project_filter_for_cwd(&cwd));
     let mut app = App {
         query: initial_query,
         cursor_pos: initial_cursor,
@@ -3334,6 +3386,7 @@ fn run_app(
         telemetry_cursor_pos: 0,
         max_results: args.max_results,
         active_tag_filters: Vec::new(),
+        startup_project_filter,
         all: Vec::new(),
         sessions: Vec::new(),
         session_records: Vec::new(),
@@ -3617,6 +3670,7 @@ fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
     app.session_records = session_records;
     app.refresh_remote_sync_states();
     app.ready = true;
+    app.apply_startup_project_filter_if_available();
     app.update_results();
 }
 
@@ -5944,6 +5998,41 @@ impl App {
             })
             .unwrap_or(project_key)
             .to_string()
+    }
+
+    fn apply_startup_project_filter_if_available(&mut self) {
+        let Some(startup_filter) = self.startup_project_filter.as_ref() else {
+            return;
+        };
+        if startup_filter.applied {
+            return;
+        }
+
+        let project_key = startup_filter.project_key.clone();
+        let project_exists = self
+            .sessions
+            .iter()
+            .any(|sess| sess.project_key.as_deref() == Some(project_key.as_str()));
+
+        if let Some(startup_filter) = self.startup_project_filter.as_mut() {
+            if !project_exists {
+                return;
+            }
+            startup_filter.applied = true;
+        }
+
+        if self
+            .active_tag_filters
+            .iter()
+            .any(|filter| filter.kind == TagFilterKind::Project)
+        {
+            return;
+        }
+
+        self.active_tag_filters.push(TagFilter {
+            kind: TagFilterKind::Project,
+            value: project_key,
+        });
     }
 
     fn active_filter_tag_specs(&self) -> Vec<SessionTagSpec> {
@@ -9436,6 +9525,7 @@ mod tests {
             telemetry_cursor_pos: 0,
             max_results: 0,
             active_tag_filters: Vec::new(),
+            startup_project_filter: None,
             all: Vec::new(),
             sessions: Vec::new(),
             session_records: Vec::new(),
@@ -10182,6 +10272,7 @@ mod tests {
             telemetry_cursor_pos: 0,
             max_results: 0,
             active_tag_filters: Vec::new(),
+            startup_project_filter: None,
             all,
             sessions,
             session_records,
@@ -10307,6 +10398,7 @@ mod tests {
             telemetry_cursor_pos: 0,
             max_results: 0,
             active_tag_filters: Vec::new(),
+            startup_project_filter: None,
             all,
             sessions,
             session_records,
@@ -11894,6 +11986,51 @@ mod tests {
         assert_eq!(
             app.sessions[app.filtered[0].session_idx].project_slug,
             Some(expected_project)
+        );
+    }
+
+    #[test]
+    fn startup_project_filter_applies_matching_project_key() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.cwd = Some("/tmp/alpha-main".to_string());
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut beta = mr(
+            Some("2026-02-10T00:00:02Z"),
+            Role::User,
+            "second",
+            "session-beta",
+            SourceKind::CodexSessionJsonl,
+        );
+        beta.cwd = Some("/tmp/beta".to_string());
+        beta.project_slug = Some("beta".to_string());
+        beta.project_key = Some("/tmp/repos/beta/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha, beta]);
+        app.startup_project_filter = Some(StartupProjectFilter {
+            project_key: "/tmp/repos/alpha/.git".to_string(),
+            applied: false,
+        });
+
+        app.apply_startup_project_filter_if_available();
+        app.update_results();
+
+        assert_eq!(app.active_tag_filters.len(), 1);
+        assert_eq!(app.active_tag_filters[0].kind, TagFilterKind::Project);
+        assert_eq!(app.active_tag_filters[0].value, "/tmp/repos/alpha/.git");
+        assert_eq!(app.filtered.len(), 1);
+        assert_eq!(
+            app.sessions[app.filtered[0].session_idx]
+                .project_slug
+                .as_deref(),
+            Some("alpha")
         );
     }
 
@@ -13600,6 +13737,7 @@ mod tests {
             telemetry_cursor_pos: 0,
             max_results: 0,
             active_tag_filters: Vec::new(),
+            startup_project_filter: None,
             all,
             sessions,
             session_records,
