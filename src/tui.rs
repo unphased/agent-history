@@ -1574,12 +1574,17 @@ fn format_telemetry_event_line_with_now(record: &telemetry::EventRecord, now_ms:
             truncate_middle(telemetry_metric_str(data, "rsync_cmd").unwrap_or(""), 80)
         ),
         "remote_sync_finished" => format!(
-            "remote={} host={} ms={} records={} sessions={}",
+            "remote={} host={} ms={} records={} sessions={} rsync_changed={} literal={} matched={} sent={} recv={}",
             telemetry_metric_str(data, "remote_name").unwrap_or(""),
             telemetry_metric_str(data, "host").unwrap_or(""),
             telemetry_metric_u64(data, "duration_ms").unwrap_or(0),
             telemetry_metric_u64(data, "records").unwrap_or(0),
-            telemetry_metric_u64(data, "sessions").unwrap_or(0)
+            telemetry_metric_u64(data, "sessions").unwrap_or(0),
+            telemetry_metric_bool(data, "rsync_changed").unwrap_or(false),
+            telemetry_metric_u64(data, "rsync_literal_data").unwrap_or(0),
+            telemetry_metric_u64(data, "rsync_matched_data").unwrap_or(0),
+            telemetry_metric_u64(data, "rsync_bytes_sent").unwrap_or(0),
+            telemetry_metric_u64(data, "rsync_bytes_received").unwrap_or(0)
         ),
         "remote_sync_failed" => format!(
             "remote={} host={} ms={} error={}",

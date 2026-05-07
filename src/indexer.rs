@@ -443,7 +443,13 @@ fn sync_remotes_from_args_with_cache_path(
         let local_db = cache::remote_db_path_for(cache_path, &remote.name);
         let rsync_cmd = shell_command_string(
             "rsync",
-            &["-az", &rsync_src, local_db.to_string_lossy().as_ref()],
+            &[
+                "-az",
+                "--itemize-changes",
+                "--stats",
+                &rsync_src,
+                local_db.to_string_lossy().as_ref(),
+            ],
         );
         let record = telemetry::EventRecord::new(
             None,
@@ -460,9 +466,9 @@ fn sync_remotes_from_args_with_cache_path(
         }
         tx.send(IndexerEvent::Telemetry { record }).ok();
         match refresh_and_rsync_remote(&remote, cache_path) {
-            Ok(local_db) => {
-                let records =
-                    cache::load_records_from_remote_db(&local_db, &remote.name).unwrap_or_default();
+            Ok(sync) => {
+                let records = cache::load_records_from_remote_db(&sync.local_db, &remote.name)
+                    .unwrap_or_default();
                 let machine_id = records.first().map(|rec| rec.machine_id.clone());
                 let machine_name = records.first().map(|rec| rec.machine_name.clone());
                 let mut store = cache::CacheStore::open(&cache_path, false)?;
@@ -487,6 +493,16 @@ fn sync_remotes_from_args_with_cache_path(
                         "sessions": count_sessions(&records),
                         "machine_id": machine_id,
                         "machine_name": machine_name,
+                        "rsync_changed": sync.stats.changed,
+                        "rsync_content_transferred": sync.stats.content_transferred,
+                        "rsync_itemized_changes": sync.stats.itemized_changes,
+                        "rsync_regular_files_transferred": sync.stats.regular_files_transferred,
+                        "rsync_total_file_size": sync.stats.total_file_size,
+                        "rsync_total_transferred_file_size": sync.stats.total_transferred_file_size,
+                        "rsync_literal_data": sync.stats.literal_data,
+                        "rsync_matched_data": sync.stats.matched_data,
+                        "rsync_bytes_sent": sync.stats.bytes_sent,
+                        "rsync_bytes_received": sync.stats.bytes_received,
                     }),
                 );
                 if let Some(sink) = telemetry.as_mut() {
@@ -528,10 +544,30 @@ fn sync_remotes_from_args_with_cache_path(
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RsyncStats {
+    changed: bool,
+    content_transferred: bool,
+    itemized_changes: Vec<String>,
+    regular_files_transferred: Option<u64>,
+    total_file_size: Option<u64>,
+    total_transferred_file_size: Option<u64>,
+    literal_data: Option<u64>,
+    matched_data: Option<u64>,
+    bytes_sent: Option<u64>,
+    bytes_received: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSyncOutput {
+    local_db: PathBuf,
+    stats: RsyncStats,
+}
+
 fn refresh_and_rsync_remote(
     remote: &config::RemoteConfig,
     cache_path: &Path,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<RemoteSyncOutput> {
     let target = match remote.user.as_deref() {
         Some(user) => format!("{user}@{}", remote.host),
         None => remote.host.clone(),
@@ -575,6 +611,8 @@ fn refresh_and_rsync_remote(
     let rsync_src = format!("{target}:{remote_cache_path}");
     let rsync = Command::new("rsync")
         .arg("-az")
+        .arg("--itemize-changes")
+        .arg("--stats")
         .arg(&rsync_src)
         .arg(local_db.to_string_lossy().as_ref())
         .output()
@@ -586,7 +624,67 @@ fn refresh_and_rsync_remote(
         );
     }
 
-    Ok(local_db)
+    Ok(RemoteSyncOutput {
+        local_db,
+        stats: parse_rsync_stats(&String::from_utf8_lossy(&rsync.stdout)),
+    })
+}
+
+fn parse_rsync_stats(stdout: &str) -> RsyncStats {
+    let mut stats = RsyncStats::default();
+
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(value) = parse_rsync_colon_value(line, "Number of regular files transferred") {
+            stats.regular_files_transferred = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Total file size") {
+            stats.total_file_size = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Total transferred file size") {
+            stats.total_transferred_file_size = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Literal data") {
+            stats.literal_data = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Matched data") {
+            stats.matched_data = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Total bytes sent") {
+            stats.bytes_sent = Some(value);
+        } else if let Some(value) = parse_rsync_colon_value(line, "Total bytes received") {
+            stats.bytes_received = Some(value);
+        } else if is_rsync_itemized_change_line(line) {
+            stats.itemized_changes.push(line.to_string());
+        }
+    }
+
+    stats.changed = !stats.itemized_changes.is_empty();
+    stats.content_transferred = stats.regular_files_transferred.unwrap_or(0) > 0
+        || stats.total_transferred_file_size.unwrap_or(0) > 0
+        || stats.literal_data.unwrap_or(0) > 0;
+    stats
+}
+
+fn parse_rsync_colon_value(line: &str, label: &str) -> Option<u64> {
+    let rest = line.strip_prefix(label)?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    parse_leading_u64(rest)
+}
+
+fn parse_leading_u64(value: &str) -> Option<u64> {
+    let digits: String = value
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit() || *ch == ',')
+        .filter(|ch| *ch != ',')
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn is_rsync_itemized_change_line(line: &str) -> bool {
+    let Some(first) = line.as_bytes().first().copied() else {
+        return false;
+    };
+    matches!(first, b'<' | b'>' | b'c' | b'h' | b'.' | b'*')
 }
 
 fn shell_escape_arg(arg: &str) -> String {
@@ -2841,6 +2939,63 @@ mod tests {
         assert!(!remote_refresh_subcommand_unsupported(
             "remote refresh failed: permission denied"
         ));
+    }
+
+    #[test]
+    fn parse_rsync_stats_extracts_transfer_metrics() {
+        let stdout = concat!(
+            ">f.st...... index.sqlite\n",
+            "\n",
+            "Number of files: 1 (reg: 1)\n",
+            "Number of created files: 0\n",
+            "Number of deleted files: 0\n",
+            "Number of regular files transferred: 1\n",
+            "Total file size: 9,347,072 bytes\n",
+            "Total transferred file size: 9,347,072 bytes\n",
+            "Literal data: 1,024 bytes\n",
+            "Matched data: 9,346,048 bytes\n",
+            "File list size: 0\n",
+            "Total bytes sent: 1,388\n",
+            "Total bytes received: 2,044\n",
+            "sent 1,388 bytes  received 2,044 bytes  6,864.00 bytes/sec\n",
+            "total size is 9,347,072  speedup is 2,724.09\n",
+        );
+
+        let stats = parse_rsync_stats(stdout);
+
+        assert!(stats.changed);
+        assert!(stats.content_transferred);
+        assert_eq!(stats.itemized_changes, vec![">f.st...... index.sqlite"]);
+        assert_eq!(stats.regular_files_transferred, Some(1));
+        assert_eq!(stats.total_file_size, Some(9_347_072));
+        assert_eq!(stats.total_transferred_file_size, Some(9_347_072));
+        assert_eq!(stats.literal_data, Some(1_024));
+        assert_eq!(stats.matched_data, Some(9_346_048));
+        assert_eq!(stats.bytes_sent, Some(1_388));
+        assert_eq!(stats.bytes_received, Some(2_044));
+    }
+
+    #[test]
+    fn parse_rsync_stats_distinguishes_metadata_only_changes() {
+        let stdout = concat!(
+            ".f..t...... index.sqlite\n",
+            "Number of regular files transferred: 0\n",
+            "Total file size: 9,347,072 bytes\n",
+            "Total transferred file size: 0 bytes\n",
+            "Literal data: 0 bytes\n",
+            "Matched data: 0 bytes\n",
+            "Total bytes sent: 88\n",
+            "Total bytes received: 64\n",
+        );
+
+        let stats = parse_rsync_stats(stdout);
+
+        assert!(stats.changed);
+        assert!(!stats.content_transferred);
+        assert_eq!(stats.itemized_changes, vec![".f..t...... index.sqlite"]);
+        assert_eq!(stats.regular_files_transferred, Some(0));
+        assert_eq!(stats.total_transferred_file_size, Some(0));
+        assert_eq!(stats.literal_data, Some(0));
     }
 
     #[test]
