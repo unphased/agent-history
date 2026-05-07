@@ -4060,7 +4060,7 @@ fn handle_key(
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             resume_selected_session(terminal, app)?;
         }
-        KeyCode::Enter => {
+        KeyCode::Enter if !app.show_telemetry => {
             if matches!(app.input_mode, InputMode::PreviewNav) {
                 let preview_width = current_preview_inner_width(terminal, app)?;
                 let preview_height = current_preview_inner_height(terminal, app)?;
@@ -13402,6 +13402,54 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::SessionSearch);
         assert_eq!(app.indexing.last_warn, None);
+    }
+
+    #[test]
+    fn handle_key_enter_in_events_does_not_resume_selected_session() {
+        let mut rec = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "event-hidden session row",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        );
+        rec.session_id = None;
+        let sessions = vec![SessionSummary {
+            source: SourceKind::CodexSessionJsonl,
+            session_id: "a".to_string(),
+            account: None,
+            machine_id: "local".to_string(),
+            machine_name: "local".to_string(),
+            origin: "local".to_string(),
+            remote_desync_label: None,
+            project_slug: None,
+            project_key: None,
+            first_user_idx: 0,
+            last_ts: Some("2026-02-10T00:00:01Z".to_string()),
+            cwd: None,
+            dir: String::new(),
+            first_line: "event-hidden session row".to_string(),
+        }];
+        let mut app = ready_app_with_data(vec![rec], sessions, vec![vec![0]]);
+        app.filtered = vec![SessionHit {
+            session_idx: 0,
+            matched_record_idx: None,
+            hit_count: 0,
+        }];
+        app.show_telemetry = true;
+        app.input_mode = InputMode::SessionSearch;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.indexing.last_warn, None);
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
     }
 
     #[test]
