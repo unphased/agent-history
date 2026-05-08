@@ -1764,6 +1764,8 @@ const PREVIEW_SELECTED_BG: Color = Color::Rgb(133, 128, 144);
 const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(196, 48, 48);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.32;
+const ACTIVE_FILTER_ALERT_BG: Color = Color::Rgb(236, 112, 104);
+const ACTIVE_FILTER_ALERT_FG: Color = Color::Black;
 const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
 const INACTIVE_SEARCH_FIELD_FG: Color = Color::Rgb(236, 236, 236);
 const QUERY_MATCH_FG: Color = Color::Black;
@@ -1802,6 +1804,13 @@ fn inactive_search_field_style() -> Style {
     Style::default()
         .fg(INACTIVE_SEARCH_FIELD_FG)
         .bg(INACTIVE_SEARCH_FIELD_BG)
+}
+
+fn active_filter_alert_style() -> Style {
+    Style::default()
+        .fg(ACTIVE_FILTER_ALERT_FG)
+        .bg(ACTIVE_FILTER_ALERT_BG)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn session_tag_specs(sess: &SessionSummary, tags: &config::UiTagConfig) -> Vec<SessionTagSpec> {
@@ -3716,10 +3725,8 @@ fn handle_key(
         }
         app.arm_escape_sequence_discard();
         if matches!(app.input_mode, InputMode::SessionSearch) {
+            app.clear_tag_filters();
             return Ok(false);
-        }
-        if matches!(app.input_mode, InputMode::PreviewNav) {
-            app.clear_preview_search();
         }
         app.input_mode = InputMode::SessionSearch;
         return Ok(false);
@@ -4572,7 +4579,7 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
         return None;
     }
 
-    let mut cursor = 0;
+    let mut cursor = active_filter_prompt_prefix_width();
     for spec in specs {
         let width = UnicodeWidthStr::width(app.query_filter_tag_content(&spec).as_str());
         if (cursor..cursor + width).contains(&content_x) {
@@ -4582,6 +4589,10 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
     }
 
     None
+}
+
+fn active_filter_prompt_prefix_width() -> usize {
+    UnicodeWidthStr::width(" FILTER  > ")
 }
 
 fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
@@ -5032,8 +5043,9 @@ fn current_results_inner_height(
 }
 
 fn preview_has_search_bar(app: &App) -> bool {
-    matches!(app.input_mode, InputMode::PreviewSearch)
-        || (matches!(app.input_mode, InputMode::PreviewNav) && !app.preview_search.query.is_empty())
+    !app.show_telemetry
+        && (matches!(app.input_mode, InputMode::PreviewSearch)
+            || !app.preview_search.query.is_empty())
 }
 
 fn preview_content_rect(preview_area: Rect, has_search_bar: bool) -> Rect {
@@ -5967,21 +5979,12 @@ impl App {
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: stay  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: clear filters  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
-            InputMode::PreviewNav => {
-                let esc_action = if self.preview_search.query.trim().is_empty() {
-                    "search"
-                } else {
-                    "clear+search"
-                };
-                format!(
-                    "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: {esc_action}  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events"
-                )
-            }
+            InputMode::PreviewNav => "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events".to_string(),
             InputMode::PreviewSearch => format!(
-                "Esc/F10: clear+exit  Tab: keep+exit  Ctrl+u: clear  filter: \"{}\"",
+                "Esc/F10: clear search  Tab: keep search  Ctrl+u: clear  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
@@ -6082,11 +6085,25 @@ impl App {
             return Line::from(vec![Span::raw("❯ ")]);
         }
 
-        let mut spans = query_filter_tag_spans(
+        let mut spans = vec![
+            Span::styled(" FILTER ", active_filter_alert_style()),
+            Span::styled(
+                " > ",
+                Style::default()
+                    .fg(ACTIVE_FILTER_ALERT_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        spans.extend(query_filter_tag_spans(
             self.active_filter_tag_specs(),
             self.hovered_query_tag_filter.as_ref(),
-        );
-        spans.push(Span::raw("❯ "));
+        ));
+        spans.push(Span::styled(
+            "❯ ",
+            Style::default()
+                .fg(ACTIVE_FILTER_ALERT_BG)
+                .add_modifier(Modifier::BOLD),
+        ));
         Line::from(spans)
     }
 
@@ -6186,6 +6203,15 @@ impl App {
         }
     }
 
+    fn clear_tag_filters(&mut self) {
+        if self.active_tag_filters.is_empty() {
+            return;
+        }
+        self.active_tag_filters.clear();
+        self.hovered_query_tag_filter = None;
+        self.update_results();
+    }
+
     fn apply_tag_filter_from_results(&mut self, filter: TagFilter) {
         if self
             .active_tag_filters
@@ -6201,6 +6227,7 @@ impl App {
         self.query.clear();
         self.cursor_pos = 0;
         self.active_tag_filters.clear();
+        self.hovered_query_tag_filter = None;
         self.update_results();
     }
 
@@ -8672,7 +8699,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         None
     };
     let results_base_border_style = chrono_border_style.unwrap_or_default();
-    let results_border_style = if matches!(app.input_mode, InputMode::SessionSearch) {
+    let results_border_style = if !app.active_tag_filters.is_empty() {
+        results_base_border_style.patch(
+            Style::default()
+                .fg(ACTIVE_FILTER_ALERT_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if matches!(app.input_mode, InputMode::SessionSearch) {
         results_base_border_style.patch(
             Style::default()
                 .fg(Color::Yellow)
@@ -12072,8 +12105,9 @@ mod tests {
         )
         .style;
 
-        assert_eq!(rendered, " alpha  ❯ ");
-        assert_eq!(prompt.spans[0].style, expected_style);
+        assert_eq!(rendered, " FILTER  >  alpha  ❯ ");
+        assert_eq!(prompt.spans[2].style, expected_style);
+        assert_eq!(prompt.spans[0].style.bg, Some(ACTIVE_FILTER_ALERT_BG));
     }
 
     #[test]
@@ -12169,8 +12203,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(rendered, " x alpha  ❯ ");
-        assert_eq!(prompt.spans[1].style.fg, Some(Color::Rgb(255, 96, 96)));
+        assert_eq!(rendered, " FILTER  >  x alpha  ❯ ");
+        assert_eq!(prompt.spans[3].style.fg, Some(Color::Rgb(255, 96, 96)));
     }
 
     #[test]
@@ -12195,7 +12229,13 @@ mod tests {
 
         let area = Rect::new(0, 0, 240, 30);
         let query_area = app_geometry(area, &app).query;
-        let chip_offset = " x alpha ".find('x').unwrap() as u16;
+        let rendered = app
+            .query_prompt_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let chip_offset = rendered.find("alpha").unwrap() as u16;
 
         route_mouse(
             &mut app,
@@ -13532,7 +13572,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_escape_in_preview_nav_clears_preview_filter_before_returning_to_search() {
+    fn handle_key_escape_in_preview_nav_keeps_preview_filter_when_returning_to_search() {
         let all = vec![mr(
             Some("2026-02-10T00:00:01Z"),
             Role::User,
@@ -13558,10 +13598,10 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::SessionSearch);
         assert_eq!(app.query, "find");
-        assert_eq!(app.preview_search.query, "");
-        assert_eq!(app.preview_search.cursor_pos, 0);
-        assert!(app.showing_session_browser());
-        assert!(app.preview_scroll_reset_pending);
+        assert_eq!(app.preview_search.query, "find");
+        assert_eq!(app.preview_search.cursor_pos, 4);
+        assert!(!app.showing_session_browser());
+        assert!(!app.preview_scroll_reset_pending);
     }
 
     #[test]
@@ -13591,10 +13631,59 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::SessionSearch);
         assert_eq!(app.query, "find");
-        assert_eq!(app.preview_search.query, "");
-        assert_eq!(app.preview_search.cursor_pos, 0);
-        assert!(app.showing_session_browser());
-        assert!(app.preview_scroll_reset_pending);
+        assert_eq!(app.preview_search.query, "find");
+        assert_eq!(app.preview_search.cursor_pos, 4);
+        assert!(!app.showing_session_browser());
+        assert!(!app.preview_scroll_reset_pending);
+    }
+
+    #[test]
+    fn handle_key_escape_in_search_clears_active_filters_without_clearing_query() {
+        let mut alpha = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first needle",
+            "session-alpha",
+            SourceKind::CodexSessionJsonl,
+        );
+        alpha.project_slug = Some("alpha".to_string());
+        alpha.project_key = Some("/tmp/repos/alpha/.git".to_string());
+
+        let mut beta = mr(
+            Some("2026-02-10T00:00:02Z"),
+            Role::User,
+            "second needle",
+            "session-beta",
+            SourceKind::CodexSessionJsonl,
+        );
+        beta.project_slug = Some("beta".to_string());
+        beta.project_key = Some("/tmp/repos/beta/.git".to_string());
+
+        let mut app = ready_app_with_indexed_data(vec![alpha, beta]);
+        app.query = "needle".to_string();
+        app.cursor_pos = app.query.chars().count();
+        app.active_tag_filters.push(TagFilter {
+            kind: TagFilterKind::Project,
+            value: "/tmp/repos/alpha/.git".to_string(),
+        });
+        app.input_mode = InputMode::SessionSearch;
+        app.update_results();
+        assert_eq!(app.filtered.len(), 1);
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert!(app.active_tag_filters.is_empty());
+        assert_eq!(app.query, "needle");
+        assert_eq!(app.cursor_pos, 6);
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(app.input_mode, InputMode::SessionSearch);
     }
 
     #[test]
@@ -13897,6 +13986,18 @@ mod tests {
         );
         assert_eq!(app.query_bar_style().fg, Some(INACTIVE_SEARCH_FIELD_FG));
         assert_eq!(app.query_bar_style().bg, Some(INACTIVE_SEARCH_FIELD_BG));
+    }
+
+    #[test]
+    fn preview_search_bar_stays_visible_for_existing_filter_outside_preview_focus() {
+        let mut app = empty_app();
+        app.input_mode = InputMode::SessionSearch;
+        app.preview_search.query = "needle".to_string();
+
+        assert!(preview_has_search_bar(&app));
+
+        app.show_telemetry = true;
+        assert!(!preview_has_search_bar(&app));
     }
 
     #[test]
