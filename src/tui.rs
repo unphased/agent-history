@@ -1797,8 +1797,7 @@ fn query_match_style_for(term_index: usize) -> Style {
 
 fn active_search_field_style() -> Style {
     Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
+        .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -13997,6 +13996,22 @@ mod tests {
         );
         assert_eq!(app.query_bar_style().fg, Some(INACTIVE_SEARCH_FIELD_FG));
         assert_eq!(app.query_bar_style().bg, Some(INACTIVE_SEARCH_FIELD_BG));
+    }
+
+    #[test]
+    fn active_search_field_style_uses_bold_yellow_foreground_only() {
+        let mut app = empty_app();
+        app.input_mode = InputMode::SessionSearch;
+
+        assert_eq!(active_search_field_style().fg, Some(Color::Yellow));
+        assert_eq!(active_search_field_style().bg, None);
+        assert!(
+            active_search_field_style()
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(app.query_bar_style().fg, Some(Color::Yellow));
+        assert_eq!(app.query_bar_style().bg, None);
     }
 
     #[test]
