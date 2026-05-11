@@ -4592,7 +4592,7 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
 }
 
 fn active_filter_prompt_prefix_width() -> usize {
-    UnicodeWidthStr::width(">")
+    UnicodeWidthStr::width("FILTER > ")
 }
 
 fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
@@ -6085,12 +6085,15 @@ impl App {
             return Line::from(vec![Span::raw("> ")]);
         }
 
-        let mut spans = vec![Span::styled(">", active_filter_alert_style())];
+        let mut spans = vec![
+            Span::styled("FILTER ", active_filter_alert_style()),
+            Span::styled("> ", active_filter_alert_style()),
+        ];
         spans.extend(query_filter_tag_spans(
             self.active_filter_tag_specs(),
             self.hovered_query_tag_filter.as_ref(),
         ));
-        spans.push(Span::styled("< ", active_filter_alert_style()));
+        spans.push(Span::styled(" < ", active_filter_alert_style()));
         Line::from(spans)
     }
 
@@ -12092,8 +12095,8 @@ mod tests {
         )
         .style;
 
-        assert_eq!(rendered, "> alpha < ");
-        assert_eq!(prompt.spans[1].style, expected_style);
+        assert_eq!(rendered, "FILTER >  alpha  < ");
+        assert_eq!(prompt.spans[2].style, expected_style);
         assert_eq!(prompt.spans[0].style.fg, Some(ACTIVE_FILTER_ALERT_FG));
         assert_eq!(prompt.spans[0].style.bg, None);
     }
@@ -12213,8 +12216,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(rendered, "> x alpha < ");
-        assert_eq!(prompt.spans[2].style.fg, Some(Color::Rgb(255, 96, 96)));
+        assert_eq!(rendered, "FILTER >  x alpha  < ");
+        assert_eq!(prompt.spans[3].style.fg, Some(Color::Rgb(255, 96, 96)));
     }
 
     #[test]
