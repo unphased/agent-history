@@ -1767,8 +1767,7 @@ const PREVIEW_SELECTED_BG: Color = Color::Rgb(133, 128, 144);
 const PREVIEW_ACTIVE_MATCH_BG: Color = Color::Rgb(196, 48, 48);
 const PREVIEW_HOVER_LIGHTEN_AMOUNT: f32 = 0.05;
 const PREVIEW_SELECTED_LIGHTEN_AMOUNT: f32 = 0.32;
-const ACTIVE_FILTER_ALERT_BG: Color = Color::Rgb(236, 112, 104);
-const ACTIVE_FILTER_ALERT_FG: Color = Color::Black;
+const ACTIVE_FILTER_ALERT_FG: Color = Color::Rgb(236, 112, 104);
 const INACTIVE_SEARCH_FIELD_BG: Color = Color::Rgb(74, 74, 74);
 const INACTIVE_SEARCH_FIELD_FG: Color = Color::Rgb(236, 236, 236);
 const QUERY_MATCH_FG: Color = Color::Black;
@@ -1812,7 +1811,6 @@ fn inactive_search_field_style() -> Style {
 fn active_filter_alert_style() -> Style {
     Style::default()
         .fg(ACTIVE_FILTER_ALERT_FG)
-        .bg(ACTIVE_FILTER_ALERT_BG)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -4595,7 +4593,7 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
 }
 
 fn active_filter_prompt_prefix_width() -> usize {
-    UnicodeWidthStr::width("<")
+    UnicodeWidthStr::width(">")
 }
 
 fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
@@ -6088,12 +6086,12 @@ impl App {
             return Line::from(vec![Span::raw("> ")]);
         }
 
-        let mut spans = vec![Span::styled("<", active_filter_alert_style())];
+        let mut spans = vec![Span::styled(">", active_filter_alert_style())];
         spans.extend(query_filter_tag_spans(
             self.active_filter_tag_specs(),
             self.hovered_query_tag_filter.as_ref(),
         ));
-        spans.push(Span::styled("> ", active_filter_alert_style()));
+        spans.push(Span::styled("< ", active_filter_alert_style()));
         Line::from(spans)
     }
 
@@ -8692,7 +8690,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let results_border_style = if !app.active_tag_filters.is_empty() {
         results_base_border_style.patch(
             Style::default()
-                .fg(ACTIVE_FILTER_ALERT_BG)
+                .fg(ACTIVE_FILTER_ALERT_FG)
                 .add_modifier(Modifier::BOLD),
         )
     } else if matches!(app.input_mode, InputMode::SessionSearch) {
@@ -12095,9 +12093,10 @@ mod tests {
         )
         .style;
 
-        assert_eq!(rendered, "< alpha > ");
+        assert_eq!(rendered, "> alpha < ");
         assert_eq!(prompt.spans[1].style, expected_style);
-        assert_eq!(prompt.spans[0].style.bg, Some(ACTIVE_FILTER_ALERT_BG));
+        assert_eq!(prompt.spans[0].style.fg, Some(ACTIVE_FILTER_ALERT_FG));
+        assert_eq!(prompt.spans[0].style.bg, None);
     }
 
     #[test]
@@ -12215,7 +12214,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(rendered, "< x alpha > ");
+        assert_eq!(rendered, "> x alpha < ");
         assert_eq!(prompt.spans[2].style.fg, Some(Color::Rgb(255, 96, 96)));
     }
 
