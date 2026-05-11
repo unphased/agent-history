@@ -1683,14 +1683,17 @@ fn query_filter_tag_spans(
     hovered_filter: Option<&TagFilter>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for spec in specs {
+    let last = specs.len().saturating_sub(1);
+    for (idx, spec) in specs.into_iter().enumerate() {
         let adornment = if hovered_filter == Some(&spec.filter) {
             QueryFilterTagAdornment::Remove
         } else {
             QueryFilterTagAdornment::None
         };
         spans.extend(query_filter_tag_spec_spans(spec, adornment));
-        spans.push(Span::raw(" "));
+        if idx < last {
+            spans.push(Span::raw(" "));
+        }
     }
     spans
 }
@@ -4592,7 +4595,7 @@ fn tag_filter_at_query_column(app: &App, content_x: usize) -> Option<TagFilter> 
 }
 
 fn active_filter_prompt_prefix_width() -> usize {
-    UnicodeWidthStr::width(" FILTER  > ")
+    UnicodeWidthStr::width("<")
 }
 
 fn handle_query_click(app: &mut App, query_area: Rect, mouse: MouseEvent) {
@@ -6079,31 +6082,18 @@ impl App {
 
     fn query_prompt_line(&self) -> Line<'static> {
         if self.show_telemetry {
-            return Line::from(vec![Span::raw("events❯ ")]);
+            return Line::from(vec![Span::raw("events> ")]);
         }
         if self.active_tag_filters.is_empty() {
-            return Line::from(vec![Span::raw("❯ ")]);
+            return Line::from(vec![Span::raw("> ")]);
         }
 
-        let mut spans = vec![
-            Span::styled(" FILTER ", active_filter_alert_style()),
-            Span::styled(
-                " > ",
-                Style::default()
-                    .fg(ACTIVE_FILTER_ALERT_BG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
+        let mut spans = vec![Span::styled("<", active_filter_alert_style())];
         spans.extend(query_filter_tag_spans(
             self.active_filter_tag_specs(),
             self.hovered_query_tag_filter.as_ref(),
         ));
-        spans.push(Span::styled(
-            "❯ ",
-            Style::default()
-                .fg(ACTIVE_FILTER_ALERT_BG)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled("> ", active_filter_alert_style()));
         Line::from(spans)
     }
 
@@ -12105,9 +12095,31 @@ mod tests {
         )
         .style;
 
-        assert_eq!(rendered, " FILTER  >  alpha  ❯ ");
-        assert_eq!(prompt.spans[2].style, expected_style);
+        assert_eq!(rendered, "< alpha > ");
+        assert_eq!(prompt.spans[1].style, expected_style);
         assert_eq!(prompt.spans[0].style.bg, Some(ACTIVE_FILTER_ALERT_BG));
+    }
+
+    #[test]
+    fn query_prompt_line_uses_ascii_prompt_markers() {
+        let mut app = empty_app();
+
+        let rendered = app
+            .query_prompt_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "> ");
+
+        app.show_telemetry = true;
+        let rendered = app
+            .query_prompt_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "events> ");
     }
 
     #[test]
@@ -12203,8 +12215,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(rendered, " FILTER  >  x alpha  ❯ ");
-        assert_eq!(prompt.spans[3].style.fg, Some(Color::Rgb(255, 96, 96)));
+        assert_eq!(rendered, "< x alpha > ");
+        assert_eq!(prompt.spans[2].style.fg, Some(Color::Rgb(255, 96, 96)));
     }
 
     #[test]
