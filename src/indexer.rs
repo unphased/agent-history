@@ -2030,6 +2030,16 @@ fn index_file(
     Ok(())
 }
 
+pub(crate) fn index_jsonl_file_records(
+    file: &Path,
+    account: Option<&str>,
+) -> anyhow::Result<Vec<MessageRecord>> {
+    let mut out = Vec::new();
+    let mut sessions = HashSet::new();
+    index_file(file, account, &mut out, &mut sessions)?;
+    Ok(out)
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenCodeSessionTime {
     created: Option<i64>,

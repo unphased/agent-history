@@ -211,6 +211,25 @@ struct ChronoViewportState {
     pin: PersistedPin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionIdentity {
+    source: SourceKind,
+    session_id: String,
+    account: Option<String>,
+    machine_id: String,
+    origin: String,
+}
+
+#[derive(Debug, Clone)]
+struct FollowedSession {
+    identity: SessionIdentity,
+    file: PathBuf,
+    account: Option<String>,
+    record_count: usize,
+    file_len: u64,
+    modified: Option<SystemTime>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreviewMatch {
     raw_line: usize,
@@ -433,6 +452,7 @@ const MIN_GIT_PCT: u16 = 15;
 const MIN_TURNS_PCT: u16 = 15;
 const MIN_GRAPH_PCT: u16 = 20;
 const MAX_GRAPH_PCT: u16 = 80;
+const SESSION_FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 impl LayoutPreset {
     fn from_label(value: &str) -> Option<Self> {
@@ -720,6 +740,28 @@ fn build_record_session_idx_map(
         }
     }
     out
+}
+
+fn raw_record_matches_follow_identity(rec: &MessageRecord, identity: &SessionIdentity) -> bool {
+    rec.source == identity.source
+        && rec.session_id.as_deref() == Some(identity.session_id.as_str())
+        && rec.account == identity.account
+}
+
+fn record_matches_session_identity(rec: &MessageRecord, identity: &SessionIdentity) -> bool {
+    rec.source == identity.source
+        && rec.session_id.as_deref() == Some(identity.session_id.as_str())
+        && rec.account == identity.account
+        && rec.machine_id == identity.machine_id
+        && rec.origin == identity.origin
+}
+
+fn session_matches_identity(sess: &SessionSummary, identity: &SessionIdentity) -> bool {
+    sess.source == identity.source
+        && sess.session_id == identity.session_id
+        && sess.account == identity.account
+        && sess.machine_id == identity.machine_id
+        && sess.origin == identity.origin
 }
 
 fn source_sort_key(source: SourceKind) -> u8 {
@@ -3406,6 +3448,7 @@ struct App {
     offset: usize,
     session_preview_states: HashMap<usize, SessionPreviewState>,
     chrono_viewport_state: Option<ChronoViewportState>,
+    followed_session: Option<FollowedSession>,
     active_preview_match_idx: Option<usize>,
     selected_preview_record_idx: Option<usize>,
     focused_record_idx: Option<usize>,
@@ -3540,6 +3583,7 @@ fn run_app(
         offset: 0,
         session_preview_states: HashMap::new(),
         chrono_viewport_state: None,
+        followed_session: None,
         active_preview_match_idx: None,
         selected_preview_record_idx: None,
         focused_record_idx: None,
@@ -3615,6 +3659,7 @@ fn run_app(
     }
 
     let mut dirty = true;
+    let mut next_session_follow_poll = Instant::now() + SESSION_FOLLOW_POLL_INTERVAL;
     loop {
         let loop_started = Instant::now();
         let mut indexer_events = 0usize;
@@ -3624,6 +3669,15 @@ fn run_app(
         }
         if indexer_events > 0 {
             dirty = true;
+        }
+
+        if Instant::now() >= next_session_follow_poll {
+            next_session_follow_poll = Instant::now() + SESSION_FOLLOW_POLL_INTERVAL;
+            let preview_width = current_preview_inner_width(terminal, &app).unwrap_or(0);
+            let preview_height = current_preview_inner_height(terminal, &app).unwrap_or(0);
+            if app.poll_followed_session(preview_width, preview_height) {
+                dirty = true;
+            }
         }
 
         let mut draw_duration_ms = 0u128;
@@ -3805,6 +3859,7 @@ fn handle_indexer_event(app: &mut App, ev: IndexerEvent) {
 }
 
 fn apply_records(app: &mut App, records: Vec<MessageRecord>) {
+    app.followed_session = None;
     app.all = records;
     let (sessions, session_records) = build_session_index(&app.all);
     app.record_session_idx_by_record =
@@ -6525,6 +6580,244 @@ impl App {
 
     fn selected_hit(&self) -> Option<SessionHit> {
         self.filtered.get(self.selected).copied()
+    }
+
+    fn selected_session_identity(&self) -> Option<SessionIdentity> {
+        let hit = self.selected_hit()?;
+        let sess = self.sessions.get(hit.session_idx)?;
+        Some(SessionIdentity {
+            source: sess.source,
+            session_id: sess.session_id.clone(),
+            account: sess.account.clone(),
+            machine_id: sess.machine_id.clone(),
+            origin: sess.origin.clone(),
+        })
+    }
+
+    fn selected_followable_session(&self) -> Option<FollowedSession> {
+        let hit = self.selected_hit()?;
+        let sess = self.sessions.get(hit.session_idx)?;
+        if sess.origin != "local" {
+            return None;
+        }
+        if !matches!(
+            sess.source,
+            SourceKind::CodexSessionJsonl
+                | SourceKind::ClaudeProjectJsonl
+                | SourceKind::CodexHistoryJsonl
+        ) {
+            return None;
+        }
+        let record_indices = self.session_records.get(hit.session_idx)?;
+        let mut files = record_indices
+            .iter()
+            .filter_map(|&idx| self.all.get(idx))
+            .map(|rec| rec.file.clone())
+            .collect::<HashSet<_>>();
+        if files.len() != 1 {
+            return None;
+        }
+        let file = files.drain().next()?;
+        let metadata = fs::metadata(&file).ok()?;
+        Some(FollowedSession {
+            identity: SessionIdentity {
+                source: sess.source,
+                session_id: sess.session_id.clone(),
+                account: sess.account.clone(),
+                machine_id: sess.machine_id.clone(),
+                origin: sess.origin.clone(),
+            },
+            file,
+            account: sess.account.clone(),
+            record_count: record_indices.len(),
+            file_len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn poll_followed_session(&mut self, preview_width: usize, preview_height: usize) -> bool {
+        let Some(current) = self.selected_followable_session() else {
+            self.followed_session = None;
+            return false;
+        };
+
+        let previous = match self.followed_session.as_ref() {
+            Some(previous)
+                if previous.identity == current.identity && previous.file == current.file =>
+            {
+                previous.clone()
+            }
+            _ => {
+                self.followed_session = Some(current);
+                return false;
+            }
+        };
+
+        let metadata = match fs::metadata(&previous.file) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.set_ui_status(format!("session follow unavailable: {err}"));
+                self.followed_session = None;
+                return true;
+            }
+        };
+        let file_len = metadata.len();
+        let modified = metadata.modified().ok();
+        if file_len == previous.file_len && modified == previous.modified {
+            return false;
+        }
+
+        let Ok(mut file_records) =
+            crate::indexer::index_jsonl_file_records(&previous.file, previous.account.as_deref())
+        else {
+            self.followed_session = Some(FollowedSession {
+                file_len,
+                modified,
+                ..previous
+            });
+            return false;
+        };
+        let new_records =
+            self.normalize_followed_session_records(&previous.identity, &mut file_records);
+        if new_records.len() <= previous.record_count {
+            self.followed_session = Some(FollowedSession {
+                record_count: new_records.len(),
+                file_len,
+                modified,
+                ..previous
+            });
+            return false;
+        }
+
+        let added = new_records.len().saturating_sub(previous.record_count);
+        let was_at_bottom = self.preview_is_at_bottom(preview_width, preview_height);
+        self.replace_followed_session_records(&previous.identity, new_records);
+        self.followed_session = Some(FollowedSession {
+            record_count: previous.record_count.saturating_add(added),
+            file_len,
+            modified,
+            ..previous
+        });
+        if was_at_bottom {
+            self.scroll_preview_to_bottom(preview_width, preview_height);
+        }
+        self.set_ui_status(format!("followed session: +{added} turns"));
+        true
+    }
+
+    fn normalize_followed_session_records(
+        &self,
+        identity: &SessionIdentity,
+        records: &mut Vec<MessageRecord>,
+    ) -> Vec<MessageRecord> {
+        let templates = self
+            .all
+            .iter()
+            .filter(|rec| record_matches_session_identity(rec, identity))
+            .collect::<Vec<_>>();
+        records
+            .drain(..)
+            .filter(|rec| raw_record_matches_follow_identity(rec, identity))
+            .map(|mut rec| {
+                let template = templates
+                    .iter()
+                    .copied()
+                    .find(|template| template.cwd == rec.cwd)
+                    .or_else(|| templates.first().copied());
+                if let Some(template) = template {
+                    rec.machine_id = template.machine_id.clone();
+                    rec.machine_name = template.machine_name.clone();
+                    rec.project_slug = template.project_slug.clone();
+                    rec.project_key = template.project_key.clone();
+                    rec.git_repo_root = template.git_repo_root.clone();
+                    rec.git_remotes = template.git_remotes.clone();
+                    rec.origin = template.origin.clone();
+                }
+                rec
+            })
+            .collect()
+    }
+
+    fn replace_followed_session_records(
+        &mut self,
+        identity: &SessionIdentity,
+        records: Vec<MessageRecord>,
+    ) {
+        let previous_identity = self.selected_session_identity();
+        let insert_at = self
+            .all
+            .iter()
+            .position(|rec| record_matches_session_identity(rec, identity))
+            .unwrap_or(self.all.len());
+        self.all
+            .retain(|rec| !record_matches_session_identity(rec, identity));
+        let insert_at = insert_at.min(self.all.len());
+        self.all.splice(insert_at..insert_at, records);
+
+        let (sessions, session_records) = build_session_index(&self.all);
+        self.record_session_idx_by_record =
+            build_record_session_idx_map(&session_records, self.all.len());
+        self.indexing.records = self.all.len();
+        self.indexing.sessions = sessions.len();
+        self.sessions = sessions;
+        self.session_records = session_records;
+        self.refresh_remote_sync_states();
+        self.update_results();
+
+        let target_identity = previous_identity.unwrap_or_else(|| identity.clone());
+        if let Some(selected) = self.filtered.iter().position(|hit| {
+            self.sessions
+                .get(hit.session_idx)
+                .is_some_and(|sess| session_matches_identity(sess, &target_identity))
+        }) {
+            self.selected = selected;
+        }
+    }
+
+    fn preview_is_at_bottom(&mut self, preview_width: usize, preview_height: usize) -> bool {
+        if preview_width == 0 || preview_height == 0 || self.show_telemetry {
+            return false;
+        }
+        if self.showing_session_browser() {
+            return matches!(self.viewport_pin, ViewportPin::Bottom);
+        }
+        let doc = self.build_preview_doc();
+        let preview_lines = preview_layout_lines(
+            &doc,
+            if self.git_graph_visible {
+                self.selected_preview_record_idx
+            } else {
+                None
+            },
+        );
+        let total_lines = preview_visual_line_count(&preview_lines, preview_width);
+        self.preview_scroll >= total_lines.saturating_sub(preview_height)
+    }
+
+    fn scroll_preview_to_bottom(&mut self, preview_width: usize, preview_height: usize) {
+        if preview_width == 0 || preview_height == 0 || self.show_telemetry {
+            return;
+        }
+        if self.showing_session_browser() {
+            self.viewport_pin = ViewportPin::Bottom;
+            self.last_viewport_result = None;
+            self.preview_scroll_reset_pending = false;
+            return;
+        }
+        let doc = self.build_preview_doc();
+        let preview_lines = preview_layout_lines(
+            &doc,
+            if self.git_graph_visible {
+                self.selected_preview_record_idx
+            } else {
+                None
+            },
+        );
+        let total_lines = preview_visual_line_count(&preview_lines, preview_width);
+        self.preview_scroll = total_lines.saturating_sub(preview_height);
+        self.sync_selected_preview_record_from_scroll(preview_width);
+        self.sync_active_preview_match_idx_for_doc(&doc, preview_width);
+        self.preview_scroll_reset_pending = false;
     }
 
     fn selected_record(&self) -> Option<&MessageRecord> {
@@ -9730,6 +10023,7 @@ mod tests {
             offset: 0,
             session_preview_states: HashMap::new(),
             chrono_viewport_state: None,
+            followed_session: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
             focused_record_idx: None,
@@ -9986,6 +10280,55 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.sessions[0].session_id, "refreshed-session");
         assert_eq!(app.indexing.records, 1);
+    }
+
+    #[test]
+    fn poll_followed_session_picks_up_appended_local_jsonl_turns() {
+        let tmp = TempDir::new("agent-history-follow");
+        let file = tmp.path.join("session.jsonl");
+        let initial = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\",\"cwd\":\"/tmp/proj\"}}\n",
+            "{\"timestamp\":\"2026-02-10T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"text\":\"first\"}]}}\n"
+        );
+        fs::write(&file, initial).unwrap();
+
+        let mut first = mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "first",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        first.file = file.clone();
+        first.line = 2;
+        first.cwd = Some("/tmp/proj".to_string());
+        let mut app = ready_app_with_indexed_data(vec![first]);
+        app.update_results();
+        app.viewport_pin = ViewportPin::Bottom;
+
+        assert!(!app.poll_followed_session(80, 10));
+        assert_eq!(
+            app.followed_session
+                .as_ref()
+                .map(|followed| followed.record_count),
+            Some(1)
+        );
+
+        let updated = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\",\"cwd\":\"/tmp/proj\"}}\n",
+            "{\"timestamp\":\"2026-02-10T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"text\":\"first\"}]}}\n",
+            "{\"timestamp\":\"2026-02-10T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"text\":\"second\"}]}}\n"
+        );
+        fs::write(&file, updated).unwrap();
+
+        assert!(app.poll_followed_session(80, 10));
+        let hit = app.selected_hit().unwrap();
+        let record_indices = app.session_records.get(hit.session_idx).unwrap();
+        assert_eq!(record_indices.len(), 2);
+        assert_eq!(app.all[record_indices[1]].text, "second");
+        assert_eq!(app.all[record_indices[1]].machine_id, "local");
+        assert!(matches!(app.viewport_pin, ViewportPin::Bottom));
+        assert_eq!(app.ui_status.as_deref(), Some("followed session: +1 turns"));
     }
 
     #[test]
@@ -10478,6 +10821,7 @@ mod tests {
             offset: 0,
             session_preview_states: HashMap::new(),
             chrono_viewport_state: None,
+            followed_session: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
             focused_record_idx: None,
@@ -10605,6 +10949,7 @@ mod tests {
             offset: 0,
             session_preview_states: HashMap::new(),
             chrono_viewport_state: None,
+            followed_session: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
             focused_record_idx: None,
@@ -14405,6 +14750,7 @@ mod tests {
             offset: 0,
             session_preview_states: HashMap::new(),
             chrono_viewport_state: None,
+            followed_session: None,
             active_preview_match_idx: None,
             selected_preview_record_idx: None,
             focused_record_idx: None,
