@@ -166,6 +166,13 @@ enum TurnExpansion {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpansionStep {
+    Cycle,
+    More,
+    Less,
+}
+
 impl TurnExpansion {
     fn next(self) -> Self {
         match self {
@@ -173,6 +180,22 @@ impl TurnExpansion {
             Self::Compact => Self::Simple,
             Self::Simple => Self::Full,
             Self::Full => Self::OneLine,
+        }
+    }
+
+    fn more(self) -> Self {
+        match self {
+            Self::OneLine => Self::Compact,
+            Self::Compact => Self::Simple,
+            Self::Simple | Self::Full => Self::Full,
+        }
+    }
+
+    fn less(self) -> Self {
+        match self {
+            Self::OneLine | Self::Compact => Self::OneLine,
+            Self::Simple => Self::Compact,
+            Self::Full => Self::Simple,
         }
     }
 
@@ -4284,6 +4307,16 @@ fn handle_key(
             let preview_height = current_preview_inner_height(terminal, app)?;
             app.jump_preview_record(1, preview_width, preview_height);
         }
+        KeyCode::Char('h') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.collapse_focused_turn(preview_width, preview_height);
+        }
+        KeyCode::Char('l') if matches!(app.input_mode, InputMode::PreviewNav) => {
+            let preview_width = current_preview_inner_width(terminal, app)?;
+            let preview_height = current_preview_inner_height(terminal, app)?;
+            app.expand_focused_turn(preview_width, preview_height);
+        }
         KeyCode::Char('n') if matches!(app.input_mode, InputMode::PreviewNav) => {
             let width = current_preview_inner_width(terminal, app)?;
             app.jump_preview_match(1, width);
@@ -6176,7 +6209,7 @@ impl App {
                 "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: clear filters  Ctrl+t: events  Ctrl+x: time  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
-            InputMode::PreviewNav => "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+x: time  Ctrl+y: mode  Ctrl+t: events".to_string(),
+            InputMode::PreviewNav => "Enter/click: cycle view  h/l: collapse/expand  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+x: time  Ctrl+y: mode  Ctrl+t: events".to_string(),
             InputMode::PreviewSearch => format!(
                 "Esc/F10: clear search  Enter/Tab: keep search  Ctrl+u: clear  Ctrl+x: time  filter: \"{}\"",
                 self.preview_search.query
@@ -7155,10 +7188,14 @@ impl App {
 
     fn cycle_turn_expansion(&mut self, record_idx: usize) {
         let next = self.turn_expansion(record_idx).next();
-        if matches!(next, TurnExpansion::OneLine) {
+        self.set_turn_expansion(record_idx, next);
+    }
+
+    fn set_turn_expansion(&mut self, record_idx: usize, expansion: TurnExpansion) {
+        if matches!(expansion, TurnExpansion::OneLine) {
             self.turn_expansions.remove(&record_idx);
         } else {
-            self.turn_expansions.insert(record_idx, next);
+            self.turn_expansions.insert(record_idx, expansion);
         }
         self.last_viewport_result = None;
     }
@@ -7210,6 +7247,23 @@ impl App {
     }
 
     fn cycle_focused_turn_expansion(&mut self, preview_width: usize, preview_height: usize) {
+        self.adjust_focused_turn_expansion(ExpansionStep::Cycle, preview_width, preview_height);
+    }
+
+    fn expand_focused_turn(&mut self, preview_width: usize, preview_height: usize) {
+        self.adjust_focused_turn_expansion(ExpansionStep::More, preview_width, preview_height);
+    }
+
+    fn collapse_focused_turn(&mut self, preview_width: usize, preview_height: usize) {
+        self.adjust_focused_turn_expansion(ExpansionStep::Less, preview_width, preview_height);
+    }
+
+    fn adjust_focused_turn_expansion(
+        &mut self,
+        step: ExpansionStep,
+        preview_width: usize,
+        preview_height: usize,
+    ) {
         if self.show_telemetry || preview_width == 0 || preview_height == 0 {
             return;
         }
@@ -7226,7 +7280,16 @@ impl App {
             return;
         };
         let top_row = self.viewport_turn_top_row(record_idx).unwrap_or(0);
-        self.cycle_turn_expansion(record_idx);
+        let current = self.turn_expansion(record_idx);
+        let next = match step {
+            ExpansionStep::Cycle => current.next(),
+            ExpansionStep::More => current.more(),
+            ExpansionStep::Less => current.less(),
+        };
+        if next == current {
+            return;
+        }
+        self.set_turn_expansion(record_idx, next);
         self.reveal_turn_top_near_row(record_idx, top_row, preview_width, preview_height);
     }
 
@@ -14228,6 +14291,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.selected_preview_record_idx, Some(0));
+    }
+
+    #[test]
+    fn handle_key_h_and_l_step_turn_expansion_in_preview_nav_mode() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "line 1\nline 2\nline 3",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        let record_idx = app.resolve_turn_scope_indices()[0];
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::OneLine);
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Simple);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Full);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Full);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Simple);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::Compact);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::OneLine);
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.turn_expansion(record_idx), TurnExpansion::OneLine);
     }
 
     #[test]
