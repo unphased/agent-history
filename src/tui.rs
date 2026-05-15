@@ -1236,33 +1236,41 @@ fn render_turn_header_with_expansion(
         }
         TurnExpansion::Simple | TurnExpansion::Full => short_ts(rec.timestamp.as_deref()),
     };
-    let size = turn_size_indicator(&rec.text);
     match expansion {
-        TurnExpansion::OneLine => Line::raw(format!(
-            "{} {} {} {} {}",
-            expansion.indicator(),
-            turn_position_in_scope + 1,
-            timestamp,
-            size,
-            compact_single_line(&rec.text)
-        )),
-        TurnExpansion::Compact => Line::raw(format!(
-            "{} {} {} {} phase:{} {}",
-            expansion.indicator(),
-            turn_position_in_scope + 1,
-            timestamp,
-            role_abbrev(rec.role),
-            abbrev_field(rec.phase.as_deref().unwrap_or("")),
-            size
-        )),
-        TurnExpansion::Simple | TurnExpansion::Full => Line::raw(format!(
-            "{} {}   {}   role: {role}   phase: {}   {}",
-            expansion.indicator(),
-            turn_position_in_scope + 1,
-            timestamp,
-            rec.phase.as_deref().unwrap_or(""),
-            size
-        )),
+        TurnExpansion::OneLine => {
+            let mut spans = vec![Span::raw(format!(
+                "{} {} {} ",
+                expansion.indicator(),
+                turn_position_in_scope + 1,
+                timestamp
+            ))];
+            spans.extend(turn_size_indicator_spans(&rec.text));
+            spans.push(Span::raw(format!(" {}", compact_single_line(&rec.text))));
+            Line::from(spans)
+        }
+        TurnExpansion::Compact => {
+            let mut spans = vec![Span::raw(format!(
+                "{} {} {} {} phase:{} ",
+                expansion.indicator(),
+                turn_position_in_scope + 1,
+                timestamp,
+                role_abbrev(rec.role),
+                abbrev_field(rec.phase.as_deref().unwrap_or(""))
+            ))];
+            spans.extend(turn_size_indicator_spans(&rec.text));
+            Line::from(spans)
+        }
+        TurnExpansion::Simple | TurnExpansion::Full => {
+            let mut spans = vec![Span::raw(format!(
+                "{} {}   {}   role: {role}   phase: {}   ",
+                expansion.indicator(),
+                turn_position_in_scope + 1,
+                timestamp,
+                rec.phase.as_deref().unwrap_or("")
+            ))];
+            spans.extend(turn_size_indicator_spans(&rec.text));
+            Line::from(spans)
+        }
     }
 }
 
@@ -1299,10 +1307,26 @@ fn abbrev_field(value: &str) -> String {
     out
 }
 
-fn turn_size_indicator(text: &str) -> String {
+fn turn_size_indicator_spans(text: &str) -> Vec<Span<'static>> {
     let lines = text.lines().count().max(usize::from(!text.is_empty()));
     let chars = text.chars().count();
-    format!("[{lines}l {chars}c]")
+    vec![
+        Span::styled(format!("{lines}l"), turn_line_count_style()),
+        Span::raw(" "),
+        Span::styled(format!("{chars}c"), turn_char_count_style()),
+    ]
+}
+
+fn turn_line_count_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::ITALIC)
+}
+
+fn turn_char_count_style() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::ITALIC)
 }
 
 fn compact_turn_timestamp(ts: Option<&str>, previous_ts: Option<&str>) -> String {
@@ -11138,7 +11162,7 @@ mod tests {
             TurnExpansion::OneLine,
             Some("2026-04-13T12:33:00Z"),
         ));
-        assert!(one_line.starts_with(". 2 34:56 [2l "));
+        assert!(one_line.starts_with(". 2 34:56 2l "));
         assert!(one_line.contains("first content line"));
         assert!(!one_line.contains("role:"));
         assert!(!one_line.contains("phase:"));
@@ -11149,7 +11173,7 @@ mod tests {
             TurnExpansion::Compact,
             Some("2026-04-13T12:33:00Z"),
         ));
-        assert!(compact.starts_with(": 2 34:56 a phase:assistant-re~ [2l "));
+        assert!(compact.starts_with(": 2 34:56 a phase:assistant-re~ 2l "));
 
         let simple = line_text(&render_turn_header_with_expansion(
             &rec,
@@ -11159,6 +11183,37 @@ mod tests {
         ));
         assert!(simple.contains("2026-04-13T12:34:56"));
         assert!(simple.contains("role: assistant"));
+    }
+
+    #[test]
+    fn turn_header_styles_line_and_char_counts_as_ui_chips() {
+        let rec = mr(
+            Some("2026-04-13T12:34:56Z"),
+            Role::Assistant,
+            "first content line\nsecond content line",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+
+        let header = render_turn_header_with_expansion(&rec, 0, TurnExpansion::OneLine, None);
+        assert!(line_text(&header).contains("2l 38c"));
+
+        let line_count = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "2l")
+            .expect("expected line-count span");
+        let char_count = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "38c")
+            .expect("expected char-count span");
+
+        assert_eq!(line_count.style, turn_line_count_style());
+        assert_eq!(char_count.style, turn_char_count_style());
+        assert_ne!(line_count.style.fg, char_count.style.fg);
+        assert!(line_count.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(char_count.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
