@@ -7424,6 +7424,11 @@ impl App {
                 break;
             }
             let rec = &self.all[rec_idx];
+            let turn_number = record_idxs
+                .iter()
+                .position(|&idx| idx == rec_idx)
+                .map(|pos| pos + 1)
+                .unwrap_or(i + 1);
             let role = match rec.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
@@ -7435,7 +7440,13 @@ impl App {
 
             let (section, section_record_indices): (Vec<Line<'static>>, Vec<Option<usize>>) = {
                 let mut section = vec![
-                    Line::raw(format!("-- hit {}/{} --", i + 1, total_matches)),
+                    Line::raw(format!(
+                        "-- hit {}/{}  turn {}/{} --",
+                        i + 1,
+                        total_matches,
+                        turn_number,
+                        record_idxs.len()
+                    )),
                     Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
                     Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                     Line::raw(format!(
@@ -10506,12 +10517,60 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("showing 2 of 2 matching messages"));
         assert!(rendered.contains("total query occurrences in shown message text: 3"));
-        assert!(rendered.contains("-- hit 1/2 --"));
-        assert!(rendered.contains("-- hit 2/2 --"));
+        assert!(rendered.contains("-- hit 1/2  turn 1/2 --"));
+        assert!(rendered.contains("-- hit 2/2  turn 2/2 --"));
         assert!(rendered.contains("query occurrences in this message: 2"));
         assert!(rendered.contains("query occurrences in this message: 1"));
         assert!(rendered.contains("first needle"));
         assert!(rendered.contains("second needle"));
+    }
+
+    #[test]
+    fn filtered_preview_hits_include_session_turn_positions() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "needle second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:04Z"),
+                Role::Assistant,
+                "needle fourth",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.preview_search.query = "needle".to_string();
+
+        let doc = app.build_preview_doc();
+        let rendered = doc
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("-- hit 1/2  turn 2/4 --"));
+        assert!(rendered.contains("-- hit 2/2  turn 4/4 --"));
     }
 
     #[test]
