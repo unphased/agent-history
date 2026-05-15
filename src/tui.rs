@@ -1093,6 +1093,21 @@ fn preview_section_record_indices(doc: &PreviewDoc) -> Vec<usize> {
         .collect()
 }
 
+fn cyclic_target_position(len: usize, current_pos: usize, dir: i32) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(if dir >= 0 {
+        if current_pos + 1 < len {
+            current_pos + 1
+        } else {
+            0
+        }
+    } else {
+        current_pos.checked_sub(1).unwrap_or(len - 1)
+    })
+}
+
 fn preview_record_visual_bounds(
     lines: &[Line<'_>],
     line_record_indices: &[Option<usize>],
@@ -3713,7 +3728,7 @@ fn handle_key(
             app.input_mode = InputMode::PreviewNav;
             return Ok(false);
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter) {
             app.input_mode = InputMode::PreviewNav;
             return Ok(false);
         }
@@ -5984,7 +5999,7 @@ impl App {
             ),
             InputMode::PreviewNav => "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events".to_string(),
             InputMode::PreviewSearch => format!(
-                "Esc/F10: clear search  Tab: keep search  Ctrl+u: clear  filter: \"{}\"",
+                "Esc/F10: clear search  Enter/Tab: keep search  Ctrl+u: clear  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
@@ -8221,16 +8236,9 @@ impl App {
                         turn_idx.min(scope_turns.len().saturating_sub(1))
                     }
                 });
-            let target_pos = if dir >= 0 {
-                if current_pos + 1 < scope_turns.len() {
-                    current_pos + 1
-                } else {
-                    0
-                }
-            } else {
-                current_pos
-                    .checked_sub(1)
-                    .unwrap_or(scope_turns.len().saturating_sub(1))
+            let Some(target_pos) = cyclic_target_position(scope_turns.len(), current_pos, dir)
+            else {
+                return;
             };
             if let Some(&record_idx) = scope_turns.get(target_pos) {
                 self.last_clicked_record_idx = None;
@@ -8268,16 +8276,9 @@ impl App {
             .iter()
             .position(|&record_idx| record_idx == current_record_idx)
             .unwrap_or(0);
-        let target_pos = if dir >= 0 {
-            if current_pos + 1 < section_records.len() {
-                current_pos + 1
-            } else {
-                0
-            }
-        } else {
-            current_pos
-                .checked_sub(1)
-                .unwrap_or(section_records.len() - 1)
+        let Some(target_pos) = cyclic_target_position(section_records.len(), current_pos, dir)
+        else {
+            return;
         };
         let target_record_idx = section_records[target_pos];
         self.reveal_preview_record(
@@ -13586,6 +13587,99 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::PreviewNav);
         assert_eq!(app.indexing.last_warn, None);
+    }
+
+    #[test]
+    fn handle_key_enter_in_preview_search_keeps_filter_and_returns_to_preview_nav() {
+        let all = vec![mr(
+            Some("2026-02-10T00:00:01Z"),
+            Role::User,
+            "needle",
+            "a",
+            SourceKind::CodexSessionJsonl,
+        )];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewSearch;
+        app.preview_search.query = "needle".to_string();
+        app.preview_search.cursor_pos = 6;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
+        assert_eq!(app.preview_search.query, "needle");
+        assert_eq!(app.preview_search.cursor_pos, 6);
+    }
+
+    #[test]
+    fn handle_key_j_and_k_after_preview_search_enter_move_between_filtered_hits() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "needle second",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:04Z"),
+                Role::Assistant,
+                "needle fourth",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewSearch;
+        app.preview_search.query = "needle".to_string();
+        app.preview_search.cursor_pos = 6;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .unwrap();
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.input_mode, InputMode::PreviewNav);
+        assert_eq!(app.selected_preview_record_idx, Some(3));
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        )
+        .unwrap();
+        assert_eq!(app.selected_preview_record_idx, Some(1));
     }
 
     #[test]
