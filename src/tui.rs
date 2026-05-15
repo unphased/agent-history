@@ -4818,7 +4818,7 @@ fn route_mouse(app: &mut App, area: Rect, mouse: MouseEvent) {
                                 adjusted_mouse,
                             );
                             if let Some(record_idx) = app.hovered_record_idx {
-                                app.reveal_preview_record_from_click(
+                                app.reveal_preview_record_from_start_if_tall(
                                     &preview_lines,
                                     &preview_doc.line_record_indices,
                                     preview_width,
@@ -5244,7 +5244,7 @@ impl App {
         self.remember_selected_session_preview_state(preview_width);
     }
 
-    fn reveal_preview_record_from_click(
+    fn reveal_preview_record_from_start_if_tall(
         &mut self,
         preview_lines: &[Line<'_>],
         line_record_indices: &[Option<usize>],
@@ -8305,7 +8305,7 @@ impl App {
             return;
         };
         let target_record_idx = section_records[target_pos];
-        self.reveal_preview_record(
+        self.reveal_preview_record_from_start_if_tall(
             &preview_lines,
             &doc.line_record_indices,
             preview_width,
@@ -12695,6 +12695,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn jump_preview_record_to_tall_filtered_hit_starts_at_section_top() {
+        let tall_hit = std::iter::once("needle tall hit".to_string())
+            .chain((1..=24).map(|line| format!("context line {line}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "needle first",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                &tall_hit,
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:03Z"),
+                Role::User,
+                "needle third",
+                "a",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.preview_search.query = "needle".to_string();
+        app.selected_preview_record_idx = Some(2);
+
+        let preview_width = 80;
+        let preview_height = 6;
+        let doc = app.build_preview_doc();
+        let preview_lines = preview_layout_lines(&doc, None);
+        let (tall_start, tall_end) = preview_record_visual_bounds(
+            &preview_lines,
+            &doc.line_record_indices,
+            preview_width,
+            1,
+        )
+        .expect("expected tall hit bounds");
+        let (third_start, _) = preview_record_visual_bounds(
+            &preview_lines,
+            &doc.line_record_indices,
+            preview_width,
+            2,
+        )
+        .expect("expected third hit bounds");
+        assert!(tall_end.saturating_sub(tall_start) > preview_height);
+
+        app.preview_scroll = third_start;
+        app.jump_preview_record(-1, preview_width, preview_height);
+
+        assert_eq!(app.selected_preview_record_idx, Some(1));
+        assert_eq!(app.preview_scroll, tall_start);
     }
 
     #[test]
