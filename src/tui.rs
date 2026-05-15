@@ -1299,40 +1299,50 @@ fn render_turn_header_with_expansion(
     };
     match expansion {
         TurnExpansion::OneLine => {
-            let mut spans = vec![Span::raw(format!(
-                "{} {} {} ",
-                expansion.indicator(),
-                turn_position_in_scope + 1,
-                timestamp
-            ))];
+            let mut spans = turn_header_prefix_spans(expansion, turn_position_in_scope, &timestamp);
+            spans.push(Span::raw(" "));
             spans.extend(turn_size_indicator_spans(&rec.text));
             spans.push(Span::raw(format!(" {}", compact_single_line(&rec.text))));
             Line::from(spans)
         }
         TurnExpansion::Compact => {
-            let mut spans = vec![Span::raw(format!(
-                "{} {} {} {} phase:{} ",
-                expansion.indicator(),
-                turn_position_in_scope + 1,
-                timestamp,
+            let mut spans = turn_header_prefix_spans(expansion, turn_position_in_scope, &timestamp);
+            spans.push(Span::raw(format!(
+                " {} phase:{} ",
                 role_abbrev(rec.role),
                 abbrev_field(rec.phase.as_deref().unwrap_or(""))
-            ))];
+            )));
             spans.extend(turn_size_indicator_spans(&rec.text));
             Line::from(spans)
         }
         TurnExpansion::Simple | TurnExpansion::Full => {
-            let mut spans = vec![Span::raw(format!(
-                "{} {}   {}   role: {role}   phase: {}   ",
-                expansion.indicator(),
-                turn_position_in_scope + 1,
-                timestamp,
+            let mut spans = turn_header_prefix_spans(expansion, turn_position_in_scope, &timestamp);
+            spans.push(Span::raw(format!(
+                "   role: {role}   phase: {}   ",
                 rec.phase.as_deref().unwrap_or("")
-            ))];
+            )));
             spans.extend(turn_size_indicator_spans(&rec.text));
             Line::from(spans)
         }
     }
+}
+
+fn turn_header_prefix_spans(
+    expansion: TurnExpansion,
+    turn_position_in_scope: usize,
+    timestamp: &str,
+) -> Vec<Span<'static>> {
+    vec![
+        Span::raw(format!("{} ", expansion.indicator())),
+        Span::styled((turn_position_in_scope + 1).to_string(), turn_index_style()),
+        Span::raw(format!(" {timestamp}")),
+    ]
+}
+
+fn turn_index_style() -> Style {
+    Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn role_label(role: Role) -> &'static str {
@@ -11347,6 +11357,39 @@ mod tests {
         assert_ne!(line_count.style.fg, char_count.style.fg);
         assert!(line_count.style.add_modifier.contains(Modifier::ITALIC));
         assert!(char_count.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn turn_header_styles_turn_index_without_styling_timestamp() {
+        let rec = mr(
+            Some("2026-04-13T12:34:56Z"),
+            Role::Assistant,
+            "first content line",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+
+        let header = render_turn_header_with_expansion(
+            &rec,
+            1,
+            TurnExpansion::OneLine,
+            None,
+            TimestampDisplayMode::Absolute,
+        );
+
+        let index = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "2")
+            .expect("expected turn-index span");
+        let timestamp = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("2026-04-13T12:34:56"))
+            .expect("expected timestamp span");
+
+        assert_eq!(index.style, turn_index_style());
+        assert_eq!(timestamp.style, Style::default());
     }
 
     #[test]
