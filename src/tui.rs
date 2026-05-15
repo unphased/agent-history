@@ -297,6 +297,28 @@ enum InputMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimestampDisplayMode {
+    Relative,
+    Absolute,
+}
+
+impl TimestampDisplayMode {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Relative => Self::Absolute,
+            Self::Absolute => Self::Relative,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Relative => "relative",
+            Self::Absolute => "absolute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveSplit {
     ResultsGit,
     GitTurns,
@@ -1158,6 +1180,42 @@ fn short_ts_millis(ts: Option<&str>) -> String {
     ts.get(0..23).unwrap_or(ts).to_string()
 }
 
+fn timestamp_label(ts: Option<&str>, mode: TimestampDisplayMode) -> String {
+    let ts = ts.unwrap_or("");
+    match mode {
+        TimestampDisplayMode::Absolute => short_ts(Some(ts)),
+        TimestampDisplayMode::Relative => relative_timestamp_label(ts, unix_now_nanos() as i128)
+            .unwrap_or_else(|| short_ts(Some(ts))),
+    }
+}
+
+fn relative_timestamp_label(ts: &str, now_nanos: i128) -> Option<String> {
+    let timestamp_nanos = parse_timestamp_nanos(ts)?;
+    let delta_nanos = now_nanos.saturating_sub(timestamp_nanos);
+    let future = delta_nanos < 0;
+    let seconds = delta_nanos.abs().div_euclid(1_000_000_000);
+    let value = if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds < 604_800 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds < 2_592_000 {
+        format!("{}w", seconds / 604_800)
+    } else if seconds < 31_536_000 {
+        format!("{}mo", seconds / 2_592_000)
+    } else {
+        format!("{}y", seconds / 31_536_000)
+    };
+    Some(if future {
+        format!("in {value}")
+    } else {
+        format!("{value} ago")
+    })
+}
+
 fn parse_timestamp_epoch(ts: &str) -> Option<i64> {
     if let Ok(n) = ts.parse::<i64>() {
         let abs = n.unsigned_abs();
@@ -1228,13 +1286,16 @@ fn render_turn_header_with_expansion(
     turn_position_in_scope: usize,
     expansion: TurnExpansion,
     previous_timestamp: Option<&str>,
+    timestamp_mode: TimestampDisplayMode,
 ) -> Line<'static> {
     let role = role_label(rec.role);
     let timestamp = match expansion {
         TurnExpansion::OneLine | TurnExpansion::Compact => {
-            compact_turn_timestamp(rec.timestamp.as_deref(), previous_timestamp)
+            compact_turn_timestamp(rec.timestamp.as_deref(), previous_timestamp, timestamp_mode)
         }
-        TurnExpansion::Simple | TurnExpansion::Full => short_ts(rec.timestamp.as_deref()),
+        TurnExpansion::Simple | TurnExpansion::Full => {
+            timestamp_label(rec.timestamp.as_deref(), timestamp_mode)
+        }
     };
     match expansion {
         TurnExpansion::OneLine => {
@@ -1329,15 +1390,22 @@ fn turn_char_count_style() -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
-fn compact_turn_timestamp(ts: Option<&str>, previous_ts: Option<&str>) -> String {
-    let current = short_ts(ts);
+fn compact_turn_timestamp(
+    ts: Option<&str>,
+    previous_ts: Option<&str>,
+    timestamp_mode: TimestampDisplayMode,
+) -> String {
+    let current = timestamp_label(ts, timestamp_mode);
     if current.is_empty() {
+        return current;
+    }
+    if timestamp_mode == TimestampDisplayMode::Relative {
         return current;
     }
     let Some(previous_ts) = previous_ts else {
         return current;
     };
-    let previous = short_ts(Some(previous_ts));
+    let previous = timestamp_label(Some(previous_ts), timestamp_mode);
     if current.len() >= 19 && previous.len() >= 19 {
         if current.get(0..13) == previous.get(0..13) {
             return current.get(14..19).unwrap_or(&current).to_string();
@@ -1465,11 +1533,15 @@ fn telemetry_relative_age(now_ms: u128, event_ms: u128) -> String {
     format!("{}d", cmp::max(1, elapsed_ms / 86_400_000))
 }
 
-fn format_telemetry_event_line(record: &telemetry::EventRecord) -> String {
-    format_telemetry_event_line_with_now(record, unix_now_nanos() / 1_000_000)
+fn format_telemetry_event_line_with_now(record: &telemetry::EventRecord, now_ms: u128) -> String {
+    format_telemetry_event_line_with_mode(record, now_ms, TimestampDisplayMode::Absolute)
 }
 
-fn format_telemetry_event_line_with_now(record: &telemetry::EventRecord, now_ms: u128) -> String {
+fn format_telemetry_event_line_with_mode(
+    record: &telemetry::EventRecord,
+    now_ms: u128,
+    timestamp_mode: TimestampDisplayMode,
+) -> String {
     let ts = short_ts_millis(Some(&record.ts_ms.to_string()));
     let rel = telemetry_relative_age(now_ms, record.ts_ms);
     let kind = record.kind.as_str();
@@ -1635,10 +1707,16 @@ fn format_telemetry_event_line_with_now(record: &telemetry::EventRecord, now_ms:
         _ => serde_json::to_string(data).unwrap_or_default(),
     };
 
-    if ts.is_empty() {
-        format!("{prefix}{kind}: {summary}")
-    } else {
-        format!("{ts}  {:>8}  {prefix}{kind}: {summary}", rel)
+    match timestamp_mode {
+        TimestampDisplayMode::Absolute if ts.is_empty() => {
+            format!("{prefix}{kind}: {summary}")
+        }
+        TimestampDisplayMode::Absolute => {
+            format!("{ts}  {:>8}  {prefix}{kind}: {summary}", rel)
+        }
+        TimestampDisplayMode::Relative => {
+            format!("{rel} ago  {prefix}{kind}: {summary}")
+        }
     }
 }
 
@@ -1897,8 +1975,9 @@ fn result_line_text(
     sess: &SessionSummary,
     matched: Option<&MessageRecord>,
     hit_count: usize,
+    timestamp_mode: TimestampDisplayMode,
 ) -> String {
-    let ts = short_ts(sess.last_ts.as_deref());
+    let ts = timestamp_label(sess.last_ts.as_deref(), timestamp_mode);
     let dir_prefix = match (sess.project_key.as_deref(), sess.project_slug.as_deref()) {
         (Some(_), Some(project)) if project == sess.dir => String::new(),
         _ => format!("[{}] ", sess.dir),
@@ -1931,9 +2010,10 @@ fn result_line(
     query: &str,
     ui_tags: &config::UiTagConfig,
     base_style: Style,
+    timestamp_mode: TimestampDisplayMode,
 ) -> Line<'static> {
-    let full_text = result_line_text(sess, matched, hit_count);
-    let ts = short_ts(sess.last_ts.as_deref());
+    let full_text = result_line_text(sess, matched, hit_count, timestamp_mode);
+    let ts = timestamp_label(sess.last_ts.as_deref(), timestamp_mode);
     let rest = full_text
         .strip_prefix(&ts)
         .unwrap_or(&full_text)
@@ -3328,6 +3408,7 @@ struct App {
     turn_expansions: HashMap<usize, TurnExpansion>,
     chrono_turns: Vec<usize>,
     browser_mode: BrowserMode,
+    timestamp_mode: TimestampDisplayMode,
     preview_scroll: usize,
     preview_scroll_reset_pending: bool,
     session_browser_start_scroll: usize,
@@ -3461,6 +3542,7 @@ fn run_app(
         turn_expansions: HashMap::new(),
         chrono_turns: Vec::new(),
         browser_mode: BrowserMode::from_ui_state(ui_state.browser_mode),
+        timestamp_mode: TimestampDisplayMode::Relative,
         preview_scroll: 0,
         preview_scroll_reset_pending: false,
         session_browser_start_scroll: 0,
@@ -3816,6 +3898,10 @@ fn handle_key(
         }
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.toggle_browser_mode();
+            return Ok(false);
+        }
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_timestamp_mode();
             return Ok(false);
         }
         KeyCode::Char('r')
@@ -4592,9 +4678,11 @@ fn visible_result_range(app: &App, results_area: Rect) -> (usize, usize) {
 fn tag_filter_at_result_column(
     sess: &SessionSummary,
     tags: &config::UiTagConfig,
+    timestamp_mode: TimestampDisplayMode,
     content_x: usize,
 ) -> Option<TagFilter> {
-    let ts_width = UnicodeWidthStr::width(short_ts(sess.last_ts.as_deref()).as_str());
+    let ts_width =
+        UnicodeWidthStr::width(timestamp_label(sess.last_ts.as_deref(), timestamp_mode).as_str());
     let specs = session_tag_specs(sess, tags);
     if specs.is_empty() {
         return None;
@@ -4679,7 +4767,9 @@ fn handle_results_click(app: &mut App, results_area: Rect, mouse: MouseEvent) {
     };
 
     let content_x = (mouse.column - results_area.x - 1) as usize;
-    if let Some(filter) = tag_filter_at_result_column(sess, &app.ui_tags, content_x) {
+    if let Some(filter) =
+        tag_filter_at_result_column(sess, &app.ui_tags, app.timestamp_mode, content_x)
+    {
         app.apply_tag_filter_from_results(filter);
     }
 }
@@ -6012,25 +6102,25 @@ impl App {
     fn footer_help_text(&self) -> String {
         if self.show_telemetry {
             return format!(
-                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
+                "Esc/F10/Ctrl+c: quit  Ctrl+t: events  Ctrl+g: perf  Ctrl+x: time  PgUp/PgDn: scroll page  wheel: scroll  Ctrl+u: clear events filter  filter: \"{}\"",
                 self.displayed_query().trim()
             );
         }
         match self.input_mode {
             InputMode::SessionSearch => format!(
-                "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: clear filters  Ctrl+t: events  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
+                "Enter: resume  Tab: preview  Ctrl+o: resume  Ctrl+p: raw  Esc/F10: clear filters  Ctrl+t: events  Ctrl+x: time  Ctrl+v: git  Ctrl+d: commit  Ctrl+l: layout  Ctrl+y: mode  Ctrl+r: refresh git  ↑/↓: move  PgUp/PgDn: page results  Ctrl+u: clear  query: \"{}\"",
                 self.displayed_query().trim()
             ),
-            InputMode::PreviewNav => "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+y: mode  Ctrl+t: events".to_string(),
+            InputMode::PreviewNav => "Enter/click: cycle view  Ctrl+o: resume  Ctrl+p: raw  Tab/Shift+Tab: focus  Esc/F10: search  /: preview search  j/k: prev/next turn  n/N: next/prev match  g/G: top/end  ↑/↓: scroll  PgUp/PgDn: page  -/=: resize  Ctrl+x: time  Ctrl+y: mode  Ctrl+t: events".to_string(),
             InputMode::PreviewSearch => format!(
-                "Esc/F10: clear search  Enter/Tab: keep search  Ctrl+u: clear  filter: \"{}\"",
+                "Esc/F10: clear search  Enter/Tab: keep search  Ctrl+u: clear  Ctrl+x: time  filter: \"{}\"",
                 self.preview_search.query
             ),
             InputMode::GitGraph => {
-                "Tab/Shift+Tab: focus  Esc/F10: search  g/G: top/end  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  g/G: top/end  ↑/↓: scroll graph  PgUp/PgDn: page  -/=: width  _/+: git split  Ctrl+r: refresh git  Ctrl+x: time  Ctrl+t: events".to_string()
             }
             InputMode::GitCommit => {
-                "Tab/Shift+Tab: focus  Esc/F10: search  g/G: top/end  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+t: events".to_string()
+                "Tab/Shift+Tab: focus  Esc/F10: search  g/G: top/end  ↑/↓: scroll commit  PgUp/PgDn: page  -/=: width  _/+: graph split  Ctrl+r: refresh git  Ctrl+x: time  Ctrl+t: events".to_string()
             }
         }
     }
@@ -6846,7 +6936,13 @@ impl App {
             .and_then(|&previous_record_idx| self.all.get(previous_record_idx))
             .and_then(|previous| previous.timestamp.as_deref());
         let header_lines = wrap_preview_line(
-            &render_turn_header_with_expansion(&rec, scope_idx, expansion, previous_timestamp),
+            &render_turn_header_with_expansion(
+                &rec,
+                scope_idx,
+                expansion,
+                previous_timestamp,
+                self.timestamp_mode,
+            ),
             width,
         );
         let mut lines = Vec::with_capacity(
@@ -6897,7 +6993,13 @@ impl App {
             .and_then(|&previous_record_idx| self.all.get(previous_record_idx))
             .and_then(|previous| previous.timestamp.as_deref());
         let header_height = wrap_preview_line(
-            &render_turn_header_with_expansion(&rec, scope_idx, expansion, previous_timestamp),
+            &render_turn_header_with_expansion(
+                &rec,
+                scope_idx,
+                expansion,
+                previous_timestamp,
+                self.timestamp_mode,
+            ),
             width,
         )
         .len();
@@ -7267,7 +7369,7 @@ impl App {
             lines.push(Line::raw(format!(
                 "turn {}   {}   role: {role}   phase: {}{}",
                 pos + 1,
-                short_ts(rec.timestamp.as_deref()),
+                timestamp_label(rec.timestamp.as_deref(), self.timestamp_mode),
                 rec.phase.as_deref().unwrap_or(""),
                 if is_match { "   [match]" } else { "" }
             )));
@@ -7352,6 +7454,7 @@ impl App {
                 pos,
                 expansion,
                 previous_timestamp,
+                self.timestamp_mode,
             ));
             line_record_indices.push(Some(idx));
             line_record_indices.extend(std::iter::repeat_n(Some(idx), rendered_body.lines.len()));
@@ -7486,7 +7589,10 @@ impl App {
                         turn_number,
                         record_idxs.len()
                     )),
-                    Line::raw(format!("timestamp: {}", short_ts(rec.timestamp.as_deref()))),
+                    Line::raw(format!(
+                        "timestamp: {}",
+                        timestamp_label(rec.timestamp.as_deref(), self.timestamp_mode)
+                    )),
                     Line::raw(format!("account: {}", rec.account.as_deref().unwrap_or(""))),
                     Line::raw(format!(
                         "role: {role}   phase: {}",
@@ -7688,7 +7794,11 @@ impl App {
         let mut matches = Vec::new();
         let mut pushed_events = false;
         for record in buffered_records.iter().rev() {
-            let rendered = format_telemetry_event_line(record);
+            let rendered = format_telemetry_event_line_with_mode(
+                record,
+                unix_now_nanos() / 1_000_000,
+                self.timestamp_mode,
+            );
             let rendered_matches = search::find_term_match_ranges(filter_query, &rendered);
             if !filter_query.is_empty() && rendered_matches.is_empty() {
                 continue;
@@ -7779,10 +7889,11 @@ impl App {
                 };
             }
         };
-        let anchor_ts = short_ts(
+        let anchor_ts = timestamp_label(
             self.all
                 .get(git_match.anchor_record_idx)
                 .and_then(|rec| rec.timestamp.as_deref()),
+            self.timestamp_mode,
         );
         let Ok(repo) = self.git_repo_context(&git_match.repo_root) else {
             self.last_git_graph_anchor = None;
@@ -8408,6 +8519,14 @@ impl App {
         });
     }
 
+    fn toggle_timestamp_mode(&mut self) {
+        self.timestamp_mode = self.timestamp_mode.toggle();
+        self.turn_cache.entries.clear();
+        self.last_viewport_result = None;
+        self.preview_scroll_reset_pending = true;
+        self.set_ui_status(format!("timestamps {}", self.timestamp_mode.label()));
+    }
+
     fn toggle_log_group(&mut self, group: LogGroup) {
         let enabled = if self.enabled_log_groups.contains(&group) {
             self.enabled_log_groups.remove(&group);
@@ -8711,6 +8830,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             &query,
             &app.ui_tags,
             Style::default(),
+            app.timestamp_mode,
         ));
     }
 
@@ -9001,6 +9121,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             &query,
             &app.ui_tags,
             selected_base_style,
+            app.timestamp_mode,
         );
         let mut adjusted_spans = Vec::with_capacity(selected_line.spans.len());
         for span in selected_line.spans.drain(..) {
@@ -9195,7 +9316,7 @@ fn build_opencode_session_pager_text(app: &App, rec: &MessageRecord) -> String {
         out.push_str(&format!("== message {} ==\n", pos + 1));
         out.push_str(&format!(
             "timestamp: {}\n",
-            short_ts(item.timestamp.as_deref())
+            timestamp_label(item.timestamp.as_deref(), app.timestamp_mode)
         ));
         out.push_str(&format!("role: {role}\n"));
         if let Some(phase) = item.phase.as_deref()
@@ -9611,6 +9732,7 @@ mod tests {
             turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
+            timestamp_mode: TimestampDisplayMode::Relative,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -10358,6 +10480,7 @@ mod tests {
             turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
+            timestamp_mode: TimestampDisplayMode::Relative,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -10484,6 +10607,7 @@ mod tests {
             turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
+            timestamp_mode: TimestampDisplayMode::Relative,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -11161,6 +11285,7 @@ mod tests {
             1,
             TurnExpansion::OneLine,
             Some("2026-04-13T12:33:00Z"),
+            TimestampDisplayMode::Absolute,
         ));
         assert!(one_line.starts_with(". 2 34:56 2l "));
         assert!(one_line.contains("first content line"));
@@ -11172,6 +11297,7 @@ mod tests {
             1,
             TurnExpansion::Compact,
             Some("2026-04-13T12:33:00Z"),
+            TimestampDisplayMode::Absolute,
         ));
         assert!(compact.starts_with(": 2 34:56 a phase:assistant-re~ 2l "));
 
@@ -11180,6 +11306,7 @@ mod tests {
             1,
             TurnExpansion::Simple,
             Some("2026-04-13T12:33:00Z"),
+            TimestampDisplayMode::Absolute,
         ));
         assert!(simple.contains("2026-04-13T12:34:56"));
         assert!(simple.contains("role: assistant"));
@@ -11195,7 +11322,13 @@ mod tests {
             SourceKind::CodexSessionJsonl,
         );
 
-        let header = render_turn_header_with_expansion(&rec, 0, TurnExpansion::OneLine, None);
+        let header = render_turn_header_with_expansion(
+            &rec,
+            0,
+            TurnExpansion::OneLine,
+            None,
+            TimestampDisplayMode::Absolute,
+        );
         assert!(line_text(&header).contains("2l 38c"));
 
         let line_count = header
@@ -12103,11 +12236,19 @@ mod tests {
         let sess = app.sessions.get(app.filtered[0].session_idx).unwrap();
         let expected_project = sess.project_slug.clone().unwrap();
         let expected_project_key = sess.project_key.clone().unwrap();
-        let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let rendered = result_line(
+            sess,
+            None,
+            0,
+            "",
+            &app.ui_tags,
+            Style::default(),
+            app.timestamp_mode,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
         let project_offset = rendered.find(&format!(" {} ", expected_project)).unwrap() as u16 + 1;
 
         route_mouse(
@@ -12417,11 +12558,19 @@ mod tests {
         let results_area = app_geometry(area, &app).results;
         let hit = app.filtered[alpha_row];
         let sess = app.sessions.get(hit.session_idx).unwrap();
-        let rendered = result_line(sess, None, 0, "", &app.ui_tags, Style::default())
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let rendered = result_line(
+            sess,
+            None,
+            0,
+            "",
+            &app.ui_tags,
+            Style::default(),
+            app.timestamp_mode,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
         let project_offset = rendered.find(" alpha ").unwrap() as u16 + 1;
 
         route_mouse(
@@ -12485,6 +12634,7 @@ mod tests {
             "",
             &config::UiTagConfig::default(),
             Style::default(),
+            TimestampDisplayMode::Absolute,
         );
         let rendered = line
             .spans
@@ -13639,6 +13789,34 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_ctrl_x_toggles_timestamp_display_mode_globally() {
+        let mut app = empty_app();
+        assert_eq!(app.timestamp_mode, TimestampDisplayMode::Relative);
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert_eq!(app.timestamp_mode, TimestampDisplayMode::Absolute);
+        assert_eq!(app.ui_status.as_deref(), Some("timestamps absolute"));
+
+        handle_key(
+            &mut terminal,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert_eq!(app.timestamp_mode, TimestampDisplayMode::Relative);
+        assert_eq!(app.ui_status.as_deref(), Some("timestamps relative"));
+    }
+
+    #[test]
     fn handle_key_enter_in_events_does_not_resume_selected_session() {
         let mut rec = mr(
             Some("2026-02-10T00:00:01Z"),
@@ -14117,6 +14295,7 @@ mod tests {
             "",
             &config::UiTagConfig::default(),
             Style::default(),
+            TimestampDisplayMode::Absolute,
         );
         let rendered = line
             .spans
@@ -14194,6 +14373,7 @@ mod tests {
             turn_expansions: HashMap::new(),
             chrono_turns: Vec::new(),
             browser_mode: BrowserMode::Session,
+            timestamp_mode: TimestampDisplayMode::Relative,
             preview_scroll: 0,
             preview_scroll_reset_pending: false,
             session_browser_start_scroll: 0,
@@ -14705,6 +14885,47 @@ mod tests {
             short_ts_millis(Some("2026-02-10T00:00:00.456Z")),
             "2026-02-10T00:00:00.456"
         );
+    }
+
+    #[test]
+    fn relative_timestamp_label_formats_ago_and_future_values() {
+        let now = parse_timestamp_nanos("2026-05-15T12:00:00Z").unwrap();
+
+        assert_eq!(
+            relative_timestamp_label("2026-05-15T11:59:45Z", now).as_deref(),
+            Some("15s ago")
+        );
+        assert_eq!(
+            relative_timestamp_label("2026-05-15T10:00:00Z", now).as_deref(),
+            Some("2h ago")
+        );
+        assert_eq!(
+            relative_timestamp_label("2026-05-15T12:03:00Z", now).as_deref(),
+            Some("in 3m")
+        );
+    }
+
+    #[test]
+    fn relative_turn_headers_do_not_use_terse_repeated_timestamp_segments() {
+        let mut rec = mr(
+            Some("2024-01-01T00:00:00Z"),
+            Role::Assistant,
+            "first content line",
+            "session-a",
+            SourceKind::CodexSessionJsonl,
+        );
+        rec.phase = Some("assistant-reply-phase".to_string());
+
+        let one_line = line_text(&render_turn_header_with_expansion(
+            &rec,
+            1,
+            TurnExpansion::OneLine,
+            Some("2024-01-01T00:00:30Z"),
+            TimestampDisplayMode::Relative,
+        ));
+
+        assert!(one_line.contains("ago"));
+        assert!(!one_line.contains("00:30"));
     }
 
     #[test]
