@@ -42,7 +42,7 @@ use std::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const TERMINAL_TITLE: &str = "agent-history";
+const INITIAL_TERMINAL_TITLE: &str = "(ag-hist) loading";
 const SAVE_TERMINAL_TITLE: &str = "\x1b[22;0t";
 const RESTORE_TERMINAL_TITLE: &str = "\x1b[23;0t";
 
@@ -3561,7 +3561,7 @@ fn enter_tui_terminal<W: io::Write>(writer: &mut W, hide_cursor: bool) -> io::Re
     execute!(
         writer,
         Print(SAVE_TERMINAL_TITLE),
-        SetTitle(TERMINAL_TITLE),
+        SetTitle(INITIAL_TERMINAL_TITLE),
         EnterAlternateScreen,
         EnableMouseCapture
     )?;
@@ -3579,6 +3579,28 @@ fn leave_tui_terminal<W: io::Write>(writer: &mut W) -> io::Result<()> {
         DisableMouseCapture,
         Print(RESTORE_TERMINAL_TITLE)
     )
+}
+
+fn session_id_title_suffix(session_id: &str) -> String {
+    let mut chars = session_id
+        .chars()
+        .rev()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(4)
+        .collect::<Vec<_>>();
+    if chars.is_empty() {
+        chars = session_id
+            .chars()
+            .rev()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(4)
+            .collect();
+    }
+    if chars.is_empty() {
+        return "----".to_string();
+    }
+    chars.reverse();
+    chars.into_iter().map(|c| c.to_ascii_lowercase()).collect()
 }
 
 fn run_app(
@@ -3706,6 +3728,7 @@ fn run_app(
     }
 
     let mut dirty = true;
+    let mut last_terminal_title = String::new();
     let mut next_session_follow_poll = Instant::now() + SESSION_FOLLOW_POLL_INTERVAL;
     loop {
         let loop_started = Instant::now();
@@ -3730,6 +3753,11 @@ fn run_app(
         let mut draw_duration_ms = 0u128;
         if dirty {
             sync_preview_bgcolor(&mut app);
+            let terminal_title = app.terminal_title();
+            if terminal_title != last_terminal_title {
+                execute!(terminal.backend_mut(), SetTitle(terminal_title.as_str())).ok();
+                last_terminal_title = terminal_title;
+            }
             let draw_started = Instant::now();
             terminal
                 .draw(|f| ui(f, &mut app))
@@ -6060,6 +6088,62 @@ impl App {
         let turns = self.selected_session_turn_count();
         let turn_label = if turns == 1 { "turn" } else { "turns" };
         format!("{label}  {turns} {turn_label}")
+    }
+
+    fn terminal_title(&self) -> String {
+        if !self.ready {
+            return INITIAL_TERMINAL_TITLE.to_string();
+        }
+
+        let mode = if self.show_telemetry {
+            "events"
+        } else if self.chrono_browser_active() {
+            "chrono"
+        } else {
+            "turns"
+        };
+        let (session_suffix, turn_label) = self.terminal_title_focus_parts();
+        format!(
+            "(ag-hist) {mode} seshs:{} sid:{session_suffix} turn:{turn_label}",
+            self.filtered.len()
+        )
+    }
+
+    fn terminal_title_focus_parts(&self) -> (String, String) {
+        let focused_record_idx = self.terminal_title_focus_record_idx();
+        let session_idx = focused_record_idx
+            .and_then(|record_idx| self.record_session_idx(record_idx))
+            .or_else(|| self.selected_hit().map(|hit| hit.session_idx));
+        let session_suffix = session_idx
+            .and_then(|idx| self.sessions.get(idx))
+            .map(|session| session_id_title_suffix(&session.session_id))
+            .unwrap_or_else(|| "----".to_string());
+        let turn_label = focused_record_idx
+            .and_then(|record_idx| {
+                let session_idx = session_idx?;
+                let record_indices = self.session_records.get(session_idx)?;
+                let turn_idx = record_indices.iter().position(|&idx| idx == record_idx)?;
+                Some(format!("{}/{}", turn_idx + 1, record_indices.len()))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        (session_suffix, turn_label)
+    }
+
+    fn terminal_title_focus_record_idx(&self) -> Option<usize> {
+        let scope_turns = self.resolve_turn_scope_indices();
+        self.focused_record_idx
+            .filter(|record_idx| scope_turns.contains(record_idx))
+            .or_else(|| {
+                self.selected_preview_record_idx
+                    .filter(|record_idx| scope_turns.contains(record_idx))
+            })
+            .or_else(|| self.selected_hit().and_then(|hit| hit.matched_record_idx))
+            .or_else(|| {
+                let hit = self.selected_hit()?;
+                self.sessions
+                    .get(hit.session_idx)
+                    .map(|session| session.first_user_idx)
+            })
     }
 
     fn chrono_browser_active(&self) -> bool {
@@ -10155,8 +10239,37 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains(SAVE_TERMINAL_TITLE));
-        assert!(output.contains("\x1b]0;agent-history\x07"));
+        assert!(output.contains("\x1b]0;(ag-hist) loading\x07"));
         assert!(output.contains(RESTORE_TERMINAL_TITLE));
+    }
+
+    #[test]
+    fn terminal_title_includes_result_count_session_suffix_and_focused_turn() {
+        let all = vec![
+            mr(
+                Some("2026-02-10T00:00:01Z"),
+                Role::User,
+                "first",
+                "11112222-3333-4444-5555-abcdef12abcd",
+                SourceKind::CodexSessionJsonl,
+            ),
+            mr(
+                Some("2026-02-10T00:00:02Z"),
+                Role::Assistant,
+                "second",
+                "11112222-3333-4444-5555-abcdef12abcd",
+                SourceKind::CodexSessionJsonl,
+            ),
+        ];
+        let mut app = ready_app_with_indexed_data(all);
+        app.update_results();
+        app.input_mode = InputMode::PreviewNav;
+        app.focused_record_idx = Some(1);
+
+        assert_eq!(
+            app.terminal_title(),
+            "(ag-hist) turns seshs:1 sid:abcd turn:2/2"
+        );
     }
 
     fn empty_app() -> App {
