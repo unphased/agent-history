@@ -15,7 +15,10 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::Print,
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -38,6 +41,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const TERMINAL_TITLE: &str = "agent-history";
+const SAVE_TERMINAL_TITLE: &str = "\x1b[22;0t";
+const RESTORE_TERMINAL_TITLE: &str = "\x1b[23;0t";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TagFilterKind {
@@ -3535,8 +3542,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("failed to enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to switch screen")?;
+    enter_tui_terminal(&mut stdout, false).context("failed to switch screen")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
@@ -3545,16 +3551,34 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let res = run_app(&mut terminal, rx, args);
 
     disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        cursor::Show,
-        DisableMouseCapture
-    )
-    .ok();
+    leave_tui_terminal(terminal.backend_mut()).ok();
     terminal.show_cursor().ok();
 
     res
+}
+
+fn enter_tui_terminal<W: io::Write>(writer: &mut W, hide_cursor: bool) -> io::Result<()> {
+    execute!(
+        writer,
+        Print(SAVE_TERMINAL_TITLE),
+        SetTitle(TERMINAL_TITLE),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    if hide_cursor {
+        execute!(writer, cursor::Hide)?;
+    }
+    Ok(())
+}
+
+fn leave_tui_terminal<W: io::Write>(writer: &mut W) -> io::Result<()> {
+    execute!(
+        writer,
+        LeaveAlternateScreen,
+        cursor::Show,
+        DisableMouseCapture,
+        Print(RESTORE_TERMINAL_TITLE)
+    )
 }
 
 fn run_app(
@@ -10078,25 +10102,13 @@ fn run_with_tui_suspended<R>(
     f: impl FnOnce() -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
     disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        cursor::Show,
-        DisableMouseCapture
-    )
-    .ok();
+    leave_tui_terminal(terminal.backend_mut()).ok();
     terminal.show_cursor().ok();
 
     let res = f();
 
     enable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        cursor::Hide,
-        EnableMouseCapture
-    )
-    .ok();
+    enter_tui_terminal(terminal.backend_mut(), true).ok();
     terminal.hide_cursor().ok();
     terminal.clear().ok();
 
@@ -10132,6 +10144,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn tui_terminal_entry_sets_and_restores_title() {
+        let mut out = Vec::new();
+
+        enter_tui_terminal(&mut out, false).unwrap();
+        leave_tui_terminal(&mut out).unwrap();
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains(SAVE_TERMINAL_TITLE));
+        assert!(output.contains("\x1b]0;agent-history\x07"));
+        assert!(output.contains(RESTORE_TERMINAL_TITLE));
     }
 
     fn empty_app() -> App {
