@@ -97,6 +97,29 @@ The important property is bidirectionality: apps can publish their native
 structure, but the central engine can suggest cross-app structure without
 rewriting app truth.
 
+## First Dogfood Adapter: Git
+
+Git is a strong first app-side adapter because it already provides deeply
+structured, content-addressed, graph-shaped data. A thin Git adapter can start
+by recording commits, parent edges, refs, trees, changed paths, and patch
+payloads as facts while preserving Git as the authority for native
+connectivity.
+
+This should stay a glue layer. The adapter observes Git's own structure and
+publishes it into the knowledge engine; MIP then builds derived summaries,
+views, and signals over that source material.
+
+Git also tests the hard part of the multiscale idea: useful work often hides
+inside long commit sequences, merges, mixed-purpose commits, and broad change
+sets. The engine should make it possible to navigate from a high-level
+history summary down through branches, commit ranges, individual commits,
+files, hunks, and source blobs without losing provenance.
+
+Potential seam-finding is deliberately framed as derived analysis, not as a
+replacement for Git truth. A commit may remain one Git commit while MIP
+detects that it contains several conceptual changes, or that a concept spans
+several commits.
+
 ## Property Classes
 
 The first reusable abstraction should be property classes, not app object
@@ -135,6 +158,22 @@ Use multiple graph semantics over shared identifiers:
 The provenance layer should be acyclic. The knowledge layer should not be
 forced to be acyclic, because useful knowledge often loops back on itself.
 
+## Multiscale Visualization
+
+Visualization should be treated as a base capability of the knowledge engine,
+not just a later UI feature. The engine should be able to provide multiscale
+views that preserve enough structure for a renderer to show where a user is in
+the data and how far they are zoomed in.
+
+For Git, this means the native DAG should be table stakes: commits and parent
+edges are visible at full fidelity. MIP-derived layers can then add summaries,
+topic bands, time buckets, conceptual seams, hot paths, and navigation hints
+above that DAG.
+
+The goal is not to replace low-level inspection. The goal is to make the
+highest useful abstraction level accessible first, then allow precise descent
+only where the task demands it.
+
 ## Design Constraints
 
 - Raw facts and blobs must remain available even when summaries exist.
@@ -148,6 +187,10 @@ forced to be acyclic, because useful knowledge often loops back on itself.
 - A weak correlation should be cheap to record and easy to supersede.
 - A strong correlation should be explainable through supporting facts and
   source facts.
+- App-native connectivity should remain authoritative even when MIP derives
+  alternate seams, clusters, or summaries.
+- Multiscale views should let users descend from summary to source without
+  severing provenance.
 
 ## Open Questions
 
@@ -158,3 +201,5 @@ forced to be acyclic, because useful knowledge often loops back on itself.
 - What is the smallest query language that can express correlation salience
   without becoming a premature ontology language?
 - Where should MIP stop and Hyperion's context engine begin?
+- Should visualization-oriented view data be stored as facts, generated on
+  demand from indexes, or cached as derived views?
