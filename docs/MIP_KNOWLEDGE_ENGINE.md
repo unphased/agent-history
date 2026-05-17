@@ -7,25 +7,37 @@ clear through use.
 
 ## Naming The Atom
 
-The previous working word was **observation**: something was seen, emitted,
-measured, stated, or derived. It is accurate, but slightly too clinical and
-too passive for the role.
+Current decision: **fact** is the atomic node.
 
-Leading candidate: **signal**.
+This is not an epistemological claim that the content is true. In this system,
+a fact is the smallest addressable unit of information the engine can store,
+index, relate, summarize, and reason over. It may be emitted by an app,
+asserted by a human, measured from a stream, extracted from a blob, inferred by
+a model, or derived from other facts.
 
-Why signal fits:
+Truth, confidence, source, and provenance are fields on a fact, not guarantees
+implied by the word.
 
-- It can be raw, structured, derived, dense, sparse, noisy, or high-confidence.
-- It does not imply truth. It only says that information entered the system.
-- It fits event streams and summaries equally well.
-- It naturally supports later language like signal strength, signal source,
-  signal correlation, signal decay, and signal extraction.
-- It leaves room for facts to be stronger epistemic objects layered on top.
+Working distinction:
 
-Other candidates considered:
+- **Blob:** uninterpreted payload bytes or text, usually content-addressed.
+- **Fact:** an atomic knowledge record with provenance.
+- **Relation:** a fact whose value points at another fact or subject.
+- **Summary:** a derived fact that compresses other facts.
+- **View:** an organizing projection over facts.
+- **Signal:** contextual salience, correlation, or usefulness discovered among
+  facts.
+
+This makes `signal` an analytic layer rather than the atom. A fact enters the
+store before the engine knows whether it is signal or noise. A signal is what
+emerges when facts become relevant under a query, task, view, or correlation
+recipe.
+
+Other atom names considered:
 
 - **Observation:** precise, but too passive and too tied to a human/scientific
   observer.
+- **Signal:** useful, but it already implies relevance or signal-vs-noise.
 - **Trace:** excellent for provenance, but less natural for intentional
   assertions and derived summaries.
 - **Evidence:** strong epistemology, but implies argument or proof too early.
@@ -33,26 +45,15 @@ Other candidates considered:
 - **Record:** practical, but too storage-shaped.
 - **Datum:** accurate, but sterile and too low-level.
 
-Current decision: use **signal** in design language until a stronger term
-appears.
-
-Working distinction:
-
-- **Signal:** an information-bearing unit with provenance.
-- **Fact:** a structured assertion derived from, emitted with, or attached to
-  one or more signals.
-- **Summary:** a derived signal that compresses other signals.
-- **View:** an organizing projection over signals and facts.
-
 Avoid treating this as final vocabulary. The useful constraint is that the
-atom must be general enough for both natural-language history and non-textual
-event streams.
+atom must be general enough for natural-language history, app-native structure,
+structured assertions, derived summaries, and non-textual event streams.
 
 ## Core Framing
 
 MIP should not own a single canonical hierarchy. App-native hierarchies,
 semantic clusters, timelines, derivation chains, and user-curated context
-paths are all projections over the same underlying signals.
+paths are all projections over the same underlying facts.
 
 The substrate is therefore not a pure tree and not only a DAG. It is a
 temporal, attributed knowledge graph with DAG-shaped projections where those
@@ -60,10 +61,10 @@ projections are useful.
 
 The clearest split:
 
-- The **knowledge engine** stores signals, facts, provenance, indexes, and
+- The **knowledge engine** stores blobs, facts, provenance, indexes, and
   derived views.
-- The **MIP engine** creates level-of-detail summaries and other derived
-  signals over that substrate.
+- The **MIP engine** creates level-of-detail summaries, signals, and other
+  derived facts over that substrate.
 - Hyperion's **context engine** builds acyclic context projections from the
   substrate for model input.
 
@@ -75,7 +76,7 @@ knowledge substrate to remain cyclic, temporal, uncertain, and cross-domain.
 Apps should be able to stream information into the system without adopting a
 large ontology. The app-side contract should stay close to these verbs:
 
-- **observe:** submit a signal with provenance, time, content or value, and
+- **record:** submit a fact with provenance, time, content or value, and
   optional metadata.
 - **assert:** attach a structured fact to a subject.
 - **relate:** declare a relationship between subjects.
@@ -87,6 +88,7 @@ The engine can then emit derived material back:
 - summaries
 - correlation candidates
 - derived facts
+- signals, meaning scored salience or usefulness under a context
 - derived views
 - drift or conflict notices
 - context candidates
@@ -135,23 +137,22 @@ forced to be acyclic, because useful knowledge often loops back on itself.
 
 ## Design Constraints
 
-- Raw signals must remain available even when summaries exist.
-- Derived signals must carry provenance back to source signals.
+- Raw facts and blobs must remain available even when summaries exist.
+- Derived facts must carry provenance back to source facts.
 - Apps should not need to predict future global ontology decisions.
 - The engine should support dense data that is rolled up or indexed rather
   than summarized as prose.
 - Time should be first-class because it is the universal cross-app correlator.
-- Human or agent curation should become high-value signal, not hidden UI state.
+- Human or agent curation should become facts that can act as high-value
+  signal, not hidden UI state.
 - A weak correlation should be cheap to record and easy to supersede.
 - A strong correlation should be explainable through supporting facts and
-  source signals.
+  source facts.
 
 ## Open Questions
 
-- Is **signal** the right atom name, or should it be reserved for inferred
-  importance while the atom keeps a more neutral name?
-- Should facts be stored as first-class objects from day one, or begin as
-  structured properties on signals and later promote?
+- Is **fact** too epistemologically loaded despite the operational definition?
+- Should every relation be represented as a fact from day one?
 - How much property-class normalization should happen at ingestion time versus
   asynchronously?
 - What is the smallest query language that can express correlation salience
